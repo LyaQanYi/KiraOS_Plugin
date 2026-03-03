@@ -4,7 +4,7 @@
 > **版本**: 1.0.0  
 > **作者**: LyaQanYi
 
-KiraOS 是 Kira 的 OS 级内置插件，整合了两大核心能力：
+KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 | 能力 | 类比 | 说明 |
 |------|------|------|
@@ -35,7 +35,7 @@ KiraOS 是 Kira 的 OS 级内置插件，整合了两大核心能力：
 
 ## 快速开始
 
-KiraOS 作为内置插件默认启用，无需额外安装。启动 Kira 后插件会自动：
+KiraOS 作为插件需要放置在 `.\core\plugin` 目录下，并在WebUI启用。启动 Kira 后插件会自动：
 
 1. 初始化 SQLite 记忆数据库 (`data/memory/kiraos.db`)
 2. 扫描 `data/skills/` 目录，发现并注册所有技能工具
