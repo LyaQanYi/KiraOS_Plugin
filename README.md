@@ -15,6 +15,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 ## 目录
 
+- [安装](#安装)
 - [快速开始](#快速开始)
 - [用户记忆系统](#用户记忆系统)
   - [工作原理](#记忆---工作原理)
@@ -33,9 +34,30 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 ---
 
+## 安装
+
+将整个 `KiraOS_Plugin` 文件夹放入 `data/plugins/` 目录即可：
+
+```
+data/plugins/
+└── KiraOS_Plugin/
+    ├── __init__.py
+    ├── main.py
+    ├── db.py
+    ├── skill_router.py
+    ├── manifest.json
+    └── schema.json
+```
+
+重启 Kira 后插件会自动被发现并加载。可在 WebUI 的插件管理页面中启用/禁用及调整配置。
+
+> **说明**: 该插件也可作为内置插件放在 `core/plugin/builtin_plugins/KiraOS_Plugin/` 下，两种方式均兼容，无需修改任何代码。
+
+---
+
 ## 快速开始
 
-KiraOS 作为插件需要放置在 `.\core\plugin` 目录下，并在WebUI启用。启动 Kira 后插件会自动：
+安装后启动 Kira，插件会自动：
 
 1. 初始化 SQLite 记忆数据库 (`data/memory/kiraos.db`)
 2. 扫描 `data/skills/` 目录，发现并注册所有技能工具
@@ -50,6 +72,8 @@ data/
         ├── manifest.json
         └── instruction.md
 ```
+
+> **提示**: 仓库根目录下的 `skills/` 文件夹包含示例技能（如 `tarot_reading`），首次使用时需将其复制到 `data/skills/` 目录下。
 
 ---
 
