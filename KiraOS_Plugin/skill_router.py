@@ -19,7 +19,7 @@ from typing import Dict, Any, Optional, Callable
 
 from core.logging_manager import get_logger
 
-logger = get_logger("skill_router", "magenta")
+logger = get_logger("skill_router", "purple")
 
 
 class SkillInfo:

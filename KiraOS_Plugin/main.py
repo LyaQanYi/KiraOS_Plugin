@@ -75,6 +75,9 @@ class UserMemoryPlugin(BasePlugin):
     # ════════════════════════════════════════════════════════════════
 
     async def initialize(self):
+        # ── Auto-disable builtin Simple Memory plugin to avoid conflict ──
+        await self._disable_builtin_memory()
+
         # ── Init memory DB ──────────────────────────────────────────
         self.db = UserMemoryDB(self.db_path)
         logger.info("User memory database ready")
@@ -90,6 +93,23 @@ class UserMemoryPlugin(BasePlugin):
             logger.info("No skills found (place skill folders in data/skills/)")
 
         logger.info("KiraOS plugin initialized (memory + skill router)")
+
+    BUILTIN_MEMORY_PLUGIN_ID = "kira_plugin_simple_memory"
+
+    async def _disable_builtin_memory(self):
+        """Auto-detect and disable the builtin Simple Memory plugin to prevent conflicts."""
+        try:
+            mgr = self.ctx.plugin_mgr
+            if mgr is None:
+                return
+            if mgr.is_plugin_enabled(self.BUILTIN_MEMORY_PLUGIN_ID):
+                await mgr.set_plugin_enabled(self.BUILTIN_MEMORY_PLUGIN_ID, False)
+                logger.warning(
+                    "检测到内置记忆插件(Simple Memory)已启用，已自动禁用以避免冲突。"
+                    "如需切换回内置记忆，请在 WebUI 禁用 KiraOS 后重新启用 Simple Memory。"
+                )
+        except Exception as e:
+            logger.warning(f"检查内置记忆插件状态时出错: {e}")
 
     async def terminate(self):
         # ── Unregister skill tools ──────────────────────────────────
@@ -112,7 +132,7 @@ class UserMemoryPlugin(BasePlugin):
     def _register_skill_tool(self, skill: SkillInfo):
         """Dynamically register a skill as an LLM tool via ctx.llm_api."""
 
-        async def _skill_executor(event: KiraMessageBatchEvent, **kwargs) -> str:
+        async def _skill_executor(event: KiraMessageBatchEvent, *_, **kwargs) -> str:
             return self._execute_skill(skill, event, **kwargs)
 
         self.ctx.llm_api.register_tool(
@@ -278,7 +298,7 @@ class UserMemoryPlugin(BasePlugin):
     # ════════════════════════════════════════════════════════════════
 
     @on.llm_request()
-    async def inject_context(self, event: KiraMessageBatchEvent, req: LLMRequest):
+    async def inject_context(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         """
         Before each LLM call:
           1. Inject per-user memory context into the system prompt

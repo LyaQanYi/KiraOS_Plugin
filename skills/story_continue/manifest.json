@@ -1,0 +1,18 @@
+{
+  "name": "story_continue",
+  "description": "当用户想要玩接龙故事、续写故事、或者给出一个故事开头让AI继续编写时调用此工具。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "story_start": {
+        "type": "string",
+        "description": "用户提供的故事开头或上一段故事内容"
+      },
+      "style": {
+        "type": "string",
+        "description": "故事风格偏好，如 搞笑、悬疑、浪漫、奇幻、日常 等（可选，默认为自动判断）"
+      }
+    },
+    "required": ["story_start"]
+  }
+}
