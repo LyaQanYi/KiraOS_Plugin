@@ -44,7 +44,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 **方式一：用户插件（推荐）**
 
-```
+```text
 data/plugins/
 └── KiraOS_Plugin/
     ├── __init__.py
@@ -57,7 +57,7 @@ data/plugins/
 
 **方式二：内置插件**
 
-```
+```text
 core/plugin/builtin_plugins/
 └── KiraOS_Plugin/
     ├── __init__.py
@@ -83,7 +83,7 @@ core/plugin/builtin_plugins/
 3. 扫描 `data/skills/` 目录，发现并注册所有技能工具
 4. 在每次 LLM 调用前自动注入用户记忆上下文
 
-```
+```text
 data/
 ├── memory/
 │   └── kiraos.db          ← 自动创建
@@ -354,7 +354,7 @@ data/skills/tarot_reading/
 
 **运行效果**：当用户说「帮我算算今天的运势」时，LLM 调用 `tarot_reading(question="今天的运势")`，插件返回替换后的完整指令，LLM 直接阅读并按指令生成占卜结果。
 
-### 更多示例技能
+### 示例技能
 
 仓库 `skills/` 目录下包含以下示例技能，首次使用时将它们复制到 `data/skills/` 即可：
 
