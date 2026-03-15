@@ -1,0 +1,14 @@
+{
+  "name": "emoji_interpret",
+  "description": "当用户发送一串emoji或表情请求解读含义、翻译emoji、或者想知道某个emoji组合表达什么意思时调用此工具。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "emojis": {
+        "type": "string",
+        "description": "用户发送的emoji或表情符号"
+      }
+    },
+    "required": ["emojis"]
+  }
+}

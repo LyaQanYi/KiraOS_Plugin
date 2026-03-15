@@ -1,8 +1,9 @@
 # KiraOS 插件文档
 
 > **插件 ID**: `kira_plugin_kiraos`  
-> **版本**: 1.0.0  
-> **作者**: LyaQanYi
+> **版本**: 1.1.0  
+> **作者**: LyaQanYi  
+> **兼容**: KiraAI v2.0 (dev branch)
 
 KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
@@ -17,6 +18,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 - [安装](#安装)
 - [快速开始](#快速开始)
+- [与内置记忆插件的关系](#与内置记忆插件的关系)
 - [用户记忆系统](#用户记忆系统)
   - [工作原理](#记忆---工作原理)
   - [memory_update 工具](#memory_update-工具)
@@ -27,18 +29,22 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
   - [创建自定义技能](#创建自定义技能)
   - [manifest.json 规范](#manifestjson-规范)
   - [instruction.md 规范](#instructionmd-规范)
-  - [完整示例：塔罗牌占卜](#完整示例塔罗牌占卜)
+  - [示例技能](#示例技能)
 - [配置项](#配置项)
 - [数据存储](#数据存储)
 - [架构概览](#架构概览)
+- [故障排除](#故障排除)
+- [更新日志](#更新日志)
 
 ---
 
 ## 安装
 
-将整个 `KiraOS_Plugin` 文件夹放入 `data/plugins/` 目录即可：
+将整个 `KiraOS_Plugin` 文件夹放入以下**任一**目录即可：
 
-```
+**方式一：用户插件（推荐）**
+
+```text
 data/plugins/
 └── KiraOS_Plugin/
     ├── __init__.py
@@ -49,9 +55,22 @@ data/plugins/
     └── schema.json
 ```
 
-重启 Kira 后插件会自动被发现并加载。可在 WebUI 的插件管理页面中启用/禁用及调整配置。
+**方式二：内置插件**
 
-> **说明**: 该插件也可作为内置插件放在 `core/plugin/builtin_plugins/KiraOS_Plugin/` 下，两种方式均兼容，无需修改任何代码。
+```text
+core/plugin/builtin_plugins/
+└── KiraOS_Plugin/
+    ├── __init__.py
+    ├── main.py
+    ├── db.py
+    ├── skill_router.py
+    ├── manifest.json
+    └── schema.json
+```
+
+两种方式均兼容，无需修改任何代码。重启 Kira 后插件会自动被发现并加载。可在 WebUI 的插件管理页面中启用/禁用及调整配置。
+
+> ⚠️ **注意**: 只有上述两个目录是有效的插件安装路径。**不要**将插件放在 `core/plugin/` 下——Kira 的插件发现机制不会扫描该目录。
 
 ---
 
@@ -59,21 +78,44 @@ data/plugins/
 
 安装后启动 Kira，插件会自动：
 
-1. 初始化 SQLite 记忆数据库 (`data/memory/kiraos.db`)
-2. 扫描 `data/skills/` 目录，发现并注册所有技能工具
-3. 在每次 LLM 调用前自动注入用户记忆上下文
+1. **检测并禁用内置记忆插件**（Simple Memory），避免工具名和 Hook 冲突
+2. 初始化 SQLite 记忆数据库 (`data/memory/kiraos.db`)
+3. 扫描 `data/skills/` 目录，发现并注册所有技能工具
+4. 在每次 LLM 调用前自动注入用户记忆上下文
 
-```
+```text
 data/
 ├── memory/
 │   └── kiraos.db          ← 自动创建
 └── skills/
-    └── tarot_reading/     ← 示例技能
-        ├── manifest.json
-        └── instruction.md
+    ├── tarot_reading/     ← 塔罗牌占卜
+    ├── daily_fortune/     ← 每日星座运势
+    ├── story_continue/    ← 接龙续写故事
+    ├── emoji_interpret/   ← Emoji 解读
+    ├── nickname_generator/← 昵称生成器
+    └── personality_test/  ← 趣味性格测试
 ```
 
-> **提示**: 仓库根目录下的 `skills/` 文件夹包含示例技能（如 `tarot_reading`），首次使用时需将其复制到 `data/skills/` 目录下。
+> **提示**: 仓库根目录下的 `skills/` 文件夹包含示例技能，首次使用时需将其复制到 `data/skills/` 目录下。
+
+---
+
+## 与内置记忆插件的关系
+
+KiraOS 的记忆系统与 Kira 内置的 **Simple Memory** 插件（`kira_plugin_simple_memory`）存在功能冲突：
+
+| 冲突项 | Simple Memory | KiraOS Memory |
+|--------|---------------|---------------|
+| LLM Hook | 向 `name="memory"` 注入上下文 | 向 `name="memory"` 注入上下文 |
+| 工具名 | `memory_update`（按索引修改文本行） | `memory_update`（按用户批量操作画像/事件） |
+| 存储 | `data/memory/core.txt`（纯文本） | `data/memory/kiraos.db`（SQLite） |
+
+**自动互斥处理**：KiraOS 在 `initialize()` 时会自动检测 Simple Memory 插件状态。若 Simple Memory 已启用，KiraOS 会**自动将其禁用**并记录日志警告。此操作会：
+
+- 注销 Simple Memory 的所有工具和 Hook
+- 将禁用状态持久化到 `config/plugins.json`
+
+如需切换回 Simple Memory，只需在 WebUI 中禁用 KiraOS 并重新启用 Simple Memory 即可。
 
 ---
 
@@ -312,6 +354,19 @@ data/skills/tarot_reading/
 
 **运行效果**：当用户说「帮我算算今天的运势」时，LLM 调用 `tarot_reading(question="今天的运势")`，插件返回替换后的完整指令，LLM 直接阅读并按指令生成占卜结果。
 
+### 示例技能
+
+仓库 `skills/` 目录下包含以下示例技能，首次使用时将它们复制到 `data/skills/` 即可：
+
+| 技能 | 说明 | 触发示例 |
+|------|------|----------|
+| `tarot_reading` | 塔罗牌占卜 | 「帮我算算今天的运势」 |
+| `daily_fortune` | 十二星座每日运势 | 「我是双鱼座，看看今天运势」 |
+| `story_continue` | 接龙续写故事 | 「帮我续写这个故事：从前有座山……」 |
+| `emoji_interpret` | Emoji 解读翻译 | 「🥺👉👈 这是什么意思？」 |
+| `nickname_generator` | 趣味昵称生成 | 「帮我取个二次元风格的网名」 |
+| `personality_test` | 趣味性格测试 | 「我想做个性格小测试」 |
+
 ---
 
 ## 配置项
@@ -383,6 +438,51 @@ KiraOS Plugin (main.py)
 
 | 阶段 | 操作 |
 |------|------|
-| `initialize()` | 初始化数据库 → 扫描技能目录 → 注册技能工具 |
+| `initialize()` | 自动禁用内置 Simple Memory → 初始化数据库 → 扫描技能目录 → 注册技能工具 |
 | 运行中 | `inject_context` 钩子注入记忆；LLM 按需调用 `memory_update` 和技能工具 |
 | `terminate()` | 注销技能工具 → 关闭数据库连接 |
+
+---
+
+## 故障排除
+
+### LLM 调用时报 TypeError
+
+**症状**：日志出现类似 `TypeError: inject_context() takes 3 positional arguments but 4 were given`
+
+**原因**：插件版本过旧，`@on.llm_request()` 钩子签名未适配最新 Kira（现在传递 3 个位置参数 `event, request, tag_set`）。
+
+**解决**：更新到 v1.1.0+。
+
+### memory_update 工具调用失败
+
+**症状**：LLM 调用 `memory_update` 时报参数错误。
+
+**可能原因**：内置 Simple Memory 与 KiraOS 同时启用，两者都注册了 `memory_update` 但参数不同。
+
+**解决**：KiraOS v1.1.0 已自动处理此冲突。若仍有问题，手动在 WebUI 禁用 Simple Memory。
+
+### 技能未被发现
+
+**检查清单**：
+1. 技能文件夹是否在 `data/skills/` 下（非 `skills/`）
+2. 文件夹名是否以 `_` 或 `.` 开头（会被跳过）
+3. 是否同时包含 `manifest.json` 和 `instruction.md`
+4. `manifest.json` 中 `name` 字段是否存在且为非空字符串
+5. 是否与其他技能重名（检查日志中的重复警告）
+
+---
+
+## 更新日志
+
+### v1.1.0
+
+- **修复**：`@on.llm_request()` 钩子签名适配最新 Kira（新增 `tag_set` 参数）
+- **修复**：技能执行器函数签名兼容额外位置参数
+- **新增**：自动检测并禁用内置 Simple Memory 插件，避免工具名与 Hook 冲突
+- **新增**：5 个示例技能（每日星座运势、接龙续写故事、Emoji 解读、昵称生成器、趣味性格测试）
+
+### v1.0.0
+
+- 初始版本：用户记忆系统 + 技能路由系统
+- 示例技能：塔罗牌占卜
