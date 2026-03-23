@@ -27,7 +27,7 @@ from core.provider import LLMRequest
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent
 from core.utils.path_utils import get_data_path
 
-from .db import UserMemoryDB, _parse_ttl
+from .db import UserMemoryDB, _parse_ttl, VALID_CATEGORIES
 from .skill_router import SkillRouter, SkillInfo
 
 # ════════════════════════════════════════════════════════════════════
@@ -95,9 +95,10 @@ class UserMemoryPlugin(BasePlugin):
             self._register_skill_tool(skill)
 
         # Build command → skill mapping (only for registered/enabled skills)
+        all_commands = self.skill_router.get_commands()
         self._command_map = {
-            s.command: s for s in self.skill_router.skills.values()
-            if s.command and s.name in self._registered_skill_names
+            cmd: s for cmd, s in all_commands.items()
+            if s.name in self._registered_skill_names
         }
 
         if skills:
@@ -207,8 +208,8 @@ class UserMemoryPlugin(BasePlugin):
             if skill.name not in self._disabled_skills:
                 self._register_skill_tool(skill)
         self._command_map = {
-            s.command: s for s in self.skill_router.skills.values()
-            if s.command and s.name in self._registered_skill_names
+            cmd: s for cmd, s in self.skill_router.get_commands().items()
+            if s.name in self._registered_skill_names
         }
         logger.info(f"Reloaded skills: {len(self._registered_skill_names)} active")
 
@@ -358,6 +359,8 @@ class UserMemoryPlugin(BasePlugin):
                         continue
                 # Parse optional metadata
                 category = item.get("category", "basic")
+                if not isinstance(category, str) or category not in VALID_CATEGORIES:
+                    category = "basic"
                 try:
                     confidence = float(item.get("confidence", 0.5))
                 except (TypeError, ValueError):

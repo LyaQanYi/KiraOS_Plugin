@@ -119,17 +119,23 @@ class SkillRouter:
                 continue
 
             name = manifest.get("name")
-            if not name or not isinstance(name, str):
+            if not isinstance(name, str) or not name.strip():
                 logger.warning(f"Skill {entry.name} has invalid or missing 'name', skipping")
                 continue
+            name = name.strip()
 
             description = manifest.get("description", "")
+            description = description.strip() if isinstance(description, str) else ""
             trigger = manifest.get("trigger", "")
+            trigger = trigger.strip() if isinstance(trigger, str) else ""
             exclude = manifest.get("exclude", "")
+            exclude = exclude.strip() if isinstance(exclude, str) else ""
             command = manifest.get("command", "")
-            if command and not isinstance(command, str):
+            if not isinstance(command, str):
                 logger.warning(f"Skill {entry.name} has non-string 'command', ignoring")
                 command = ""
+            else:
+                command = command.strip()
             parameters = manifest.get("parameters", {"type": "object", "properties": {}, "required": []})
             if not isinstance(parameters, dict):
                 logger.warning(f"Skill {entry.name} has invalid 'parameters', using default")
