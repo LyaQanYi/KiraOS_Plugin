@@ -1,6 +1,9 @@
 {
   "name": "tarot_reading",
-  "description": "当用户明确要求进行塔罗牌占卜、算命、或者预测运势时调用此工具。",
+  "description": "塔罗牌占卜",
+  "trigger": "当用户明确要求进行塔罗牌占卜、算命、或者预测运势时调用此工具。",
+  "exclude": "用户只是随口提到占卜但没有要求执行；用户问星座运势应走 daily_fortune。",
+  "command": "/tarot",
   "parameters": {
     "type": "object",
     "properties": {

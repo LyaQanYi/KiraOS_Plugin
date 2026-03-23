@@ -1,6 +1,9 @@
 {
   "name": "story_continue",
-  "description": "当用户想要玩接龙故事、续写故事、或者给出一个故事开头让AI继续编写时调用此工具。",
+  "description": "接龙续写故事",
+  "trigger": "当用户想要玩接龙故事、续写故事、或者给出一个故事开头让AI继续编写时调用此工具。",
+  "exclude": "用户只是在讲述自己的经历；用户要求写完整文章或作文。",
+  "command": "/story",
   "parameters": {
     "type": "object",
     "properties": {

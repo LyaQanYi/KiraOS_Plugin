@@ -1,6 +1,9 @@
 {
   "name": "personality_test",
-  "description": "当用户想要做趣味性格测试、心理小测试、MBTI相关测试、或想了解自己的性格特点时调用此工具。",
+  "description": "趣味性格测试",
+  "trigger": "当用户想要做趣味性格测试、心理小测试、MBTI相关测试、或想了解自己的性格特点时调用此工具。",
+  "exclude": "用户只是提到MBTI类型或在讨论心理学知识，没有要求做测试。",
+  "command": "/test",
   "parameters": {
     "type": "object",
     "properties": {

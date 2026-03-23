@@ -1,6 +1,9 @@
 {
   "name": "daily_fortune",
-  "description": "当用户询问今日运势、星座运势、每日占卜时调用此工具。需要提供用户的星座。",
+  "description": "每日星座运势",
+  "trigger": "当用户询问今日运势、星座运势、每日占卜时调用此工具。需要提供用户的星座。",
+  "exclude": "用户要求塔罗牌占卜应走 tarot_reading；用户只是问天气。",
+  "command": "/fortune",
   "parameters": {
     "type": "object",
     "properties": {
