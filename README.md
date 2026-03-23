@@ -42,7 +42,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 ## 安装
 
-将整个 `KiraOS_Plugin` 文件夹放入以下目录即可：
+将整个 `KiraOS_Plugin` 文件夹放入 Kira 的内置插件目录即可：
 
 ```text
 core/plugin/builtin_plugins/
@@ -55,9 +55,9 @@ core/plugin/builtin_plugins/
     └── schema.json
 ```
 
-两种方式均兼容，无需修改任何代码。重启 Kira 后插件会自动被发现并加载。可在 WebUI 的插件管理页面中启用/禁用及调整配置。
+无需修改任何代码。重启 Kira 后插件会自动被发现并加载。可在 WebUI 的插件管理页面中启用/禁用及调整配置。
 
-> ⚠️ **注意**: 只有上述两个目录是有效的插件安装路径。**不要**将插件放在 `core/plugin/` 下——Kira 的插件发现机制不会扫描该目录。
+> ⚠️ **注意**: `core/plugin/builtin_plugins/` 是唯一有效的插件安装路径。**不要**将插件放在 `core/plugin/` 下——Kira 的插件发现机制不会扫描该目录。
 
 ---
 

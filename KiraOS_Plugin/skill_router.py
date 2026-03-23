@@ -127,6 +127,9 @@ class SkillRouter:
             trigger = manifest.get("trigger", "")
             exclude = manifest.get("exclude", "")
             command = manifest.get("command", "")
+            if command and not isinstance(command, str):
+                logger.warning(f"Skill {entry.name} has non-string 'command', ignoring")
+                command = ""
             parameters = manifest.get("parameters", {"type": "object", "properties": {}, "required": []})
             if not isinstance(parameters, dict):
                 logger.warning(f"Skill {entry.name} has invalid 'parameters', using default")
@@ -168,7 +171,18 @@ class SkillRouter:
 
     def get_commands(self) -> Dict[str, SkillInfo]:
         """Return a mapping of command string → SkillInfo for all skills with commands."""
-        return {s.command: s for s in self.skills.values() if s.command}
+        cmd_map: Dict[str, SkillInfo] = {}
+        for s in self.skills.values():
+            if not s.command:
+                continue
+            if s.command in cmd_map:
+                logger.warning(
+                    f"Duplicate command '{s.command}': skill '{s.name}' "
+                    f"conflicts with '{cmd_map[s.command].name}', keeping first"
+                )
+                continue
+            cmd_map[s.command] = s
+        return cmd_map
     def build_instruction_prompt(self, skill: SkillInfo, args: dict) -> str:
         """
         Load instruction.md and substitute argument placeholders.
@@ -188,8 +202,10 @@ class SkillRouter:
         for param_name in skill._declared_params:
             placeholder = f"{{{param_name}}}"
             if param_name in args and args[param_name] is not None:
-                # Wrap user-provided values in XML tags for prompt injection defense
-                safe_value = f"<user_input>{args[param_name]}</user_input>"
+                # XML-escape then wrap in tags for prompt injection defense
+                from xml.sax.saxutils import escape as xml_escape
+                escaped = xml_escape(str(args[param_name]), {'"': '&quot;', "'": '&apos;'})
+                safe_value = f"<user_input>{escaped}</user_input>"
                 template = template.replace(placeholder, safe_value)
             elif param_name not in required:
                 # Optional param not provided — remove placeholder

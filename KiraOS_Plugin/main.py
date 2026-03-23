@@ -94,8 +94,11 @@ class UserMemoryPlugin(BasePlugin):
                 continue
             self._register_skill_tool(skill)
 
-        # Build command → skill mapping for slash command interception
-        self._command_map = self.skill_router.get_commands()
+        # Build command → skill mapping (only for registered/enabled skills)
+        self._command_map = {
+            s.command: s for s in self.skill_router.skills.values()
+            if s.command and s.name in self._registered_skill_names
+        }
 
         if skills:
             active = len(self._registered_skill_names)
@@ -203,7 +206,10 @@ class UserMemoryPlugin(BasePlugin):
         for skill in skills:
             if skill.name not in self._disabled_skills:
                 self._register_skill_tool(skill)
-        self._command_map = self.skill_router.get_commands()
+        self._command_map = {
+            s.command: s for s in self.skill_router.skills.values()
+            if s.command and s.name in self._registered_skill_names
+        }
         logger.info(f"Reloaded skills: {len(self._registered_skill_names)} active")
 
     # ════════════════════════════════════════════════════════════════
@@ -352,7 +358,10 @@ class UserMemoryPlugin(BasePlugin):
                         continue
                 # Parse optional metadata
                 category = item.get("category", "basic")
-                confidence = float(item.get("confidence", 0.5))
+                try:
+                    confidence = float(item.get("confidence", 0.5))
+                except (TypeError, ValueError):
+                    confidence = 0.5
                 ttl = item.get("ttl")
                 parsed_ttl = _parse_ttl(ttl) if ttl else None
                 expires_at = parsed_ttl.isoformat() if parsed_ttl else None
