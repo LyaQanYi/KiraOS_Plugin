@@ -204,7 +204,7 @@ LLM 调用：
 
 每次 LLM 调用前，插件通过 `llm_request` 钩子自动将用户记忆注入系统提示。v1.2.0 起按分类分组并标注置信度：
 
-```
+```text
 [user_123:basic] 昵称=小明(✓) | 城市=北京(✓)
 [user_123:preference] 喜欢猫(?) | 偏好甜食(~)
 [user_123:events] 2025-03-01 完成半马 | 2025-02-28 通过面试
@@ -383,7 +383,7 @@ data/skills/tarot_reading/
 | `story_continue` | 接龙续写故事 | `/story` | 「帮我续写这个故事：从前有座山……」 |
 | `emoji_interpret` | Emoji 解读翻译 | `/emoji` | 「🥺👉👈 这是什么意思？」 |
 | `nickname_generator` | 趣味昵称生成 | `/nickname` | 「帮我取个二次元风格的网名」 |
-| `personality_test` | 趣味性格测试 | `/test` | 「我想做个性格小测试」 |
+| `personality_test` | 趣味性格测试 | `/personality` | 「我想做个性格小测试」 |
 
 ---
 

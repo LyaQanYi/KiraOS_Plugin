@@ -195,8 +195,8 @@ class UserMemoryPlugin(BasePlugin):
         for name in self._registered_skill_names:
             try:
                 self.ctx.llm_api.unregister_tool(name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to unregister tool '{name}': {e}")
         self._registered_skill_names.clear()
 
         skills = self.skill_router.reload()
@@ -233,8 +233,9 @@ class UserMemoryPlugin(BasePlugin):
         if not skill:
             return  # Not a known skill command
 
-        # Rewrite message to hint the LLM to call the skill tool
-        event.message.chain = [Text(f"[用户使用了技能命令 {cmd}] {args_text}")]
+        # Rewrite text but preserve non-text elements (images, mentions, etc.)
+        non_text = [e for e in event.message.chain if not isinstance(e, Text)]
+        event.message.chain = [Text(f"[用户使用了技能命令 {cmd}] {args_text}")] + non_text
         logger.info(f"Slash command '{cmd}' matched skill '{skill.name}'")
 
     # ════════════════════════════════════════════════════════════════
@@ -353,7 +354,8 @@ class UserMemoryPlugin(BasePlugin):
                 category = item.get("category", "basic")
                 confidence = float(item.get("confidence", 0.5))
                 ttl = item.get("ttl")
-                expires_at = _parse_ttl(ttl).isoformat() if ttl and _parse_ttl(ttl) else None
+                parsed_ttl = _parse_ttl(ttl) if ttl else None
+                expires_at = parsed_ttl.isoformat() if parsed_ttl else None
                 self.db.save_profile(user_id, key, value,
                                      confidence=confidence, category=category,
                                      expires_at=expires_at)

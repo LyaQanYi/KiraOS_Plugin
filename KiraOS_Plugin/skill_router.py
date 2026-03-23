@@ -187,7 +187,7 @@ class SkillRouter:
         required = set(skill.parameters.get("required", []))
         for param_name in skill._declared_params:
             placeholder = f"{{{param_name}}}"
-            if param_name in args and args[param_name]:
+            if param_name in args and args[param_name] is not None:
                 # Wrap user-provided values in XML tags for prompt injection defense
                 safe_value = f"<user_input>{args[param_name]}</user_input>"
                 template = template.replace(placeholder, safe_value)

@@ -345,11 +345,11 @@ class UserMemoryDB:
         if profiles:
             lines.append("【用户画像】")
             by_cat: Dict[str, list] = {}
-            for key, value, updated, conf, cat, expires in profiles:
-                by_cat.setdefault(cat, []).append((key, value, updated, conf, expires))
+            for key, value, _, conf, cat, expires in profiles:
+                by_cat.setdefault(cat, []).append((key, value, conf, expires))
             for cat in sorted(by_cat.keys(), key=lambda c: CATEGORY_PRIORITY.get(c, 99)):
                 lines.append(f"  [{cat}]")
-                for key, value, updated, conf, expires in by_cat[cat]:
+                for key, value, conf, expires in by_cat[cat]:
                     exp_str = f" (过期: {expires[:10]})" if expires else ""
                     lines.append(f"    {key} = {value}  [置信度:{conf:.1f}]{exp_str}")
 
