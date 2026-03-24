@@ -95,11 +95,7 @@ class UserMemoryPlugin(BasePlugin):
             self._register_skill_tool(skill)
 
         # Build command → skill mapping (only for registered/enabled skills)
-        all_commands = self.skill_router.get_commands()
-        self._command_map = {
-            cmd: s for cmd, s in all_commands.items()
-            if s.name in self._registered_skill_names
-        }
+        self._command_map = self.skill_router.get_commands(enabled_only=self._registered_skill_names)
 
         if skills:
             active = len(self._registered_skill_names)
@@ -207,10 +203,7 @@ class UserMemoryPlugin(BasePlugin):
         for skill in skills:
             if skill.name not in self._disabled_skills:
                 self._register_skill_tool(skill)
-        self._command_map = {
-            cmd: s for cmd, s in self.skill_router.get_commands().items()
-            if s.name in self._registered_skill_names
-        }
+        self._command_map = self.skill_router.get_commands(enabled_only=self._registered_skill_names)
         logger.info(f"Reloaded skills: {len(self._registered_skill_names)} active")
 
     # ════════════════════════════════════════════════════════════════

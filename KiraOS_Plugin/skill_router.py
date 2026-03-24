@@ -175,11 +175,18 @@ class SkillRouter:
     def get_skill(self, name: str) -> Optional[SkillInfo]:
         return self.skills.get(name)
 
-    def get_commands(self) -> Dict[str, SkillInfo]:
-        """Return a mapping of command string → SkillInfo for all skills with commands."""
+    def get_commands(self, enabled_only: Optional[Set[str]] = None) -> Dict[str, SkillInfo]:
+        """Return a mapping of command string → SkillInfo for skills with commands.
+
+        If *enabled_only* is provided, only skills whose name is in the set
+        participate in conflict resolution, so a disabled skill cannot block
+        an enabled one from claiming a command.
+        """
         cmd_map: Dict[str, SkillInfo] = {}
         for s in self.skills.values():
             if not s.command:
+                continue
+            if enabled_only is not None and s.name not in enabled_only:
                 continue
             if s.command in cmd_map:
                 logger.warning(
