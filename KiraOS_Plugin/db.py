@@ -327,10 +327,19 @@ class UserMemoryDB:
         kept = []
         total = 0
         for line in parts:
-            if total + len(line) + 1 > max_chars and kept:
+            remaining = max_chars - total
+            if remaining <= 0:
                 break
-            kept.append(line)
-            total += len(line) + 1  # +1 for newline
+            cost = len(line) + (1 if kept else 0)  # +1 for newline separator
+            if cost <= remaining:
+                kept.append(line)
+                total += cost
+            else:
+                # Truncate the line to fit the remaining budget
+                avail = remaining - (1 if kept else 0)
+                if avail > 0:
+                    kept.append(line[:avail])
+                break
         return "\n".join(kept)
 
     def get_all_profiles_formatted(self, user_id: str, max_events: int = 10) -> str:

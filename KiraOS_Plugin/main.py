@@ -185,7 +185,7 @@ class UserMemoryPlugin(BasePlugin):
         # Optionally include user memory for context-aware skill execution
         user_id = self._get_primary_user_id(event)
         if self.db and user_id != "unknown":
-            mem_ctx = self.db.build_user_context(user_id, max_events=3)
+            mem_ctx = self.db.build_user_context(user_id, max_events=3, max_chars=self.max_context_chars)
             if mem_ctx:
                 parts.append(f"\n<context>\n{mem_ctx}\n</context>")
 
