@@ -1,6 +1,9 @@
 {
   "name": "nickname_generator",
-  "description": "当用户想要取网名、昵称、游戏名、笔名，或者请求起名建议时调用此工具。",
+  "description": "趣味昵称生成器",
+  "trigger": "当用户想要取网名、昵称、游戏名、笔名，或者请求起名建议时调用此工具。",
+  "exclude": "用户在介绍自己的昵称；用户问某个名字的含义或来源。",
+  "command": "/nickname",
   "parameters": {
     "type": "object",
     "properties": {

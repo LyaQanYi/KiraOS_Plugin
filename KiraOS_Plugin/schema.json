@@ -25,5 +25,24 @@
         "type": "string",
         "default": null,
         "hint": "Path to skills directory (defaults to data/skills/). Each skill is a subfolder with manifest.json + instruction.md"
+    },
+    "max_context_chars": {
+        "name": "Max context chars per user",
+        "type": "integer",
+        "default": 500,
+        "minimum": 0,
+        "hint": "Maximum characters of memory context injected per user (0 = unlimited). Truncates by category priority when exceeded"
+    },
+    "disabled_skills": {
+        "name": "Disabled skills",
+        "type": "list",
+        "default": [],
+        "hint": "List of skill names to disable (won't be registered as LLM tools). Example: [\"tarot_reading\", \"daily_fortune\"]"
+    },
+    "enable_slash_commands": {
+        "name": "Enable slash commands",
+        "type": "switch",
+        "default": false,
+        "hint": "Allow users to trigger skills via /command (e.g. /tarot, /fortune). When disabled, skills can only be triggered by LLM."
     }
 }
