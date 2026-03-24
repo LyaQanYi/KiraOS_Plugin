@@ -41,6 +41,22 @@ def _parse_ttl(ttl: str) -> Optional[datetime]:
 class UserMemoryDB:
     """Thread-safe SQLite wrapper for user memory persistence."""
 
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        """Sanitize text for safe embedding in structured context.
+
+        Replaces XML-like angle brackets with fullwidth variants and
+        collapses newlines to spaces so injected content cannot break
+        out of <context>...</context> or similar delimiters.
+        """
+        return (
+            str(text)
+            .replace("<", "\uff1c")
+            .replace(">", "\uff1e")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._lock = Lock()
@@ -151,13 +167,13 @@ class UserMemoryDB:
             conn = self._get_conn()
             if include_expired:
                 sql = """SELECT memory_key, memory_value, updated_at, confidence, category, expires_at
-                         FROM user_profiles WHERE user_id = ? ORDER BY updated_at DESC"""
+                         FROM user_profiles WHERE user_id = ? ORDER BY datetime(updated_at) DESC"""
                 cursor = conn.execute(sql, (user_id,))
             else:
                 sql = """SELECT memory_key, memory_value, updated_at, confidence, category, expires_at
                          FROM user_profiles
-                         WHERE user_id = ? AND (expires_at IS NULL OR expires_at > ?)
-                         ORDER BY updated_at DESC"""
+                         WHERE user_id = ? AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
+                         ORDER BY datetime(updated_at) DESC"""
                 cursor = conn.execute(sql, (user_id, now))
             return cursor.fetchall()
 
@@ -170,8 +186,8 @@ class UserMemoryDB:
             cursor = conn.execute(
                 """SELECT memory_key, memory_value, confidence FROM user_profiles
                    WHERE user_id = ? AND category = ?
-                     AND (expires_at IS NULL OR expires_at > ?)
-                   ORDER BY confidence DESC, updated_at DESC""",
+                     AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
+                   ORDER BY confidence DESC, datetime(updated_at) DESC""",
                 (user_id, category, now)
             )
             return cursor.fetchall()
@@ -194,7 +210,7 @@ class UserMemoryDB:
             cursor = conn.execute(
                 """SELECT 1 FROM user_profiles
                    WHERE user_id = ? AND memory_key = ?
-                     AND (expires_at IS NULL OR expires_at > ?)
+                     AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
                    LIMIT 1""",
                 (user_id, key, now)
             )
@@ -207,7 +223,7 @@ class UserMemoryDB:
             conn = self._get_conn()
             cursor = conn.execute(
                 """SELECT COUNT(*) FROM user_profiles
-                   WHERE user_id = ? AND (expires_at IS NULL OR expires_at > ?)""",
+                   WHERE user_id = ? AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))""",
                 (user_id, now)
             )
             return cursor.fetchone()[0]
@@ -238,7 +254,7 @@ class UserMemoryDB:
         with self._lock:
             conn = self._get_conn()
             cursor = conn.execute(
-                "SELECT event_summary, created_at FROM event_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT event_summary, created_at FROM event_logs WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT ?",
                 (user_id, limit)
             )
             return cursor.fetchall()
@@ -263,7 +279,7 @@ class UserMemoryDB:
                    WHERE user_id = ? AND id NOT IN (
                        SELECT id FROM event_logs
                        WHERE user_id = ?
-                       ORDER BY created_at DESC
+                       ORDER BY datetime(created_at) DESC
                        LIMIT ?
                    )""",
                 (user_id, user_id, keep)
@@ -301,17 +317,18 @@ class UserMemoryDB:
             by_cat.setdefault(cat, []).append((key, value, conf))
 
         parts = []
+        _s = self._sanitize
         # Emit categories in priority order
         for cat in sorted(by_cat.keys(), key=lambda c: CATEGORY_PRIORITY.get(c, 99)):
             items = by_cat[cat]
             kvs = " | ".join(
-                f"{k}={v}({self._confidence_marker(c)})" for k, v, c in items
+                f"{_s(k)}={_s(v)}({self._confidence_marker(c)})" for k, v, c in items
             )
-            parts.append(f"[{user_id}:{cat}] {kvs}")
+            parts.append(f"[{_s(user_id)}:{_s(cat)}] {kvs}")
 
         if events:
-            evts = " | ".join(f"{ts[:10]} {s}" for s, ts in events)
-            parts.append(f"[{user_id}:events] {evts}")
+            evts = " | ".join(f"{ts[:10]} {_s(s)}" for s, ts in events)
+            parts.append(f"[{_s(user_id)}:events] {evts}")
 
         result = "\n".join(parts)
 

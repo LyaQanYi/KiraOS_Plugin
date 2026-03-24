@@ -402,7 +402,7 @@ class UserMemoryPlugin(BasePlugin):
                 more = f" (+{len(profiles) - 5})" if len(profiles) > 5 else ""
                 summary_suffix = f"\n当前画像: {kvs}{more}"
 
-        logger.info(f"memory_update for {user_id}: {len(operations)} ops → {results}")
+        logger.info(f"memory_update for {user_id}: {len(operations)} ops → {len(results)} results")
         return f"已完成 {len(results)} 项记忆操作: " + "; ".join(results) + summary_suffix
 
     @register_tool(
