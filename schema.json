@@ -50,7 +50,8 @@
         "type": "integer",
         "default": 0,
         "minimum": 0,
-        "hint": "Port for the memory management WebUI (0 = disabled). Example: 8765"
+        "maximum": 65535,
+        "hint": "Port for the memory management WebUI (0 = disabled, valid range: 1-65535). Example: 8765"
     },
     "webui_host": {
         "name": "Memory WebUI host",

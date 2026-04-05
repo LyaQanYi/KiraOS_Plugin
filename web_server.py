@@ -149,7 +149,10 @@ async def api_update_profile(request: Request) -> JSONResponse:
     if not value:
         return JSONResponse({"error": "value is required"}, status_code=400)
 
-    confidence = max(0.0, min(1.0, float(body.get("confidence", 0.5))))
+    try:
+        confidence = max(0.0, min(1.0, float(body.get("confidence", 0.5))))
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "Invalid confidence value, must be a number"}, status_code=400)
     category = body.get("category", "basic")
     expires_at = body.get("expires_at")
 
@@ -193,16 +196,17 @@ async def api_delete_event(request: Request) -> JSONResponse:
     if not db:
         return JSONResponse({"error": "Database not available"}, status_code=503)
 
+    user_id = request.path_params["user_id"]
     try:
         event_id = int(request.path_params["event_id"])
     except ValueError:
         return JSONResponse({"error": "Invalid event_id"}, status_code=400)
 
     try:
-        removed = db.delete_event(event_id)
+        removed = db.delete_event(event_id, user_id=user_id)
         if removed:
             return JSONResponse({"ok": True})
-        return JSONResponse({"error": "Event not found"}, status_code=404)
+        return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
     except Exception as e:
         logger.error(f"Error deleting event {event_id}: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)

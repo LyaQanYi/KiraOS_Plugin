@@ -1109,7 +1109,7 @@ async function selectUser(userId) {
     userData = await api('/users/' + encodeURIComponent(userId));
     renderDetail();
   } catch (e) {
-    content.innerHTML = '<div class="empty-state" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';;
+    content.innerHTML = '<div class="empty-state" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';
   }
 }
 
@@ -1310,7 +1310,7 @@ function escapeHtml(s) {
 }
 
 function escapeAttr(s) {
-  return (s || '').replace(/&/g, '&amp;').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return (s || '').replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /* ═══════════════════════════════════════════════════════════════

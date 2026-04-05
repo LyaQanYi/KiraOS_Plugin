@@ -264,13 +264,19 @@ class UserMemoryDB:
                 for row in cursor.fetchall()
             ]
 
-    def delete_event(self, event_id: int) -> bool:
-        """Delete a single event log entry by its ID. Returns True if deleted."""
+    def delete_event(self, event_id: int, user_id: str | None = None) -> bool:
+        """Delete a single event log entry by its ID. If user_id is given, also verify ownership."""
         with self._lock:
             conn = self._get_conn()
-            cursor = conn.execute(
-                "DELETE FROM event_logs WHERE id = ?", (event_id,)
-            )
+            if user_id is not None:
+                cursor = conn.execute(
+                    "DELETE FROM event_logs WHERE id = ? AND user_id = ?",
+                    (event_id, user_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM event_logs WHERE id = ?", (event_id,)
+                )
             conn.commit()
             return cursor.rowcount > 0
 
