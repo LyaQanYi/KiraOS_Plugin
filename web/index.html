@@ -924,13 +924,23 @@ let selectedUserId = null;
 let userData = null;
 let editingKey = null;
 let modalCallback = null;
+let _selectRequestId = 0;
 
 /* ═══════════════════════════════════════════════════════════════
    API Helpers
    ═══════════════════════════════════════════════════════════════ */
 function getToken() {
+  const stored = sessionStorage.getItem('kiraos_token');
+  if (stored !== null) return stored;
   const params = new URLSearchParams(location.search);
-  return params.get('token') || '';
+  const token = params.get('token') || '';
+  sessionStorage.setItem('kiraos_token', token);
+  if (params.has('token')) {
+    params.delete('token');
+    const qs = params.toString();
+    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+  }
+  return token;
 }
 
 async function api(path, opts = {}) {
@@ -1092,6 +1102,7 @@ function handleCardKey(e, userId) {
 async function selectUser(userId) {
   selectedUserId = userId;
   editingKey = null;
+  const localRequestId = ++_selectRequestId;
 
   // Update sidebar active state
   document.querySelectorAll('.user-card').forEach(c => {
@@ -1106,9 +1117,12 @@ async function selectUser(userId) {
   content.innerHTML = '<div class="spinner" role="status" aria-label="加载中"><span class="sr-only">正在加载用户数据…</span></div>';
 
   try {
-    userData = await api('/users/' + encodeURIComponent(userId));
+    const data = await api('/users/' + encodeURIComponent(userId));
+    if (localRequestId !== _selectRequestId) return; // stale response
+    userData = data;
     renderDetail();
   } catch (e) {
+    if (localRequestId !== _selectRequestId) return;
     content.innerHTML = '<div class="empty-state" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';
   }
 }
