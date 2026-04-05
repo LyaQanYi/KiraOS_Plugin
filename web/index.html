@@ -1,0 +1,1317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KiraOS Memory Manager</title>
+<style>
+/* ═══════════════════════════════════════════════════════════════
+   Satoshi Font + CSS Reset
+   ═══════════════════════════════════════════════════════════════ */
+@font-face {
+  font-family: 'Satoshi';
+  src: url('https://cdn.jsdelivr.net/gh/nicepkg/gpt-runner@master/packages/gpt-web/src/assets/fonts/Satoshi-Variable.woff2') format('woff2');
+  font-weight: 300 900;
+  font-display: swap;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --font: 'Satoshi', 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --bg-gradient: linear-gradient(160deg, #f5f6fa 0%, #ebedf5 100%);
+  --glass-bg: rgba(255, 255, 255, 0.78);
+  --glass-bg-hover: rgba(255, 255, 255, 0.90);
+  --glass-bg-active: rgba(255, 255, 255, 0.96);
+  --glass-border: rgba(0, 0, 0, 0.06);
+  --glass-border-hover: rgba(0, 0, 0, 0.10);
+  --glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.04);
+  --glass-blur: blur(20px);
+  --text-primary: #1a1a2e;
+  --text-secondary: #4a4a6a;
+  --text-muted: rgba(26, 26, 46, 0.50);
+  --text-on-glass: #1a1a2e;
+  --accent: #4f46e5;
+  --accent-light: #818cf8;
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --success: #059669;
+  --radius-btn: 10px;
+  --radius-card: 14px;
+  --radius-input: 8px;
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --focus-ring: 0 0 0 3px rgba(79, 70, 229, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Dark Mode
+   ═══════════════════════════════════════════════════════════════ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-gradient: linear-gradient(160deg, #0f0f1a 0%, #161625 100%);
+    --glass-bg: rgba(255, 255, 255, 0.06);
+    --glass-bg-hover: rgba(255, 255, 255, 0.10);
+    --glass-bg-active: rgba(255, 255, 255, 0.14);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --glass-border-hover: rgba(255, 255, 255, 0.14);
+    --glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.20), 0 4px 16px rgba(0, 0, 0, 0.16);
+    --text-primary: #e4e4ed;
+    --text-secondary: #a8a8c0;
+    --text-muted: rgba(228, 228, 237, 0.45);
+    --text-on-glass: #e4e4ed;
+    --accent: #818cf8;
+    --accent-light: #a5b4fc;
+    --danger: #f87171;
+    --danger-hover: #ef4444;
+    --success: #34d399;
+    --focus-ring: 0 0 0 3px rgba(129, 140, 248, 0.35);
+  }
+}
+
+[data-theme="dark"] {
+  --bg-gradient: linear-gradient(160deg, #0f0f1a 0%, #161625 100%);
+  --glass-bg: rgba(255, 255, 255, 0.06);
+  --glass-bg-hover: rgba(255, 255, 255, 0.10);
+  --glass-bg-active: rgba(255, 255, 255, 0.14);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-hover: rgba(255, 255, 255, 0.14);
+  --glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.20), 0 4px 16px rgba(0, 0, 0, 0.16);
+  --text-primary: #e4e4ed;
+  --text-secondary: #a8a8c0;
+  --text-muted: rgba(228, 228, 237, 0.45);
+  --text-on-glass: #e4e4ed;
+  --accent: #818cf8;
+  --accent-light: #a5b4fc;
+  --danger: #f87171;
+  --danger-hover: #ef4444;
+  --success: #34d399;
+  --focus-ring: 0 0 0 3px rgba(129, 140, 248, 0.35);
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--font);
+  color: var(--text-primary);
+  background: var(--bg-gradient);
+  background-attachment: fixed;
+  overflow: hidden;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Accessibility: Skip Link
+   ═══════════════════════════════════════════════════════════════ */
+.skip-link {
+  position: absolute;
+  top: -100%;
+  left: 16px;
+  padding: 10px 20px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: var(--radius-btn);
+  z-index: 999;
+  text-decoration: none;
+  transition: top 0.2s;
+}
+.skip-link:focus {
+  top: 12px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Accessibility: Screen Reader Only
+   ═══════════════════════════════════════════════════════════════ */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Layout
+   ═══════════════════════════════════════════════════════════════ */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 28px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  flex-shrink: 0;
+  z-index: 10;
+  gap: 16px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-btn);
+  background: var(--glass-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.theme-toggle:hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+}
+
+.theme-toggle:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.header-search {
+  position: relative;
+  width: 280px;
+}
+
+.header-search input {
+  width: 100%;
+  padding: 8px 14px 8px 36px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-btn);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  outline: none;
+  transition: var(--transition);
+}
+
+.header-search input::placeholder { color: var(--text-muted); }
+.header-search input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+  background: var(--glass-bg-active);
+}
+
+.header-search svg {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  gap: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Left Panel — User List
+   ═══════════════════════════════════════════════════════════════ */
+.sidebar {
+  width: 300px;
+  min-width: 300px;
+  padding: 20px 16px;
+  overflow-y: auto;
+  border-right: 1px solid var(--glass-border);
+  backdrop-filter: blur(8px);
+  background: var(--glass-bg);
+}
+
+.sidebar::-webkit-scrollbar { width: 4px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--glass-border-hover); border-radius: 4px; }
+
+.sidebar-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+  padding-left: 4px;
+}
+
+.user-card {
+  padding: 14px 16px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-card);
+  border: 1px solid transparent;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  cursor: pointer;
+  transition: var(--transition);
+  opacity: 0;
+  transform: translateY(16px);
+}
+
+.user-card.revealed {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.user-card:hover,
+.user-card:focus-visible {
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+  transform: translateY(-1px);
+  box-shadow: var(--glass-shadow);
+}
+
+.user-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.user-card.active {
+  background: var(--glass-bg-active);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.12);
+}
+
+.user-id {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-on-glass);
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+
+.user-badges {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  background: rgba(79, 70, 229, 0.08);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.badge.events {
+  background: rgba(5, 150, 105, 0.08);
+  color: var(--success);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty-state svg {
+  width: 48px;
+  height: 48px;
+  margin-bottom: 16px;
+  opacity: 0.4;
+}
+
+.empty-state p {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Right Panel — Detail
+   ═══════════════════════════════════════════════════════════════ */
+.detail {
+  flex: 1;
+  padding: 24px 32px;
+  overflow-y: auto;
+}
+
+.detail::-webkit-scrollbar { width: 6px; }
+.detail::-webkit-scrollbar-track { background: transparent; }
+.detail::-webkit-scrollbar-thumb { background: var(--glass-border-hover); border-radius: 6px; }
+
+.detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.detail-user-id {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.section {
+  margin-bottom: 28px;
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+
+.section.revealed {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.section-title {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-title .count {
+  font-size: 11px;
+  background: rgba(79, 70, 229, 0.08);
+  color: var(--accent);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+/* Glass Card */
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--glass-shadow);
+  padding: 18px 20px;
+  margin-bottom: 10px;
+  transition: var(--transition);
+}
+
+.glass-card:hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+}
+
+/* Category group */
+.cat-header {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  padding: 6px 12px;
+  background: var(--glass-bg);
+  border-radius: 8px;
+  display: inline-block;
+  margin-bottom: 12px;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--glass-border);
+  gap: 12px;
+  min-height: 44px;
+}
+
+.profile-row:last-child { border-bottom: none; }
+
+.profile-key {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-on-glass);
+  min-width: 100px;
+  flex-shrink: 0;
+}
+
+.profile-value {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-on-glass);
+  word-break: break-word;
+}
+
+.confidence-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.profile-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.profile-row:hover .profile-actions,
+.profile-row:focus-within .profile-actions { opacity: 1; }
+
+.profile-actions .btn:focus-visible { opacity: 1; }
+
+/* Edit form */
+.edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 0;
+  flex: 1;
+}
+
+.edit-form .field-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.edit-form label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  min-width: 48px;
+}
+
+.edit-form input, .edit-form select {
+  flex: 1;
+  padding: 7px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-input);
+  background: var(--glass-bg);
+  backdrop-filter: blur(8px);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  outline: none;
+  transition: var(--transition);
+}
+
+.edit-form input:focus, .edit-form select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}
+
+.edit-form .edit-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* ── Timeline (Events) ─────────────────────────────────── */
+.timeline { position: relative; padding-left: 24px; }
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: linear-gradient(to bottom, rgba(79, 70, 229, 0.25), transparent);
+  border-radius: 2px;
+}
+
+.event-row {
+  position: relative;
+  padding: 10px 0 10px 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.event-row::before {
+  content: '';
+  position: absolute;
+  left: -20px;
+  top: 16px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--glass-bg-active);
+}
+
+.event-time {
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 80px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.event-summary {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-on-glass);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.event-del {
+  opacity: 0;
+  transition: opacity 0.15s;
+  flex-shrink: 0;
+}
+
+.event-row:hover .event-del,
+.event-row:focus-within .event-del { opacity: 1; }
+
+.event-del:focus-visible { opacity: 1; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Buttons
+   ═══════════════════════════════════════════════════════════════ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 16px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-btn);
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition);
+  outline: none;
+  white-space: nowrap;
+}
+
+.btn:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+
+.btn-primary:hover {
+  background: #4338ca;
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.25);
+}
+
+.btn-ghost {
+  background: var(--glass-bg);
+  color: var(--text-on-glass);
+  border-color: var(--glass-border);
+}
+
+.btn-ghost:hover {
+  background: var(--glass-bg-hover);
+}
+
+.btn-danger {
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--danger);
+  border-color: rgba(220, 38, 38, 0.15);
+}
+
+.btn-danger:hover {
+  background: rgba(220, 38, 38, 0.15);
+}
+
+.btn-danger:focus-visible {
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.2);
+  outline: 2px solid var(--danger);
+  outline-offset: 1px;
+}
+
+.btn-icon {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Modal
+   ═══════════════════════════════════════════════════════════════ */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+
+.modal-overlay.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.modal {
+  background: var(--glass-bg-active);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.20);
+  padding: 28px 32px;
+  max-width: 420px;
+  width: 90%;
+  transform: scale(0.95);
+  transition: transform 0.2s;
+}
+
+.modal-overlay.show .modal {
+  transform: scale(1);
+}
+
+.modal h3 {
+  font-size: 17px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.modal p {
+  font-size: 14px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-bottom: 22px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Toast
+   ═══════════════════════════════════════════════════════════════ */
+.toast-container {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toast {
+  padding: 12px 20px;
+  border-radius: var(--radius-btn);
+  background: var(--glass-bg-active);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-on-glass);
+  animation: toastIn 0.3s ease;
+  max-width: 360px;
+}
+
+.toast.success { border-left: 3px solid var(--success); }
+.toast.error   { border-left: 3px solid var(--danger); }
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(30px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Loading Spinner
+   ═══════════════════════════════════════════════════════════════ */
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--glass-border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  margin: 40px auto;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ═══════════════════════════════════════════════════════════════
+   Scrollbar Global
+   ═══════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--glass-border-hover); border-radius: 6px; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Responsive
+   ═══════════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+  .main { flex-direction: column; }
+  .sidebar { width: 100%; min-width: 0; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--glass-border); }
+  .detail { padding: 16px; }
+  .header-search { width: 200px; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Accessibility: Reduced Motion
+   ═══════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .user-card { opacity: 1; transform: none; }
+  .section { opacity: 1; transform: none; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Accessibility: High Contrast Mode
+   ═══════════════════════════════════════════════════════════════ */
+@media (forced-colors: active) {
+  .btn { border: 2px solid ButtonText; }
+  .user-card { border: 1px solid ButtonText; }
+  .user-card.active { border: 2px solid Highlight; }
+  .glass-card { border: 1px solid ButtonText; }
+  .modal { border: 2px solid ButtonText; }
+  .toast { border: 2px solid ButtonText; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- Skip Link -->
+  <a class="skip-link" href="#detailPanel">跳过导航，直接查看内容</a>
+
+  <!-- Header -->
+  <header class="header" role="banner">
+    <h1>✦ KiraOS Memory Manager</h1>
+    <div class="header-right">
+      <div class="header-search" role="search">
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <label for="searchInput" class="sr-only">搜索用户 ID</label>
+        <input type="text" id="searchInput" placeholder="搜索用户 ID ..." oninput="filterUsers()" autocomplete="off">
+      </div>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换明暗模式" aria-label="切换明暗模式">
+        <span id="themeIcon">🌙</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <div class="main">
+    <!-- Sidebar -->
+    <nav class="sidebar" id="sidebar" aria-label="用户列表">
+      <h2 class="sidebar-title">用户列表</h2>
+      <div id="userList" role="list" aria-label="用户列表"></div>
+    </nav>
+
+    <!-- Detail Panel -->
+    <main class="detail" id="detailPanel" aria-label="用户详情" aria-live="polite">
+      <div class="empty-state" id="emptyState" role="status">
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <path d="M12 2a7 7 0 0 1 7 7c0 3-2 5.5-4 7l-3 3.5L9 16c-2-1.5-4-4-4-7a7 7 0 0 1 7-7z"/>
+          <circle cx="12" cy="9" r="2"/>
+        </svg>
+        <p>选择一个用户查看记忆数据<br><span style="font-size:12px;opacity:0.6;">左侧列表展示所有有记忆记录的用户</span></p>
+      </div>
+      <div id="detailContent" style="display:none;"></div>
+    </main>
+  </div>
+
+  <!-- Modal -->
+  <div class="modal-overlay" id="modalOverlay" onclick="closeModal(event)" role="presentation">
+    <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMessage">
+      <h3 id="modalTitle">确认操作</h3>
+      <p id="modalMessage">确定要执行此操作吗？</p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+        <button class="btn btn-danger" id="modalConfirmBtn" onclick="confirmModal()">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer" role="status" aria-live="polite" aria-atomic="false"></div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════
+   State
+   ═══════════════════════════════════════════════════════════════ */
+let allUsers = [];
+let selectedUserId = null;
+let userData = null;
+let editingKey = null;
+let modalCallback = null;
+
+/* ═══════════════════════════════════════════════════════════════
+   API Helpers
+   ═══════════════════════════════════════════════════════════════ */
+function getToken() {
+  const params = new URLSearchParams(location.search);
+  return params.get('token') || '';
+}
+
+async function api(path, opts = {}) {
+  const token = getToken();
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch('/api' + path, { ...opts, headers });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Request failed');
+  }
+  return res.json();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Toast
+   ═══════════════════════════════════════════════════════════════ */
+function showToast(message, type = 'success') {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = 'toast ' + type;
+  toast.setAttribute('role', 'status');
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; toast.style.transform = 'translateX(30px)'; toast.style.transition = '0.3s'; }, 2500);
+  setTimeout(() => toast.remove(), 2800);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Modal
+   ═══════════════════════════════════════════════════════════════ */
+let _previousFocus = null;
+
+function showModal(title, message, callback) {
+  _previousFocus = document.activeElement;
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalMessage').textContent = message;
+  const overlay = document.getElementById('modalOverlay');
+  overlay.classList.add('show');
+  modalCallback = callback;
+  // Focus the first action button
+  setTimeout(() => {
+    const firstBtn = overlay.querySelector('.modal .btn');
+    if (firstBtn) firstBtn.focus();
+  }, 100);
+}
+
+function closeModal(e) {
+  if (e && e.target !== e.currentTarget) return;
+  document.getElementById('modalOverlay').classList.remove('show');
+  modalCallback = null;
+  // Return focus to the element that opened the modal
+  if (_previousFocus) { _previousFocus.focus(); _previousFocus = null; }
+}
+
+function confirmModal() {
+  if (modalCallback) modalCallback();
+  document.getElementById('modalOverlay').classList.remove('show');
+  modalCallback = null;
+  if (_previousFocus) { _previousFocus.focus(); _previousFocus = null; }
+}
+
+// Modal keyboard trap: Escape to close, Tab cycles within modal
+document.addEventListener('keydown', function(e) {
+  const overlay = document.getElementById('modalOverlay');
+  if (!overlay.classList.contains('show')) return;
+
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeModal();
+    return;
+  }
+
+  if (e.key === 'Tab') {
+    const focusable = overlay.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey) {
+      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+    } else {
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════
+   Scroll Reveal (IntersectionObserver)
+   ═══════════════════════════════════════════════════════════════ */
+function setupReveal(container) {
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry, i) => {
+        if (entry.isIntersecting) {
+          setTimeout(() => entry.target.classList.add('revealed'), i * 60);
+          observer.unobserve(entry.target);
+        }
+      });
+    },
+    { threshold: 0.08, root: container }
+  );
+  container.querySelectorAll('.user-card, .section').forEach(el => observer.observe(el));
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Load Users
+   ═══════════════════════════════════════════════════════════════ */
+async function loadUsers() {
+  const listEl = document.getElementById('userList');
+  listEl.innerHTML = '<div class="spinner" role="status" aria-label="加载中"><span class="sr-only">正在加载用户列表…</span></div>';
+  try {
+    allUsers = await api('/users');
+    renderUsers(allUsers);
+  } catch (e) {
+    listEl.innerHTML = '<div class="empty-state" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';
+  }
+}
+
+function filterUsers() {
+  const q = document.getElementById('searchInput').value.trim().toLowerCase();
+  const filtered = q ? allUsers.filter(u => u.user_id.toLowerCase().includes(q)) : allUsers;
+  renderUsers(filtered);
+}
+
+function renderUsers(users) {
+  const listEl = document.getElementById('userList');
+  if (!users.length) {
+    listEl.innerHTML = '<div class="empty-state" role="status"><p>暂无记忆数据</p></div>';
+    return;
+  }
+  listEl.innerHTML = users.map(u => `
+    <div class="user-card ${selectedUserId === u.user_id ? 'active' : ''}"
+         role="listitem" tabindex="0"
+         onclick="selectUser('${escapeAttr(u.user_id)}')"
+         onkeydown="handleCardKey(event, '${escapeAttr(u.user_id)}')"
+         data-uid="${escapeAttr(u.user_id)}"
+         aria-label="用户 ${escapeAttr(u.user_id)}，${u.profile_count} 条画像，${u.event_count} 条事件"
+         aria-current="${selectedUserId === u.user_id ? 'true' : 'false'}">
+      <div class="user-id">${escapeHtml(u.user_id)}</div>
+      <div class="user-badges">
+        <span class="badge" aria-hidden="true">📋 ${u.profile_count} 画像</span>
+        <span class="badge events" aria-hidden="true">📅 ${u.event_count} 事件</span>
+      </div>
+    </div>
+  `).join('');
+  setupReveal(document.getElementById('sidebar'));
+}
+
+function handleCardKey(e, userId) {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    selectUser(userId);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Select User
+   ═══════════════════════════════════════════════════════════════ */
+async function selectUser(userId) {
+  selectedUserId = userId;
+  editingKey = null;
+
+  // Update sidebar active state
+  document.querySelectorAll('.user-card').forEach(c => {
+    const isActive = c.dataset.uid === userId;
+    c.classList.toggle('active', isActive);
+    c.setAttribute('aria-current', isActive ? 'true' : 'false');
+  });
+
+  document.getElementById('emptyState').style.display = 'none';
+  const content = document.getElementById('detailContent');
+  content.style.display = 'block';
+  content.innerHTML = '<div class="spinner" role="status" aria-label="加载中"><span class="sr-only">正在加载用户数据…</span></div>';
+
+  try {
+    userData = await api('/users/' + encodeURIComponent(userId));
+    renderDetail();
+  } catch (e) {
+    content.innerHTML = '<div class="empty-state" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Render Detail
+   ═══════════════════════════════════════════════════════════════ */
+function renderDetail() {
+  if (!userData) return;
+  const { user_id, profiles, events } = userData;
+
+  // Group profiles by category
+  const groups = {};
+  const categoryOrder = ['basic', 'preference', 'social', 'other'];
+  profiles.forEach(p => {
+    if (!groups[p.category]) groups[p.category] = [];
+    groups[p.category].push(p);
+  });
+
+  const confMark = c => c >= 0.8 ? '✓' : c >= 0.5 ? '?' : '~';
+  const confColor = c => c >= 0.8 ? '#047857' : c >= 0.5 ? '#b45309' : '#dc2626';
+  const confLabel = c => c >= 0.8 ? '高置信度' : c >= 0.5 ? '中置信度' : '低置信度';
+
+  let profileHtml = '';
+  categoryOrder.forEach(cat => {
+    const items = groups[cat];
+    if (!items) return;
+    profileHtml += `<div class="glass-card section">
+      <div class="cat-header">${escapeHtml(cat)}</div>`;
+    items.forEach(p => {
+      if (editingKey === p.key) {
+        profileHtml += renderEditForm(p);
+      } else {
+        profileHtml += `
+        <div class="profile-row">
+          <span class="profile-key">${escapeHtml(p.key)}</span>
+          <span class="profile-value">${escapeHtml(p.value)}</span>
+          <span class="confidence-dot" style="color:${confColor(p.confidence)}" title="置信度: ${p.confidence}" aria-label="${confLabel(p.confidence)}: ${p.confidence}">${confMark(p.confidence)}</span>
+          <div class="profile-actions">
+            <button class="btn btn-icon btn-ghost" onclick="startEdit('${escapeAttr(p.key)}')" title="编辑" aria-label="编辑画像 ${escapeAttr(p.key)}">✎</button>
+            <button class="btn btn-icon btn-danger" onclick="deleteProfile('${escapeAttr(p.key)}')" title="删除" aria-label="删除画像 ${escapeAttr(p.key)}">×</button>
+          </div>
+        </div>`;
+      }
+    });
+    profileHtml += '</div>';
+  });
+
+  let eventHtml = '';
+  if (events.length) {
+    eventHtml = '<div class="glass-card section"><div class="timeline">';
+    events.forEach(ev => {
+      const time = ev.created_at ? ev.created_at.substring(0, 16).replace('T', ' ') : '';
+      eventHtml += `
+      <div class="event-row">
+        <span class="event-time">${escapeHtml(time)}</span>
+        <span class="event-summary">${escapeHtml(ev.event_summary)}</span>
+        <button class="btn btn-icon btn-danger event-del" onclick="deleteEvent(${ev.id})" title="删除事件" aria-label="删除事件: ${escapeAttr(ev.event_summary)}">×</button>
+      </div>`;
+    });
+    eventHtml += '</div></div>';
+  }
+
+  const content = document.getElementById('detailContent');
+  content.innerHTML = `
+    <div class="detail-header">
+      <h2 class="detail-user-id">${escapeHtml(user_id)}</h2>
+      <button class="btn btn-danger" onclick="clearAllMemory()" aria-label="清除 ${escapeAttr(user_id)} 的全部记忆">🗑 清除全部记忆</button>
+    </div>
+    <h3 class="section-title">画像 <span class="count" aria-label="${profiles.length} 条画像">${profiles.length}</span></h3>
+    ${profileHtml || '<div class="glass-card section" role="status"><div class="empty-state" style="padding:24px"><p>暂无画像数据</p></div></div>'}
+    <h3 class="section-title" style="margin-top:8px;">事件 <span class="count" aria-label="${events.length} 条事件">${events.length}</span></h3>
+    ${eventHtml || '<div class="glass-card section" role="status"><div class="empty-state" style="padding:24px"><p>暂无事件记录</p></div></div>'}
+  `;
+
+  setupReveal(document.getElementById('detailPanel'));
+}
+
+function renderEditForm(p) {
+  const editId = 'edit-' + p.key.replace(/[^a-zA-Z0-9]/g, '_');
+  return `
+  <div class="profile-row" style="flex-direction:column;align-items:stretch;" role="form" aria-label="编辑画像 ${escapeAttr(p.key)}">
+    <div class="profile-key" style="margin-bottom:8px;">${escapeHtml(p.key)}</div>
+    <div class="edit-form">
+      <div class="field-row">
+        <label for="edit-value">值</label>
+        <input type="text" id="edit-value" value="${escapeAttr(p.value)}" aria-required="true">
+      </div>
+      <div class="field-row">
+        <label for="edit-conf">置信度</label>
+        <input type="range" id="edit-conf" min="0" max="1" step="0.1" value="${p.confidence}" style="flex:1" aria-valuemin="0" aria-valuemax="1" aria-valuenow="${p.confidence}" oninput="document.getElementById('conf-display').textContent=this.value; this.setAttribute('aria-valuenow', this.value)">
+        <span id="conf-display" style="min-width:28px;text-align:center;font-size:12px;" aria-hidden="true">${p.confidence}</span>
+      </div>
+      <div class="field-row">
+        <label for="edit-cat">分类</label>
+        <select id="edit-cat">
+          ${['basic','preference','social','other'].map(c => `<option value="${c}" ${p.category===c?'selected':''}>${c}</option>`).join('')}
+        </select>
+      </div>
+      <div class="edit-actions">
+        <button class="btn btn-ghost" onclick="cancelEdit()">取消</button>
+        <button class="btn btn-primary" onclick="saveEdit('${escapeAttr(p.key)}')">保存</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Inline Edit
+   ═══════════════════════════════════════════════════════════════ */
+function startEdit(key) {
+  editingKey = key;
+  renderDetail();
+}
+
+function cancelEdit() {
+  editingKey = null;
+  renderDetail();
+}
+
+async function saveEdit(key) {
+  const value = document.getElementById('edit-value').value.trim();
+  const confidence = parseFloat(document.getElementById('edit-conf').value);
+  const category = document.getElementById('edit-cat').value;
+
+  if (!value) { showToast('值不能为空', 'error'); return; }
+
+  try {
+    await api('/users/' + encodeURIComponent(selectedUserId) + '/profiles/' + encodeURIComponent(key), {
+      method: 'PUT',
+      body: JSON.stringify({ value, confidence, category })
+    });
+    showToast('画像已更新');
+    editingKey = null;
+    await selectUser(selectedUserId);
+    await loadUsers(); // refresh counts
+  } catch (e) {
+    showToast('更新失败: ' + e.message, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Delete Operations
+   ═══════════════════════════════════════════════════════════════ */
+function deleteProfile(key) {
+  showModal('删除画像', `确定要删除画像 "${key}" 吗？此操作不可撤销。`, async () => {
+    try {
+      await api('/users/' + encodeURIComponent(selectedUserId) + '/profiles/' + encodeURIComponent(key), { method: 'DELETE' });
+      showToast('画像已删除');
+      await selectUser(selectedUserId);
+      await loadUsers();
+    } catch (e) {
+      showToast('删除失败: ' + e.message, 'error');
+    }
+  });
+}
+
+function deleteEvent(eventId) {
+  showModal('删除事件', '确定要删除此事件记录吗？', async () => {
+    try {
+      await api('/users/' + encodeURIComponent(selectedUserId) + '/events/' + eventId, { method: 'DELETE' });
+      showToast('事件已删除');
+      await selectUser(selectedUserId);
+      await loadUsers();
+    } catch (e) {
+      showToast('删除失败: ' + e.message, 'error');
+    }
+  });
+}
+
+function clearAllMemory() {
+  showModal(
+    '⚠ 清除全部记忆',
+    `即将删除用户 "${selectedUserId}" 的所有画像和事件记录。此操作不可恢复！`,
+    async () => {
+      try {
+        const res = await api('/users/' + encodeURIComponent(selectedUserId), { method: 'DELETE' });
+        showToast(`已清除: ${res.profiles_deleted} 条画像, ${res.events_deleted} 条事件`);
+        selectedUserId = null;
+        userData = null;
+        document.getElementById('detailContent').style.display = 'none';
+        document.getElementById('emptyState').style.display = '';
+        await loadUsers();
+      } catch (e) {
+        showToast('清除失败: ' + e.message, 'error');
+      }
+    }
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Helpers
+   ═══════════════════════════════════════════════════════════════ */
+function escapeHtml(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function escapeAttr(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Theme Toggle
+   ═══════════════════════════════════════════════════════════════ */
+function getPreferredTheme() {
+  const stored = localStorage.getItem('kiraos-theme');
+  if (stored === 'dark' || stored === 'light') return stored;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  document.getElementById('themeIcon').textContent = theme === 'dark' ? '☀️' : '🌙';
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') || getPreferredTheme();
+  const next = current === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('kiraos-theme', next);
+  applyTheme(next);
+}
+
+// Apply on load
+applyTheme(getPreferredTheme());
+
+/* ═══════════════════════════════════════════════════════════════
+   Init
+   ═══════════════════════════════════════════════════════════════ */
+loadUsers();
+</script>
+</body>
+</html>
