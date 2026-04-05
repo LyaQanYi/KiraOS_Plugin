@@ -97,6 +97,25 @@ html, body {
   overflow: hidden;
 }
 
+/* Theme transition — disabled on initial load via .no-transition */
+html:not(.no-transition),
+html:not(.no-transition) body,
+html:not(.no-transition) .header,
+html:not(.no-transition) .sidebar,
+html:not(.no-transition) .glass-card,
+html:not(.no-transition) .user-card,
+html:not(.no-transition) .modal,
+html:not(.no-transition) .toast,
+html:not(.no-transition) .btn,
+html:not(.no-transition) .badge,
+html:not(.no-transition) .cat-header,
+html:not(.no-transition) .profile-row,
+html:not(.no-transition) .edit-form input,
+html:not(.no-transition) .edit-form select,
+html:not(.no-transition) .header-search input {
+  transition: background 0.65s ease, color 0.65s ease, border-color 0.65s ease, box-shadow 0.65s ease;
+}
+
 /* ═══════════════════════════════════════════════════════════════
    Accessibility: Skip Link
    ═══════════════════════════════════════════════════════════════ */
@@ -177,6 +196,16 @@ html, body {
   transition: var(--transition);
   font-size: 16px;
   flex-shrink: 0;
+  overflow: hidden;
+}
+
+.theme-toggle .theme-icon {
+  display: inline-block;
+  transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
+}
+
+.theme-toggle:active .theme-icon {
+  transform: rotate(360deg) scale(0.8);
 }
 
 .theme-toggle:hover {
@@ -844,7 +873,7 @@ html, body {
         <input type="text" id="searchInput" placeholder="搜索用户 ID ..." oninput="filterUsers()" autocomplete="off">
       </div>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换明暗模式" aria-label="切换明暗模式">
-        <span id="themeIcon">🌙</span>
+        <span class="theme-icon" id="themeIcon">🌙</span>
       </button>
     </div>
   </header>
@@ -1293,20 +1322,37 @@ function getPreferredTheme() {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
-function applyTheme(theme) {
+function applyTheme(theme, animate) {
   document.documentElement.setAttribute('data-theme', theme);
-  document.getElementById('themeIcon').textContent = theme === 'dark' ? '☀️' : '🌙';
+  const icon = document.getElementById('themeIcon');
+  if (animate) {
+    icon.style.transform = 'rotate(360deg) scale(0)';
+    icon.style.opacity = '0';
+    setTimeout(() => {
+      icon.textContent = theme === 'dark' ? '☀️' : '🌙';
+      icon.style.transform = 'rotate(0deg) scale(1)';
+      icon.style.opacity = '1';
+    }, 200);
+  } else {
+    icon.textContent = theme === 'dark' ? '☀️' : '🌙';
+  }
 }
 
 function toggleTheme() {
   const current = document.documentElement.getAttribute('data-theme') || getPreferredTheme();
   const next = current === 'dark' ? 'light' : 'dark';
   localStorage.setItem('kiraos-theme', next);
-  applyTheme(next);
+  applyTheme(next, true);
 }
 
-// Apply on load
-applyTheme(getPreferredTheme());
+// Apply on load — suppress transition to avoid flash
+document.documentElement.classList.add('no-transition');
+applyTheme(getPreferredTheme(), false);
+requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    document.documentElement.classList.remove('no-transition');
+  });
+});
 
 /* ═══════════════════════════════════════════════════════════════
    Init
