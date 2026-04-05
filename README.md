@@ -134,7 +134,7 @@ LLM 在对话中识别到有价值的用户信息时，会自动调用 `memory_u
         "value": "画像值（set 时）或事件描述（event 时）",
         "category": "basic | preference | social | other（可选，默认 basic）",
         "confidence": "0-1 的置信度（可选，默认 0.5）",
-        "ttl": "过期时间，如 30d、7d、12h（可选）"
+        "ttl": "过期时间，如 30d、7d、12h、30m（可选）"
       }
     ]
   }
@@ -151,6 +151,7 @@ LLM 在对话中识别到有价值的用户信息时，会自动调用 `memory_u
 {"op": "set", "key": "昵称", "value": "小明", "category": "basic", "confidence": 0.9}
 {"op": "set", "key": "城市", "value": "北京", "category": "basic", "confidence": 0.8}
 {"op": "set", "key": "最近在减肥", "value": "是", "category": "other", "confidence": 0.5, "ttl": "30d"}
+{"op": "set", "key": "正在准备考试", "value": "是", "category": "other", "confidence": 0.6, "ttl": "30m"}
 ```
 
 #### `event` — 记录事件
@@ -379,10 +380,10 @@ data/skills/tarot_reading/
 | 技能 | 说明 | 斜杠命令 | 触发示例 |
 |------|------|----------|----------|
 | `tarot_reading` | 塔罗牌占卜 | `/tarot` | 「帮我算算今天的运势」 |
-| `daily_fortune` | 十二星座每日运势 | `/fortune` | 「我是双鱼座，看看今天运势」 |
+| `daily_fortune` | 每日星座运势 | `/fortune` | 「我是双鱼座，看看今天运势」 |
 | `story_continue` | 接龙续写故事 | `/story` | 「帮我续写这个故事：从前有座山……」 |
 | `emoji_interpret` | Emoji 解读翻译 | `/emoji` | 「🥺👉👈 这是什么意思？」 |
-| `nickname_generator` | 趣味昵称生成 | `/nickname` | 「帮我取个二次元风格的网名」 |
+| `nickname_generator` | 趣味昵称生成器 | `/nickname` | 「帮我取个二次元风格的网名」 |
 | `personality_test` | 趣味性格测试 | `/personality` | 「我想做个性格小测试」 |
 
 ---
@@ -397,7 +398,7 @@ data/skills/tarot_reading/
 | `max_profiles_per_user` | integer | 50 | 每个用户允许的最大画像条目数 |
 | `max_event_keep` | integer | 100 | 数据库中每个用户保留的最大事件数（超出自动清理） |
 | `max_context_chars` | integer | 500 | 每用户注入的记忆上下文最大字符数（0 = 不限制），超限时按分类优先级截断 |
-| `skills_dir` | string | `data/skills/` | 技能目录路径 |
+| `skills_dir` | string | `null` | 技能目录路径（为空时自动使用 `data/skills/`） |
 | `disabled_skills` | list | `[]` | 要禁用的技能名称列表，如 `["tarot_reading", "daily_fortune"]` |
 | `enable_slash_commands` | switch | `false` | 是否允许用户通过 `/command` 触发技能，默认关闭 |
 
@@ -435,6 +436,10 @@ CREATE TABLE event_logs (
     event_summary TEXT NOT NULL,
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 事件日志索引（按用户 + 时间倒序，加速上下文查询）
+CREATE INDEX idx_event_logs_user
+    ON event_logs (user_id, created_at DESC);
 ```
 
 ### 技能文件
