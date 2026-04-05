@@ -1,7 +1,7 @@
 # KiraOS 插件文档
 
 > **插件 ID**: `kira_plugin_kiraos`  
-> **版本**: 1.2.0  
+> **版本**: 1.3.0  
 > **作者**: LyaQanYi  
 > **兼容**: KiraAI v2.0 (dev branch)
 
@@ -26,6 +26,10 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
   - [memory_query 工具](#memory_query-工具)
   - [memory_clear 工具](#memory_clear-工具)
   - [上下文自动注入](#上下文自动注入)
+- [Memory WebUI](#memory-webui)
+  - [启用 WebUI](#启用-webui)
+  - [REST API](#rest-api)
+  - [认证](#认证)
 - [技能路由系统](#技能路由系统)
   - [工作原理](#技能---工作原理)
   - [创建自定义技能](#创建自定义技能)
@@ -51,8 +55,11 @@ core/plugin/builtin_plugins/
     ├── main.py
     ├── db.py
     ├── skill_router.py
+    ├── web_server.py
     ├── manifest.json
-    └── schema.json
+    ├── schema.json
+    └── web/
+        └── index.html
 ```
 
 无需修改任何代码。重启 Kira 后插件会自动被发现并加载。可在 WebUI 的插件管理页面中启用/禁用及调整配置。
@@ -216,6 +223,51 @@ LLM 调用：
 当总字符数超过 `max_context_chars` 限制时，按分类优先级（basic > preference > social > other > events）截断。
 
 注入目标为系统提示中 `name="memory"` 的部分，若不存在则追加到末尾。
+
+---
+
+## Memory WebUI
+
+KiraOS 内置了一个可视化记忆管理界面，基于 Starlette + 单文件 SPA 实现，可直接在浏览器中查看和管理所有用户的记忆数据。
+
+### 启用 WebUI
+
+在插件配置中设置 `webui_port` 为非零端口即可启用：
+
+| 配置键 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `webui_port` | integer | 0 | WebUI 监听端口（0 = 禁用）。推荐值：`8765` |
+| `webui_host` | string | `127.0.0.1` | 绑定地址。`127.0.0.1` 仅本机访问，`0.0.0.0` 允许远程 |
+| `webui_token` | string | `""` | 访问令牌（留空则无认证，仅限本地使用安全） |
+
+启用后，插件初始化时会自动启动 Web 服务器，终止时自动停止。
+
+访问地址：`http://<webui_host>:<webui_port>/`
+
+### REST API
+
+WebUI 通过以下 REST API 与后端交互：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/users` | 列出所有用户（含画像/事件计数） |
+| `GET` | `/api/users/{user_id}` | 获取用户的全部画像和事件 |
+| `PUT` | `/api/users/{user_id}/profiles/{key}` | 新增/更新画像条目 |
+| `DELETE` | `/api/users/{user_id}/profiles/{key}` | 删除画像条目 |
+| `DELETE` | `/api/users/{user_id}/events/{event_id}` | 删除单条事件 |
+| `DELETE` | `/api/users/{user_id}` | 清除用户全部记忆 |
+
+### 认证
+
+设置 `webui_token` 后，所有 API 请求需携带 Bearer Token：
+
+```text
+Authorization: Bearer <your_token>
+```
+
+首页（`/`）不需要认证，前端页面会通过 `?token=` 查询参数或 `Authorization` 头传递令牌。
+
+> ⚠️ 若在公网暴露 WebUI，**强烈建议**设置 `webui_token` 并使用 HTTPS 反向代理。
 
 ---
 
@@ -401,6 +453,9 @@ data/skills/tarot_reading/
 | `skills_dir` | string | `null` | 技能目录路径（为空时自动使用 `data/skills/`） |
 | `disabled_skills` | list | `[]` | 要禁用的技能名称列表，如 `["tarot_reading", "daily_fortune"]` |
 | `enable_slash_commands` | switch | `false` | 是否允许用户通过 `/command` 触发技能，默认关闭 |
+| `webui_port` | integer | 0 | Memory WebUI 监听端口（0 = 禁用）。推荐值：8765 |
+| `webui_host` | string | `127.0.0.1` | WebUI 绑定地址。`127.0.0.1` 仅本机访问 |
+| `webui_token` | string | `""` | WebUI 访问令牌（留空则无认证） |
 
 所有整型配置项最小值为 0。
 
@@ -459,6 +514,8 @@ KiraOS Plugin (main.py)
 │   └── event_logs 表               ← 短期事件
 ├── SkillRouter (skill_router.py)  ← 技能发现与指令构建
 │   └── SkillInfo                   ← 元数据 + trigger/exclude/command + 指令缓存
+├── WebUIServer (web_server.py)    ← Memory WebUI（REST API + SPA）
+│   └── web/index.html              ← 单文件前端界面
 ├── memory_update()                ← LLM 工具：批量记忆操作
 ├── memory_query()                 ← LLM 工具：查询用户记忆
 ├── memory_clear()                 ← LLM 工具：清除全部记忆
@@ -470,9 +527,9 @@ KiraOS Plugin (main.py)
 
 | 阶段 | 操作 |
 |------|------|
-| `initialize()` | 自动禁用内置 Simple Memory → 初始化数据库（含自动迁移）→ 扫描技能目录 → 注册技能工具 → 构建斜杠命令映射 |
-| 运行中 | `inject_context` 钩子注入记忆；`handle_slash_command` 拦截斜杠命令；LLM 按需调用记忆工具和技能工具 |
-| `terminate()` | 注销技能工具 → 关闭数据库连接 |
+| `initialize()` | 自动禁用内置 Simple Memory → 初始化数据库（含自动迁移）→ 扫描技能目录 → 注册技能工具 → 构建斜杠命令映射 → 启动 WebUI（如已配置） |
+| 运行中 | `inject_context` 钩子注入记忆；`handle_slash_command` 拦截斜杠命令；LLM 按需调用记忆工具和技能工具；WebUI 提供 REST API |
+| `terminate()` | 停止 WebUI → 注销技能工具 → 关闭数据库连接 |
 
 ---
 
@@ -506,6 +563,23 @@ KiraOS Plugin (main.py)
 ---
 
 ## 更新日志
+
+### v1.3.0
+
+**Memory WebUI**
+
+- **新增**：内置 Memory WebUI — 基于 Starlette 的可视化记忆管理界面，支持浏览器中查看、编辑、删除用户画像和事件
+- **新增**：REST API — 完整的用户记忆 CRUD 接口（列出用户、查询/更新/删除画像、删除事件、清除用户记忆）
+- **新增**：Bearer Token 认证中间件 — 可选的 API 访问控制，保护公网部署安全
+- **新增**：单文件 SPA 前端（`web/index.html`）— 毛玻璃风格 UI，支持亮色/暗色主题自动切换与手动切换
+- **新增**：3 项配置 — `webui_port`（监听端口）、`webui_host`（绑定地址）、`webui_token`（访问令牌）
+- **新增**：WebUI 生命周期自动管理 — 插件初始化时自动启动，终止时自动停止
+
+**数据库扩展**
+
+- **新增**：`list_users()` 方法 — 汇总所有用户及其画像/事件计数
+- **新增**：`delete_event()` 方法 — 按 ID 删除单条事件日志
+- **新增**：`get_events_with_id()` 方法 — 返回带 ID 的事件列表，供 WebUI 使用
 
 ### v1.2.0
 
