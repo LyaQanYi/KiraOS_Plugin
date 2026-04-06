@@ -236,6 +236,62 @@ class UserMemoryDB:
             c2 = conn.execute("DELETE FROM event_logs WHERE user_id = ?", (user_id,))
             conn.commit()
             return c1.rowcount, c2.rowcount
+    # ── User Listing (for WebUI) ───────────────────────────────────
+
+    def list_users(self) -> List[Dict]:
+        """Return a summary of all users with profile and event counts."""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute(
+                """SELECT uid, 
+                          COALESCE(pc, 0) AS profile_count,
+                          COALESCE(ec, 0) AS event_count
+                   FROM (
+                       SELECT user_id AS uid FROM user_profiles
+                       UNION
+                       SELECT user_id AS uid FROM event_logs
+                   ) all_users
+                   LEFT JOIN (
+                       SELECT user_id, COUNT(*) AS pc FROM user_profiles GROUP BY user_id
+                   ) p ON p.user_id = uid
+                   LEFT JOIN (
+                       SELECT user_id, COUNT(*) AS ec FROM event_logs GROUP BY user_id
+                   ) e ON e.user_id = uid
+                   ORDER BY uid"""
+            )
+            return [
+                {"user_id": row[0], "profile_count": row[1], "event_count": row[2]}
+                for row in cursor.fetchall()
+            ]
+
+    def delete_event(self, event_id: int, user_id: str | None = None) -> bool:
+        """Delete a single event log entry by its ID. If user_id is given, also verify ownership."""
+        with self._lock:
+            conn = self._get_conn()
+            if user_id is not None:
+                cursor = conn.execute(
+                    "DELETE FROM event_logs WHERE id = ? AND user_id = ?",
+                    (event_id, user_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM event_logs WHERE id = ?", (event_id,)
+                )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_events_with_id(self, user_id: str, limit: int = 100) -> List[Tuple[int, str, str]]:
+        """Return recent events with IDs as (id, event_summary, created_at) tuples."""
+        limit = max(limit, 0)
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute(
+                "SELECT id, event_summary, created_at FROM event_logs "
+                "WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT ?",
+                (user_id, limit)
+            )
+            return cursor.fetchall()
+
     # ── Event Log Operations ────────────────────────────────────────
 
     def save_event(self, user_id: str, event_summary: str) -> None:

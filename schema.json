@@ -44,5 +44,25 @@
         "type": "switch",
         "default": false,
         "hint": "Allow users to trigger skills via /command (e.g. /tarot, /fortune). When disabled, skills can only be triggered by LLM."
+    },
+    "webui_port": {
+        "name": "Memory WebUI port",
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 65535,
+        "hint": "Port for the memory management WebUI (0 = disabled, valid range: 1-65535). Example: 8765"
+    },
+    "webui_host": {
+        "name": "Memory WebUI host",
+        "type": "string",
+        "default": "127.0.0.1",
+        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access"
+    },
+    "webui_token": {
+        "name": "Memory WebUI token",
+        "type": "string",
+        "default": "",
+        "hint": "Access token for the memory WebUI (leave empty for no authentication, only safe for local access)"
     }
 }

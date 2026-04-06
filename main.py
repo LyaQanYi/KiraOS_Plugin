@@ -74,6 +74,12 @@ class UserMemoryPlugin(BasePlugin):
         self._command_map: dict[str, SkillInfo] = {}
         self._enable_slash_commands: bool = bool(cfg.get("enable_slash_commands", False))
 
+        # ── WebUI config ────────────────────────────────────────────
+        self._webui_port = int(cfg.get("webui_port", 0))
+        self._webui_host = str(cfg.get("webui_host", "127.0.0.1"))
+        self._webui_token = str(cfg.get("webui_token", ""))
+        self._webui_server: object | None = None
+
     # ════════════════════════════════════════════════════════════════
     #  Lifecycle
     # ════════════════════════════════════════════════════════════════
@@ -103,6 +109,17 @@ class UserMemoryPlugin(BasePlugin):
         else:
             logger.info("No skills found (place skill folders in data/skills/)")
 
+        # ── Start Memory WebUI (if port configured) ─────────────
+        if self._webui_port > 0 and self.db:
+            from .web_server import WebUIServer
+            self._webui_server = WebUIServer(
+                db=self.db,
+                host=self._webui_host,
+                port=self._webui_port,
+                token=self._webui_token,
+            )
+            await self._webui_server.start()
+
         logger.info("KiraOS plugin initialized (memory + skill router)")
 
     BUILTIN_MEMORY_PLUGIN_ID = "kira_plugin_simple_memory"
@@ -123,6 +140,11 @@ class UserMemoryPlugin(BasePlugin):
             logger.warning(f"检查内置记忆插件状态时出错: {e}")
 
     async def terminate(self):
+        # ── Stop Memory WebUI ───────────────────────────────────────
+        if self._webui_server:
+            await self._webui_server.stop()
+            self._webui_server = None
+
         # ── Unregister skill tools ──────────────────────────────────
         for name in self._registered_skill_names:
             try:
