@@ -1084,8 +1084,6 @@ function renderUsers(users) {
   listEl.innerHTML = users.map(u => `
     <div class="user-card ${selectedUserId === u.user_id ? 'active' : ''}"
          role="listitem" tabindex="0"
-         onclick="selectUser('${escapeAttr(u.user_id)}')"
-         onkeydown="handleCardKey(event, '${escapeAttr(u.user_id)}')"
          data-uid="${escapeAttr(u.user_id)}"
          aria-label="用户 ${escapeAttr(u.user_id)}，${u.profile_count} 条画像，${u.event_count} 条事件"
          aria-current="${selectedUserId === u.user_id ? 'true' : 'false'}">
@@ -1102,6 +1100,19 @@ function renderUsers(users) {
 function handleCardKey(e, userId) {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectUser(userId); }
 }
+
+// Event delegation for user cards (avoids inline handlers with user data)
+(function() {
+  const listEl = document.getElementById('userList');
+  listEl.addEventListener('click', function(e) {
+    const card = e.target.closest('.user-card');
+    if (card && card.dataset.uid) selectUser(card.dataset.uid);
+  });
+  listEl.addEventListener('keydown', function(e) {
+    const card = e.target.closest('.user-card');
+    if (card && card.dataset.uid) handleCardKey(e, card.dataset.uid);
+  });
+})();
 
 /* ═══════════════════════════════════════════════════════════════
    Select User
@@ -1141,10 +1152,10 @@ async function selectUser(userId) {
 /* Silently refresh selected user data (for live update, no spinner) */
 async function refreshSelectedUser() {
   if (!selectedUserId || editingKey || addingProfile || addingEvent || editingEventId !== null) return;
-  const localRequestId = ++_selectRequestId;
+  const capturedId = selectedUserId;
   try {
-    const data = await api('/users/' + encodeURIComponent(selectedUserId));
-    if (localRequestId !== _selectRequestId) return;
+    const data = await api('/users/' + encodeURIComponent(capturedId));
+    if (capturedId !== selectedUserId) return;
     const dataJson = JSON.stringify(data);
     if (dataJson !== _lastUserDataJson) {
       _lastUserDataJson = dataJson;
@@ -1324,6 +1335,8 @@ function showCreateUserDialog() {
     _lastUsersJson = JSON.stringify(allUsers);
     filterUsers();
   }
+  // Switch to memory page first so detail panel is visible
+  if (currentPage !== 'memory') navigateTo('memory');
   // Create empty userData for the new user and select it
   selectedUserId = trimmed;
   userData = { user_id: trimmed, profiles: [], events: [] };

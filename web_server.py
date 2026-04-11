@@ -368,6 +368,7 @@ class WebUIServer:
         self._server: Optional[uvicorn.Server] = None
         self._task: Optional[asyncio.Task] = None
         self._original_handler = None
+        self._poll_log_filter: Optional[_PollLogFilter] = None
 
     async def start(self):
         """Start the web server in a background asyncio task."""
@@ -382,8 +383,9 @@ class WebUIServer:
         self._server = uvicorn.Server(config)
 
         # Suppress repetitive access logs from high-frequency polling endpoints
+        self._poll_log_filter = _PollLogFilter()
         access_logger = logging.getLogger("uvicorn.access")
-        access_logger.addFilter(_PollLogFilter())
+        access_logger.addFilter(self._poll_log_filter)
 
         # Suppress Windows ProactorEventLoop ConnectionResetError noise
         # that fires in async callbacks *after* connections close.
@@ -415,6 +417,11 @@ class WebUIServer:
                 self._task.cancel()
             self._task = None
         self._server = None
+
+        # Remove access log filter
+        if self._poll_log_filter:
+            logging.getLogger("uvicorn.access").removeFilter(self._poll_log_filter)
+            self._poll_log_filter = None
 
         # Restore original exception handler
         try:
