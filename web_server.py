@@ -84,9 +84,9 @@ async def api_stats(request: Request) -> JSONResponse:
     try:
         stats = db.get_stats()
         return JSONResponse(stats)
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error getting stats")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_list_users(request: Request) -> JSONResponse:
@@ -97,9 +97,9 @@ async def api_list_users(request: Request) -> JSONResponse:
     try:
         users = db.list_users()
         return JSONResponse(users)
-    except Exception as e:
-        logger.error(f"Error listing users: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error listing users")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_get_user(request: Request) -> JSONResponse:
@@ -140,9 +140,9 @@ async def api_get_user(request: Request) -> JSONResponse:
             "profiles": profile_list,
             "events": event_list,
         })
-    except Exception as e:
-        logger.error(f"Error getting user {user_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error getting user {user_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_update_profile(request: Request) -> JSONResponse:
@@ -180,9 +180,9 @@ async def api_update_profile(request: Request) -> JSONResponse:
                         category=category,
                         expires_at=expires_at)
         return JSONResponse({"ok": True, "key": key, "value": value})
-    except Exception as e:
-        logger.error(f"Error updating profile {user_id}/{key}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error updating profile {user_id}/{key}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_delete_profile(request: Request) -> JSONResponse:
@@ -199,9 +199,9 @@ async def api_delete_profile(request: Request) -> JSONResponse:
         if removed:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Profile not found"}, status_code=404)
-    except Exception as e:
-        logger.error(f"Error deleting profile {user_id}/{key}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error deleting profile {user_id}/{key}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_delete_event(request: Request) -> JSONResponse:
@@ -221,9 +221,9 @@ async def api_delete_event(request: Request) -> JSONResponse:
         if removed:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
-    except Exception as e:
-        logger.error(f"Error deleting event {event_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error deleting event {event_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_clear_user(request: Request) -> JSONResponse:
@@ -241,9 +241,9 @@ async def api_clear_user(request: Request) -> JSONResponse:
             "profiles_deleted": profiles_del,
             "events_deleted": events_del,
         })
-    except Exception as e:
-        logger.error(f"Error clearing user {user_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error clearing user {user_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_add_event(request: Request) -> JSONResponse:
@@ -265,10 +265,13 @@ async def api_add_event(request: Request) -> JSONResponse:
 
     try:
         db.save_event(user_id, event_summary)
+        max_keep = request.app.state.max_event_keep
+        if max_keep:
+            db.cleanup_old_events(user_id, keep=max_keep)
         return JSONResponse({"ok": True})
-    except Exception as e:
-        logger.error(f"Error adding event for {user_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error adding event for {user_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_update_event(request: Request) -> JSONResponse:
@@ -297,9 +300,9 @@ async def api_update_event(request: Request) -> JSONResponse:
         if updated:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
-    except Exception as e:
-        logger.error(f"Error updating event {event_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error updating event {event_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -319,7 +322,7 @@ class _PollLogFilter(logging.Filter):
 #  App Factory & Server Management
 # ════════════════════════════════════════════════════════════════════
 
-def create_app(db, token: str = "") -> Starlette:
+def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
     """Create the Starlette app with routes and middleware."""
     # Order matters: more-specific (longer) routes first, then catch-all.
     routes = [
@@ -341,30 +344,32 @@ def create_app(db, token: str = "") -> Starlette:
 
     app = Starlette(routes=routes, middleware=middleware)
     app.state.db = db
+    app.state.max_event_keep = max_event_keep
     return app
 
 
 class WebUIServer:
     """Manages the uvicorn server lifecycle for the memory WebUI."""
 
-    def __init__(self, db, host: str = "127.0.0.1", port: int = 8765, token: str = ""):
+    def __init__(self, db, host: str = "127.0.0.1", port: int = 8765, token: str = "", max_event_keep: int = 0):
         self.db = db
         self.host = host
         self.port = port
         self.token = token
+        self.max_event_keep = max_event_keep
         self._server: Optional[uvicorn.Server] = None
         self._task: Optional[asyncio.Task] = None
         self._original_handler = None
 
     async def start(self):
         """Start the web server in a background asyncio task."""
-        app = create_app(self.db, self.token)
+        app = create_app(self.db, self.token, max_event_keep=self.max_event_keep)
         config = uvicorn.Config(
             app,
             host=self.host,
             port=self.port,
             log_level="warning",
-            access_log=False,
+            access_log=True,
         )
         self._server = uvicorn.Server(config)
 

@@ -117,6 +117,7 @@ class UserMemoryPlugin(BasePlugin):
                 host=self._webui_host,
                 port=self._webui_port,
                 token=self._webui_token,
+                max_event_keep=self.max_event_keep,
             )
             await self._webui_server.start()
 

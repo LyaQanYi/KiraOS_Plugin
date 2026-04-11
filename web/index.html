@@ -687,7 +687,7 @@ html:not(.no-transition) .live-toggle {
 .section-title-row .btn { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
 .add-inline-form {
   background: var(--glass-bg); border: 1px solid var(--glass-border);
-  border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
+  border-radius: var(--radius-card); padding: 16px; margin-bottom: 12px;
 }
 .add-inline-form .field-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .add-inline-form .field-row label { min-width: 52px; font-size: 12px; font-weight: 600; color: var(--text-muted); }
@@ -795,7 +795,9 @@ html:not(.no-transition) .live-toggle {
     </nav>
 
     <!-- Content Area -->
-    <main class="content-area" id="contentArea" aria-live="polite">
+    <main class="content-area" id="contentArea">
+      <!-- Live region for status announcements -->
+      <div id="statusLive" class="sr-only" aria-live="polite" aria-atomic="true"></div>
       <!-- Overview Page -->
       <div class="page-panel visible" id="overviewPanel">
         <h2 class="overview-title">概览</h2>
@@ -910,6 +912,9 @@ function showToast(message, type = 'success') {
   toast.setAttribute('role', 'status');
   toast.textContent = message;
   container.appendChild(toast);
+  // Announce to dedicated live region for screen readers
+  const live = document.getElementById('statusLive');
+  if (live) live.textContent = message;
   setTimeout(() => { toast.style.opacity = '0'; toast.style.transform = 'translateX(30px)'; toast.style.transition = '0.3s'; }, 2500);
   setTimeout(() => toast.remove(), 2800);
 }
