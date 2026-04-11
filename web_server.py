@@ -9,6 +9,7 @@ Uses only uvicorn + starlette (shipped with FastAPI, zero extra deps).
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -73,6 +74,19 @@ async def serve_index(request: Request) -> Response:
     if not index_path.is_file():
         return HTMLResponse("<h1>KiraOS Memory WebUI</h1><p>index.html not found.</p>", status_code=404)
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
+
+
+async def api_stats(request: Request) -> JSONResponse:
+    """GET /api/stats — Return global statistics."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    try:
+        stats = db.get_stats()
+        return JSONResponse(stats)
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def api_list_users(request: Request) -> JSONResponse:
@@ -232,6 +246,75 @@ async def api_clear_user(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def api_add_event(request: Request) -> JSONResponse:
+    """POST /api/users/{user_id}/events — Add a new event."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    user_id = request.path_params["user_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    event_summary = (body.get("event_summary") or "").strip()
+    if not event_summary:
+        return JSONResponse({"error": "event_summary is required"}, status_code=400)
+
+    try:
+        db.save_event(user_id, event_summary)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logger.error(f"Error adding event for {user_id}: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_update_event(request: Request) -> JSONResponse:
+    """PUT /api/users/{user_id}/events/{event_id} — Update an event's summary."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    user_id = request.path_params["user_id"]
+    try:
+        event_id = int(request.path_params["event_id"])
+    except ValueError:
+        return JSONResponse({"error": "Invalid event_id"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    event_summary = (body.get("event_summary") or "").strip()
+    if not event_summary:
+        return JSONResponse({"error": "event_summary is required"}, status_code=400)
+
+    try:
+        updated = db.update_event(event_id, event_summary, user_id=user_id)
+        if updated:
+            return JSONResponse({"ok": True})
+        return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
+    except Exception as e:
+        logger.error(f"Error updating event {event_id}: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Logging Filter — suppress noisy polling endpoints
+# ════════════════════════════════════════════════════════════════════
+
+class _PollLogFilter(logging.Filter):
+    """Drop access-log records for high-frequency polling paths."""
+    _QUIET = ('/api/stats', '/api/users')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p in msg for p in self._QUIET)
+
+
 # ════════════════════════════════════════════════════════════════════
 #  App Factory & Server Management
 # ════════════════════════════════════════════════════════════════════
@@ -243,9 +326,12 @@ def create_app(db, token: str = "") -> Starlette:
         Route("/", serve_index, methods=["GET"]),
         Route("/api/users/{user_id}/profiles/{key}", api_update_profile, methods=["PUT"]),
         Route("/api/users/{user_id}/profiles/{key}", api_delete_profile, methods=["DELETE"]),
+        Route("/api/users/{user_id}/events/{event_id:int}", api_update_event, methods=["PUT"]),
         Route("/api/users/{user_id}/events/{event_id:int}", api_delete_event, methods=["DELETE"]),
+        Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
         Route("/api/users/{user_id}", api_get_user, methods=["GET"]),
         Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
+        Route("/api/stats", api_stats, methods=["GET"]),
         Route("/api/users", api_list_users, methods=["GET"]),
     ]
 
@@ -281,6 +367,10 @@ class WebUIServer:
             access_log=False,
         )
         self._server = uvicorn.Server(config)
+
+        # Suppress repetitive access logs from high-frequency polling endpoints
+        access_logger = logging.getLogger("uvicorn.access")
+        access_logger.addFilter(_PollLogFilter())
 
         # Suppress Windows ProactorEventLoop ConnectionResetError noise
         # that fires in async callbacks *after* connections close.

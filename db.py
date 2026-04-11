@@ -236,6 +236,31 @@ class UserMemoryDB:
             c2 = conn.execute("DELETE FROM event_logs WHERE user_id = ?", (user_id,))
             conn.commit()
             return c1.rowcount, c2.rowcount
+    # ── Statistics (for WebUI) ─────────────────────────────────────
+
+    def get_stats(self) -> Dict:
+        """Return global statistics: total users, profiles, and events."""
+        with self._lock:
+            conn = self._get_conn()
+            total_users = conn.execute(
+                """SELECT COUNT(*) FROM (
+                       SELECT user_id FROM user_profiles
+                       UNION
+                       SELECT user_id FROM event_logs
+                   )"""
+            ).fetchone()[0]
+            total_profiles = conn.execute(
+                "SELECT COUNT(*) FROM user_profiles"
+            ).fetchone()[0]
+            total_events = conn.execute(
+                "SELECT COUNT(*) FROM event_logs"
+            ).fetchone()[0]
+            return {
+                "total_users": total_users,
+                "total_profiles": total_profiles,
+                "total_events": total_events,
+            }
+
     # ── User Listing (for WebUI) ───────────────────────────────────
 
     def list_users(self) -> List[Dict]:
@@ -303,6 +328,23 @@ class UserMemoryDB:
                 (user_id, event_summary, datetime.now().isoformat())
             )
             conn.commit()
+
+    def update_event(self, event_id: int, event_summary: str, user_id: str | None = None) -> bool:
+        """Update an existing event's summary. If user_id is given, also verify ownership."""
+        with self._lock:
+            conn = self._get_conn()
+            if user_id is not None:
+                cursor = conn.execute(
+                    "UPDATE event_logs SET event_summary = ? WHERE id = ? AND user_id = ?",
+                    (event_summary, event_id, user_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE event_logs SET event_summary = ? WHERE id = ?",
+                    (event_summary, event_id),
+                )
+            conn.commit()
+            return cursor.rowcount > 0
 
     def get_recent_events(self, user_id: str, limit: int = 5) -> List[Tuple[str, str]]:
         """Return the most recent events for a user as (event_summary, created_at) tuples."""
