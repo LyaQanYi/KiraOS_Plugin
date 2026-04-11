@@ -8,6 +8,7 @@ Uses only uvicorn + starlette (shipped with FastAPI, zero extra deps).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -26,6 +27,16 @@ from core.logging_manager import get_logger
 logger = get_logger("kiraos_webui", "cyan")
 
 _WEB_DIR = Path(__file__).parent / "web"
+MAX_EVENT_SUMMARY_LEN = 1000
+
+
+def _mask_id(value: str) -> str:
+    """Return a masked identifier safe for logging (prefix + short hash)."""
+    if not value:
+        return "<empty>"
+    h = hashlib.sha256(value.encode()).hexdigest()[:8]
+    prefix = value[:3] if len(value) >= 3 else value
+    return f"{prefix}***({h})"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -141,7 +152,7 @@ async def api_get_user(request: Request) -> JSONResponse:
             "events": event_list,
         })
     except Exception:
-        logger.exception(f"Error getting user {user_id}")
+        logger.exception("Error getting user %s", _mask_id(user_id))
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
@@ -181,7 +192,7 @@ async def api_update_profile(request: Request) -> JSONResponse:
                         expires_at=expires_at)
         return JSONResponse({"ok": True, "key": key, "value": value})
     except Exception:
-        logger.exception(f"Error updating profile {user_id}/{key}")
+        logger.exception("Error updating profile %s/%s", _mask_id(user_id), key)
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
@@ -200,7 +211,7 @@ async def api_delete_profile(request: Request) -> JSONResponse:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Profile not found"}, status_code=404)
     except Exception:
-        logger.exception(f"Error deleting profile {user_id}/{key}")
+        logger.exception("Error deleting profile %s/%s", _mask_id(user_id), key)
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
@@ -242,7 +253,7 @@ async def api_clear_user(request: Request) -> JSONResponse:
             "events_deleted": events_del,
         })
     except Exception:
-        logger.exception(f"Error clearing user {user_id}")
+        logger.exception("Error clearing user %s", _mask_id(user_id))
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
@@ -262,16 +273,26 @@ async def api_add_event(request: Request) -> JSONResponse:
     event_summary = (body.get("event_summary") or "").strip()
     if not event_summary:
         return JSONResponse({"error": "event_summary is required"}, status_code=400)
+    if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
+        return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
 
     try:
         db.save_event(user_id, event_summary)
+    except Exception:
+        logger.exception("Error adding event for %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+    # Cleanup runs best-effort after successful save
+    try:
         max_keep = max(0, int(request.app.state.max_event_keep))
         if max_keep > 0:
             db.cleanup_old_events(user_id, keep=max_keep)
-        return JSONResponse({"ok": True})
+    except (ValueError, TypeError):
+        logger.warning("Invalid max_event_keep value, skipping cleanup")
     except Exception:
-        logger.exception(f"Error adding event for {user_id}")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
+        logger.exception("Error during event cleanup for %s", _mask_id(user_id))
+
+    return JSONResponse({"ok": True})
 
 
 async def api_update_event(request: Request) -> JSONResponse:
@@ -294,6 +315,8 @@ async def api_update_event(request: Request) -> JSONResponse:
     event_summary = (body.get("event_summary") or "").strip()
     if not event_summary:
         return JSONResponse({"error": "event_summary is required"}, status_code=400)
+    if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
+        return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
 
     try:
         updated = db.update_event(event_id, event_summary, user_id=user_id)
