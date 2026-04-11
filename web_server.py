@@ -8,7 +8,9 @@ Uses only uvicorn + starlette (shipped with FastAPI, zero extra deps).
 """
 
 import asyncio
+import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +27,16 @@ from core.logging_manager import get_logger
 logger = get_logger("kiraos_webui", "cyan")
 
 _WEB_DIR = Path(__file__).parent / "web"
+MAX_EVENT_SUMMARY_LEN = 1000
+
+
+def _mask_id(value: str) -> str:
+    """Return a masked identifier safe for logging (prefix + short hash)."""
+    if not value:
+        return "<empty>"
+    h = hashlib.sha256(value.encode()).hexdigest()[:8]
+    prefix = value[:3] if len(value) >= 3 else value
+    return f"{prefix}***({h})"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -75,6 +87,19 @@ async def serve_index(request: Request) -> Response:
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
 
+async def api_stats(request: Request) -> JSONResponse:
+    """GET /api/stats — Return global statistics."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    try:
+        stats = db.get_stats()
+        return JSONResponse(stats)
+    except Exception:
+        logger.exception("Error getting stats")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
 async def api_list_users(request: Request) -> JSONResponse:
     """GET /api/users — List all users with memory data."""
     db = _get_db(request)
@@ -83,9 +108,9 @@ async def api_list_users(request: Request) -> JSONResponse:
     try:
         users = db.list_users()
         return JSONResponse(users)
-    except Exception as e:
-        logger.error(f"Error listing users: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error listing users")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_get_user(request: Request) -> JSONResponse:
@@ -126,9 +151,9 @@ async def api_get_user(request: Request) -> JSONResponse:
             "profiles": profile_list,
             "events": event_list,
         })
-    except Exception as e:
-        logger.error(f"Error getting user {user_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error getting user %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_update_profile(request: Request) -> JSONResponse:
@@ -142,7 +167,7 @@ async def api_update_profile(request: Request) -> JSONResponse:
 
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     value = body.get("value", "")
@@ -166,9 +191,9 @@ async def api_update_profile(request: Request) -> JSONResponse:
                         category=category,
                         expires_at=expires_at)
         return JSONResponse({"ok": True, "key": key, "value": value})
-    except Exception as e:
-        logger.error(f"Error updating profile {user_id}/{key}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error updating profile %s/%s", _mask_id(user_id), key)
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_delete_profile(request: Request) -> JSONResponse:
@@ -185,9 +210,9 @@ async def api_delete_profile(request: Request) -> JSONResponse:
         if removed:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Profile not found"}, status_code=404)
-    except Exception as e:
-        logger.error(f"Error deleting profile {user_id}/{key}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error deleting profile %s/%s", _mask_id(user_id), key)
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_delete_event(request: Request) -> JSONResponse:
@@ -207,9 +232,9 @@ async def api_delete_event(request: Request) -> JSONResponse:
         if removed:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
-    except Exception as e:
-        logger.error(f"Error deleting event {event_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception(f"Error deleting event {event_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 async def api_clear_user(request: Request) -> JSONResponse:
@@ -227,25 +252,120 @@ async def api_clear_user(request: Request) -> JSONResponse:
             "profiles_deleted": profiles_del,
             "events_deleted": events_del,
         })
-    except Exception as e:
-        logger.error(f"Error clearing user {user_id}: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Error clearing user %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+async def api_add_event(request: Request) -> JSONResponse:
+    """POST /api/users/{user_id}/events — Add a new event."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    user_id = request.path_params["user_id"]
+
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    event_summary = (body.get("event_summary") or "").strip()
+    if not event_summary:
+        return JSONResponse({"error": "event_summary is required"}, status_code=400)
+    if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
+        return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
+
+    try:
+        db.save_event(user_id, event_summary)
+    except Exception:
+        logger.exception("Error adding event for %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+    # Cleanup runs best-effort after successful save
+    try:
+        max_keep = max(0, int(request.app.state.max_event_keep))
+        if max_keep > 0:
+            db.cleanup_old_events(user_id, keep=max_keep)
+    except (ValueError, TypeError):
+        logger.warning("Invalid max_event_keep value, skipping cleanup")
+    except Exception:
+        logger.exception("Error during event cleanup for %s", _mask_id(user_id))
+
+    return JSONResponse({"ok": True})
+
+
+async def api_update_event(request: Request) -> JSONResponse:
+    """PUT /api/users/{user_id}/events/{event_id} — Update an event's summary."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    user_id = request.path_params["user_id"]
+    try:
+        event_id = int(request.path_params["event_id"])
+    except ValueError:
+        return JSONResponse({"error": "Invalid event_id"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    event_summary = (body.get("event_summary") or "").strip()
+    if not event_summary:
+        return JSONResponse({"error": "event_summary is required"}, status_code=400)
+    if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
+        return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
+
+    try:
+        updated = db.update_event(event_id, event_summary, user_id=user_id)
+        if updated:
+            return JSONResponse({"ok": True})
+        return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
+    except Exception:
+        logger.exception(f"Error updating event {event_id}")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Logging Filter — suppress noisy polling endpoints
+# ════════════════════════════════════════════════════════════════════
+
+class _PollLogFilter(logging.Filter):
+    """Drop access-log records for high-frequency GET polling paths."""
+    _QUIET_EXACT = frozenset({'/api/stats', '/api/users'})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        # Uvicorn access log format: '<addr> - "<METHOD> <path> HTTP/..." <status>'
+        if '"GET ' not in msg:
+            return True
+        for path in self._QUIET_EXACT:
+            # Match exact path followed by space or query string
+            marker = f'"GET {path} '
+            if marker in msg or f'"GET {path}?' in msg:
+                return False
+        return True
 
 
 # ════════════════════════════════════════════════════════════════════
 #  App Factory & Server Management
 # ════════════════════════════════════════════════════════════════════
 
-def create_app(db, token: str = "") -> Starlette:
+def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
     """Create the Starlette app with routes and middleware."""
     # Order matters: more-specific (longer) routes first, then catch-all.
     routes = [
         Route("/", serve_index, methods=["GET"]),
         Route("/api/users/{user_id}/profiles/{key}", api_update_profile, methods=["PUT"]),
         Route("/api/users/{user_id}/profiles/{key}", api_delete_profile, methods=["DELETE"]),
+        Route("/api/users/{user_id}/events/{event_id:int}", api_update_event, methods=["PUT"]),
         Route("/api/users/{user_id}/events/{event_id:int}", api_delete_event, methods=["DELETE"]),
+        Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
         Route("/api/users/{user_id}", api_get_user, methods=["GET"]),
         Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
+        Route("/api/stats", api_stats, methods=["GET"]),
         Route("/api/users", api_list_users, methods=["GET"]),
     ]
 
@@ -255,32 +375,40 @@ def create_app(db, token: str = "") -> Starlette:
 
     app = Starlette(routes=routes, middleware=middleware)
     app.state.db = db
+    app.state.max_event_keep = max_event_keep
     return app
 
 
 class WebUIServer:
     """Manages the uvicorn server lifecycle for the memory WebUI."""
 
-    def __init__(self, db, host: str = "127.0.0.1", port: int = 8765, token: str = ""):
+    def __init__(self, db, host: str = "127.0.0.1", port: int = 8765, token: str = "", max_event_keep: int = 0):
         self.db = db
         self.host = host
         self.port = port
         self.token = token
+        self.max_event_keep = max_event_keep
         self._server: Optional[uvicorn.Server] = None
         self._task: Optional[asyncio.Task] = None
         self._original_handler = None
+        self._poll_log_filter: Optional[_PollLogFilter] = None
 
     async def start(self):
         """Start the web server in a background asyncio task."""
-        app = create_app(self.db, self.token)
+        app = create_app(self.db, self.token, max_event_keep=self.max_event_keep)
         config = uvicorn.Config(
             app,
             host=self.host,
             port=self.port,
             log_level="warning",
-            access_log=False,
+            access_log=True,
         )
         self._server = uvicorn.Server(config)
+
+        # Suppress repetitive access logs from high-frequency polling endpoints
+        self._poll_log_filter = _PollLogFilter()
+        access_logger = logging.getLogger("uvicorn.access")
+        access_logger.addFilter(self._poll_log_filter)
 
         # Suppress Windows ProactorEventLoop ConnectionResetError noise
         # that fires in async callbacks *after* connections close.
@@ -312,6 +440,11 @@ class WebUIServer:
                 self._task.cancel()
             self._task = None
         self._server = None
+
+        # Remove access log filter
+        if self._poll_log_filter:
+            logging.getLogger("uvicorn.access").removeFilter(self._poll_log_filter)
+            self._poll_log_filter = None
 
         # Restore original exception handler
         try:
