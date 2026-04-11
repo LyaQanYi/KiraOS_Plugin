@@ -311,7 +311,7 @@ async def api_update_event(request: Request) -> JSONResponse:
 
 class _PollLogFilter(logging.Filter):
     """Drop access-log records for high-frequency GET polling paths."""
-    _QUIET_EXACT = {'/api/stats', '/api/users'}
+    _QUIET_EXACT = frozenset({'/api/stats', '/api/users'})
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
