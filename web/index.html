@@ -197,9 +197,11 @@ html:not(.no-transition) .live-toggle {
   overflow: hidden;
 }
 .theme-toggle .theme-icon {
-  display: inline-block;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px;
   transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
 }
+.theme-toggle .theme-icon svg { width: 100%; height: 100%; fill: currentColor; }
 .theme-toggle:active .theme-icon { transform: rotate(360deg) scale(0.8); }
 .theme-toggle:hover { background: var(--glass-bg-hover); border-color: var(--glass-border-hover); }
 .theme-toggle:focus-visible { box-shadow: var(--focus-ring); outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -763,7 +765,7 @@ html:not(.no-transition) .live-toggle {
         <span id="liveLabel">实时更新：开</span>
       </button>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换明暗模式" aria-label="切换明暗模式">
-        <span class="theme-icon" id="themeIcon">🌙</span>
+        <span class="theme-icon" id="themeIcon"></span>
       </button>
     </div>
   </header>
@@ -1568,19 +1570,23 @@ function getPreferredTheme() {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+const _sunSvg = '<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg"><path d="M305.594 515.321c0 117.6 95.334 212.934 212.934 212.934s212.934-95.334 212.934-212.934-95.334-212.934-212.934-212.934-212.934 95.334-212.934 212.934z"/><path d="M518.565 233.7H497.9a13.711 13.711 0 0 1-13.707-13.706v-75.62a13.712 13.712 0 0 1 13.707-13.71h20.669a13.711 13.711 0 0 1 13.702 13.71v75.623a13.711 13.711 0 0 1-13.706 13.703zM317.4 304.434l-14.62 14.62a13.7 13.7 0 0 1-19.381 0l-53.474-53.473a13.7 13.7 0 0 1 0-19.381l14.62-14.62a13.7 13.7 0 0 1 19.381 0l53.474 53.473a13.7 13.7 0 0 1 0 19.381zM230.036 501.55v20.669a13.712 13.712 0 0 1-13.706 13.707h-75.623A13.712 13.712 0 0 1 127 522.22v-20.67a13.712 13.712 0 0 1 13.707-13.706h75.623a13.712 13.712 0 0 1 13.706 13.706z m77.606 201.164l14.62 14.62a13.7 13.7 0 0 1 0 19.381l-53.473 53.474a13.7 13.7 0 0 1-19.381 0l-14.62-14.62a13.7 13.7 0 0 1 0-19.381l53.473-53.474a13.7 13.7 0 0 1 19.381 0.001z m197.116 87.365h20.669a13.711 13.711 0 0 1 13.706 13.706v75.623a13.711 13.711 0 0 1-13.706 13.706h-20.669a13.712 13.712 0 0 1-13.706-13.706v-75.622a13.712 13.712 0 0 1 13.706-13.707z m201.165-77.605l14.62-14.62a13.7 13.7 0 0 1 19.381 0l53.476 53.473a13.7 13.7 0 0 1 0 19.381l-14.62 14.62a13.7 13.7 0 0 1-19.381 0l-53.473-53.473a13.7 13.7 0 0 1-0.003-19.381z m87.365-197.116v-20.67a13.711 13.711 0 0 1 13.706-13.706h75.623a13.711 13.711 0 0 1 13.706 13.706v20.669a13.711 13.711 0 0 1-13.706 13.706h-75.623a13.711 13.711 0 0 1-13.707-13.705z m-77.607-201.165l-14.62-14.62a13.7 13.7 0 0 1 0-19.381l53.473-53.473a13.7 13.7 0 0 1 19.381 0l14.62 14.62a13.7 13.7 0 0 1 0 19.381l-53.474 53.473a13.7 13.7 0 0 1-19.38 0z"/></svg>';
+const _moonSvg = '<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg"><path d="M525.248 896c-109.632 0-203.2-38.784-280.832-116.48S128 608.128 128 498.56c0-78.784 22.272-151.808 66.752-219.264a402.112 402.112 0 0 1 174.656-149.12c4.48-3.392 9.088-2.816 13.632 1.728 5.76 3.456 7.488 8.512 5.12 15.424a338.752 338.752 0 0 0-27.328 131.968c0 101.632 36.288 188.736 108.8 261.248s159.488 108.8 261.12 108.8c55.872 0 104.448-8.512 145.536-25.664 4.48-3.52 9.024-2.944 13.568 1.6 5.76 3.456 7.488 8.512 5.12 15.488-29.632 77.632-77.824 139.584-144.64 185.856C683.52 872.896 608.576 896 525.248 896z"/></svg>';
+
 function applyTheme(theme, animate) {
   document.documentElement.setAttribute('data-theme', theme);
   const icon = document.getElementById('themeIcon');
+  const svg = theme === 'dark' ? _moonSvg : _sunSvg;
   if (animate) {
     icon.style.transform = 'rotate(360deg) scale(0)';
     icon.style.opacity = '0';
     setTimeout(() => {
-      icon.textContent = theme === 'dark' ? '☀️' : '🌙';
+      icon.innerHTML = svg;
       icon.style.transform = 'rotate(0deg) scale(1)';
       icon.style.opacity = '1';
     }, 200);
   } else {
-    icon.textContent = theme === 'dark' ? '☀️' : '🌙';
+    icon.innerHTML = svg;
   }
 }
 
