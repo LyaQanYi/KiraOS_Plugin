@@ -776,12 +776,12 @@ html:not(.no-transition) .live-toggle {
         <button class="nav-item active" id="navOverview" onclick="navigateTo('overview')" aria-current="page">
           <span class="nav-icon">📊</span> 概览
         </button>
-        <button class="nav-item" id="navMemory" onclick="toggleMemoryNav()">
+        <button class="nav-item" id="navMemory" onclick="toggleMemoryNav()" aria-expanded="false" aria-controls="navSub">
           <span class="nav-icon">🧠</span> 记忆管理
           <span class="nav-arrow">▶</span>
         </button>
       </div>
-      <div class="nav-sub" id="navSub">
+      <div class="nav-sub" id="navSub" aria-hidden="true">
         <div class="nav-sub-inner">
           <div class="nav-search" role="search">
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
@@ -848,7 +848,7 @@ html:not(.no-transition) .live-toggle {
   </div>
 
   <!-- Toast Container -->
-  <div class="toast-container" id="toastContainer" role="status" aria-live="polite" aria-atomic="false"></div>
+  <div class="toast-container" id="toastContainer"></div>
 </div>
 
 <script>
@@ -909,7 +909,6 @@ function showToast(message, type = 'success') {
   const container = document.getElementById('toastContainer');
   const toast = document.createElement('div');
   toast.className = 'toast ' + type;
-  toast.setAttribute('role', 'status');
   toast.textContent = message;
   container.appendChild(toast);
   // Announce to dedicated live region for screen readers
@@ -1011,6 +1010,8 @@ function toggleMemoryNav() {
   const btn = document.getElementById('navMemory');
   sub.classList.toggle('expanded', memoryNavExpanded);
   btn.classList.toggle('expanded', memoryNavExpanded);
+  btn.setAttribute('aria-expanded', String(memoryNavExpanded));
+  sub.setAttribute('aria-hidden', String(!memoryNavExpanded));
 
   // Switch to memory page when expanding
   if (memoryNavExpanded) {
