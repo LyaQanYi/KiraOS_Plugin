@@ -156,7 +156,7 @@ async def api_update_profile(request: Request) -> JSONResponse:
 
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     value = body.get("value", "")
@@ -256,7 +256,7 @@ async def api_add_event(request: Request) -> JSONResponse:
 
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     event_summary = (body.get("event_summary") or "").strip()
@@ -265,8 +265,8 @@ async def api_add_event(request: Request) -> JSONResponse:
 
     try:
         db.save_event(user_id, event_summary)
-        max_keep = request.app.state.max_event_keep
-        if max_keep:
+        max_keep = max(0, int(request.app.state.max_event_keep))
+        if max_keep > 0:
             db.cleanup_old_events(user_id, keep=max_keep)
         return JSONResponse({"ok": True})
     except Exception:
@@ -288,7 +288,7 @@ async def api_update_event(request: Request) -> JSONResponse:
 
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     event_summary = (body.get("event_summary") or "").strip()
@@ -310,12 +310,20 @@ async def api_update_event(request: Request) -> JSONResponse:
 # ════════════════════════════════════════════════════════════════════
 
 class _PollLogFilter(logging.Filter):
-    """Drop access-log records for high-frequency polling paths."""
-    _QUIET = ('/api/stats', '/api/users')
+    """Drop access-log records for high-frequency GET polling paths."""
+    _QUIET_EXACT = {'/api/stats', '/api/users'}
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        return not any(p in msg for p in self._QUIET)
+        # Uvicorn access log format: '<addr> - "<METHOD> <path> HTTP/..." <status>'
+        if '"GET ' not in msg:
+            return True
+        for path in self._QUIET_EXACT:
+            # Match exact path followed by space or query string
+            marker = f'"GET {path} '
+            if marker in msg or f'"GET {path}?' in msg:
+                return False
+        return True
 
 
 # ════════════════════════════════════════════════════════════════════
