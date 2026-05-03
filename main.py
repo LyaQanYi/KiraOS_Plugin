@@ -28,7 +28,7 @@ from core.prompt_manager import Prompt
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, KiraStepResult
 from core.utils.path_utils import get_data_path
 
-from .db import UserMemoryDB, _parse_ttl, VALID_CATEGORIES, CATEGORY_PRIORITY
+from .db import UserMemoryDB, _parse_ttl, VALID_CATEGORIES, CATEGORY_PRIORITY, _mask_id
 from .skill_router import SkillRouter, SkillInfo
 
 # ────────────────────────────────────────────────────────────────────
@@ -713,7 +713,7 @@ class UserMemoryPlugin(BasePlugin):
 
         dedup_note = f" [{dropped} 重复操作已合并]" if dropped else ""
         logger.info(
-            f"memory_update for {primary_uid}: {len(operations)} ops "
+            f"memory_update for {_mask_id(primary_uid)}: {len(operations)} ops "
             f"({dropped} deduped) → {len(results)} results"
         )
         return (
@@ -850,7 +850,7 @@ class UserMemoryPlugin(BasePlugin):
         if user_id == "unknown":
             return "Error: cannot determine user_id"
         profiles_del, events_del = self.db.clear_user_memory(user_id)
-        logger.info(f"memory_clear for {user_id}: {profiles_del} profiles, {events_del} events deleted")
+        logger.info(f"memory_clear for {_mask_id(user_id)}: {profiles_del} profiles, {events_del} events deleted")
         return f"已清除全部记忆: 删除了 {profiles_del} 条画像和 {events_del} 条事件记录。"
 
     # ════════════════════════════════════════════════════════════════
@@ -1063,7 +1063,7 @@ class UserMemoryPlugin(BasePlugin):
             try:
                 resp = await asyncio.wait_for(client.chat(req), timeout=15.0)
             except asyncio.TimeoutError:
-                logger.warning(f"[auditor] LLM call timed out for user {user_id}")
+                logger.warning(f"[auditor] LLM call timed out for user {_mask_id(user_id)}")
                 return
             text = (resp.text_response or "").strip()
             if not text:
@@ -1071,7 +1071,7 @@ class UserMemoryPlugin(BasePlugin):
 
             extracted = self._parse_auditor_output(text)
             if not extracted:
-                logger.info(f"[auditor] {user_id}: no facts extracted")
+                logger.info(f"[auditor] {_mask_id(user_id)}: no facts extracted")
                 return
 
             # Write to DB. Each entry goes through upsert_with_limit so M6
@@ -1105,16 +1105,17 @@ class UserMemoryPlugin(BasePlugin):
                 else:
                     skipped += 1
                     logger.info(
-                        f"[auditor] {user_id}: {key}={value!r} skipped ({status}: {info})"
+                        f"[auditor] {_mask_id(user_id)}: {_mask_id(key)} skipped "
+                        f"({status}: {info})"
                     )
 
             logger.info(
-                f"[auditor] {user_id}: extracted {len(extracted)}, "
+                f"[auditor] {_mask_id(user_id)}: extracted {len(extracted)}, "
                 f"written {written}, skipped {skipped}"
             )
         except Exception as e:
             # Don't let a buggy auditor take down the main turn. Log and move on.
-            logger.exception(f"[auditor] error for {user_id}: {e}")
+            logger.exception(f"[auditor] error for {_mask_id(user_id)}: {e}")
 
     @staticmethod
     def _parse_auditor_output(text: str) -> list[dict]:

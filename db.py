@@ -19,6 +19,7 @@ Expiration:
     function which forces a full scan.
 """
 
+import hashlib
 import os
 import re
 import sqlite3
@@ -31,6 +32,21 @@ from typing import Dict, List, Optional, Tuple
 from core.logging_manager import get_logger
 
 logger = get_logger("kiraos_db", "green")
+
+
+def _mask_id(value: object) -> str:
+    """Return a masked identifier safe for log files.
+
+    Mirrors the helper in ``web_server.py`` so user_ids and memory keys never
+    leak into rotating log files (which may be retained, shared, or pasted
+    into bug reports). Format: ``<3-char prefix>***(<8-char sha256>)``.
+    """
+    s = "" if value is None else str(value)
+    if not s:
+        return "<empty>"
+    digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:8]
+    prefix = s[:3] if len(s) >= 3 else s
+    return f"{prefix}***({digest})"
 
 # Category priority for context injection (lower = higher priority)
 CATEGORY_PRIORITY = {"basic": 0, "preference": 1, "social": 2, "other": 3}
@@ -101,6 +117,34 @@ def _epoch_to_iso_date(epoch: Optional[int]) -> Optional[str]:
         return datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d")
     except (ValueError, OSError, OverflowError):
         return None
+
+
+def _normalize_iso_timestamp(value) -> str:
+    """Coerce a timestamp value into an ISO-8601 string.
+
+    ``import_all`` writes ``created_at`` and ``updated_at`` straight into the
+    DB, where downstream code does ``ts[:10]`` to render the date prefix. If
+    the snapshot smuggles in an ``int`` epoch or a ``datetime`` object (from a
+    JSON export tool that round-trips dates differently, or a hand-edited
+    backup), that string-slice would crash on the very first read.
+
+    Strategy:
+      - bare ``str`` that isn't empty → keep it (assume already ISO; if it
+        isn't, downstream slicing returns garbage but doesn't crash)
+      - ``datetime`` → ``.isoformat()``
+      - ``int`` / ``float`` → treated as unix epoch
+      - everything else → ``datetime.now().isoformat()`` as a safe default
+    """
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value)).isoformat()
+        except (ValueError, OSError, OverflowError):
+            return datetime.now().isoformat()
+    return datetime.now().isoformat()
 
 
 class UserMemoryDB:
@@ -285,8 +329,8 @@ class UserMemoryDB:
         clipped, was_truncated = self._clip_value(value, MAX_PROFILE_VALUE_LEN)
         if was_truncated:
             logger.warning(
-                f"Profile value for {user_id}/{key} truncated from {len(str(value))} "
-                f"to {MAX_PROFILE_VALUE_LEN} chars"
+                f"Profile value for {_mask_id(user_id)}/{_mask_id(key)} truncated "
+                f"from {len(str(value))} to {MAX_PROFILE_VALUE_LEN} chars"
             )
         with self._write_lock:
             conn = self._get_conn()
@@ -408,7 +452,7 @@ class UserMemoryDB:
                     # surfaces it so we can correlate with the outer error.
                     logger.warning(
                         f"upsert_with_limit: rollback failed for "
-                        f"{user_id}/{key}: {rb_err}"
+                        f"{_mask_id(user_id)}/{_mask_id(key)}: {rb_err}"
                     )
                 raise
 
@@ -572,8 +616,8 @@ class UserMemoryDB:
         clipped, was_truncated = self._clip_value(event_summary, MAX_EVENT_LEN)
         if was_truncated:
             logger.warning(
-                f"Event summary for {user_id} truncated from {len(str(event_summary))} "
-                f"to {MAX_EVENT_LEN} chars"
+                f"Event summary for {_mask_id(user_id)} truncated "
+                f"from {len(str(event_summary))} to {MAX_EVENT_LEN} chars"
             )
         tag_norm = tag.strip() if isinstance(tag, str) and tag.strip() else None
         with self._write_lock:
@@ -879,15 +923,23 @@ class UserMemoryDB:
             if not entry["snippet"]:
                 entry["snippet"] = f"id: {uid}"
 
-        # Match by profile value — group by user_id so each matching user
-        # occupies exactly one slot. MIN() picks an arbitrary but stable row
-        # to serve as the snippet sample.
+        # Match by profile value. Bug-resistant pattern: aggregating
+        # MIN(memory_key) and MIN(memory_value) separately can pick those
+        # two strings from *different* rows of the same user, producing a
+        # synthetic "key=value" snippet that doesn't actually exist in the DB.
+        # Instead, pick a single sample rowid per user via a subquery, then
+        # JOIN back to the source row so the snippet's key and value always
+        # come from the same record.
         for uid, sample_key, sample_value in conn.execute(
-            "SELECT user_id, MIN(memory_key), MIN(memory_value) "
-            "FROM user_profiles "
-            "WHERE memory_value LIKE ? ESCAPE '!' "
-            "GROUP BY user_id "
-            "LIMIT ?",
+            "SELECT p.user_id, p.memory_key, p.memory_value "
+            "FROM user_profiles p "
+            "INNER JOIN ("
+            "    SELECT user_id, MIN(rowid) AS sample_rowid "
+            "    FROM user_profiles "
+            "    WHERE memory_value LIKE ? ESCAPE '!' "
+            "    GROUP BY user_id "
+            "    LIMIT ?"
+            ") s ON p.rowid = s.sample_rowid",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
@@ -895,13 +947,17 @@ class UserMemoryDB:
             if not entry["snippet"]:
                 entry["snippet"] = f"{sample_key}={(sample_value or '')[:60]}"
 
-        # Match by event summary — same per-user aggregation
+        # Match by event summary — same single-row sampling approach
         for uid, sample_summary in conn.execute(
-            "SELECT user_id, MIN(event_summary) "
-            "FROM event_logs "
-            "WHERE event_summary LIKE ? ESCAPE '!' "
-            "GROUP BY user_id "
-            "LIMIT ?",
+            "SELECT e.user_id, e.event_summary "
+            "FROM event_logs e "
+            "INNER JOIN ("
+            "    SELECT user_id, MIN(id) AS sample_id "
+            "    FROM event_logs "
+            "    WHERE event_summary LIKE ? ESCAPE '!' "
+            "    GROUP BY user_id "
+            "    LIMIT ?"
+            ") s ON e.id = s.sample_id",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
@@ -946,15 +1002,32 @@ class UserMemoryDB:
         """Dump every user's profiles + events to a JSON-serializable dict.
 
         Designed to round-trip through ``import_all``.
+
+        Both SELECTs run inside a single deferred transaction so they observe
+        the **same** SQLite snapshot — without this guard, a writer that
+        commits between the two queries can produce a backup with a row in
+        ``event_logs`` referencing a profile that the export has already
+        skipped past, leaving cross-table inconsistency in the JSON.
         """
         conn = self._get_conn()
-        prof_rows = conn.execute(
-            "SELECT user_id, memory_key, memory_value, updated_at, "
-            "       confidence, category, expires_at FROM user_profiles"
-        ).fetchall()
-        evt_rows = conn.execute(
-            "SELECT user_id, event_summary, created_at, tag FROM event_logs"
-        ).fetchall()
+        try:
+            conn.execute("BEGIN")
+            prof_rows = conn.execute(
+                "SELECT user_id, memory_key, memory_value, updated_at, "
+                "       confidence, category, expires_at FROM user_profiles"
+            ).fetchall()
+            evt_rows = conn.execute(
+                "SELECT user_id, event_summary, created_at, tag FROM event_logs"
+            ).fetchall()
+        finally:
+            # Release the read lock — read-only so commit() and rollback()
+            # are equivalent here.
+            try:
+                conn.commit()
+            except sqlite3.OperationalError:
+                # If something went wrong before BEGIN actually opened a
+                # transaction, ignore — the SELECTs above will have raised.
+                pass
         return {
             "schema_version": self.EXPORT_SCHEMA_VERSION,
             "exported_at": datetime.now().isoformat(),
@@ -986,8 +1059,13 @@ class UserMemoryDB:
         Returns a dict with counts: ``profiles_added``, ``profiles_updated``,
         ``profiles_skipped``, ``events_added``.
 
-        Validation is permissive — malformed rows are skipped with a warning
-        rather than aborting the whole import.
+        - merge / upsert: lenient — malformed rows are skipped and counted in
+          ``profiles_skipped``.
+        - replace: strict — the snapshot is **fully validated before** the
+          existing tables are wiped. Any malformed row raises ``ValueError``
+          and the live DB is left untouched. Without this guard, a corrupt
+          or partial snapshot would erase the user's data and leave only
+          fragments behind.
         """
         if mode not in ("merge", "replace", "upsert"):
             raise ValueError(f"invalid mode: {mode!r}")
@@ -996,6 +1074,40 @@ class UserMemoryDB:
         events = data.get("events") or []
         if not isinstance(profiles, list) or not isinstance(events, list):
             raise ValueError("profiles/events must be lists")
+
+        # Optional schema_version sanity check — only enforce the upper bound
+        # (rejecting future versions); older versions are tolerated since
+        # they're a strict subset of the current shape.
+        sv = data.get("schema_version")
+        if sv is not None and isinstance(sv, int) and sv > self.EXPORT_SCHEMA_VERSION:
+            raise ValueError(
+                f"snapshot schema_version {sv} is newer than supported "
+                f"({self.EXPORT_SCHEMA_VERSION}); refusing to import"
+            )
+
+        # Strict pre-validation for replace: do a dry run that surfaces every
+        # bad row up front so we never DELETE then partially restore.
+        if mode == "replace":
+            for i, row in enumerate(profiles):
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"replace: profiles[{i}] is {type(row).__name__}, expected dict"
+                    )
+                if not row.get("user_id") or not row.get("key") or row.get("value") is None:
+                    raise ValueError(
+                        f"replace: profiles[{i}] missing required fields "
+                        f"(user_id/key/value)"
+                    )
+            for i, row in enumerate(events):
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"replace: events[{i}] is {type(row).__name__}, expected dict"
+                    )
+                if not row.get("user_id") or not row.get("summary"):
+                    raise ValueError(
+                        f"replace: events[{i}] missing required fields "
+                        f"(user_id/summary)"
+                    )
 
         added = updated = skipped = events_added = 0
         with self._write_lock:
@@ -1025,7 +1137,11 @@ class UserMemoryDB:
                     except (TypeError, ValueError):
                         conf = 0.5
                     exp = _to_epoch(row.get("expires_at"))
-                    ua = row.get("updated_at") or datetime.now().isoformat()
+                    # Normalize updated_at — see _normalize_iso_timestamp;
+                    # downstream rendering slices ts[:10] and would crash on
+                    # an int/datetime value smuggled in by a hand-edited
+                    # snapshot.
+                    ua = _normalize_iso_timestamp(row.get("updated_at"))
                     clipped, _ = self._clip_value(val, MAX_PROFILE_VALUE_LEN)
 
                     if mode == "merge":
@@ -1099,7 +1215,9 @@ class UserMemoryDB:
                     if not uid or not summary:
                         skipped += 1
                         continue
-                    ca = row.get("created_at") or datetime.now().isoformat()
+                    # Same normalization as profiles.updated_at — guard
+                    # against int epoch / datetime objects in the snapshot.
+                    ca = _normalize_iso_timestamp(row.get("created_at"))
                     tag = row.get("tag")
                     if isinstance(tag, str) and not tag.strip():
                         tag = None
