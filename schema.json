@@ -89,5 +89,13 @@
         "type": "list",
         "default": ["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"],
         "hint": "If the user's latest message contains any of these, the auditor skips that turn entirely (privacy guard for messages that shouldn't be recorded)."
+    },
+    "memory_auditor_max_inflight": {
+        "name": "Memory auditor max concurrent calls",
+        "type": "integer",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 32,
+        "hint": "Maximum number of concurrent in-flight auditor LLM calls. When this many audits are already running, new turns are dropped (best-effort; auditor is an opt-in bonus layer). Lower = stricter, fewer rate-limit hits; higher = more thorough but more provider load."
     }
 }

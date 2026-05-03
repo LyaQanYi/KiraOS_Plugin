@@ -151,6 +151,16 @@ class UserMemoryPlugin(BasePlugin):
         # external reference can be garbage-collected mid-execution and
         # silently disappear. We park each task here and remove it when done.
         self._auditor_tasks: set[asyncio.Task] = set()
+        # Cap concurrent in-flight auditor calls so a traffic spike can't
+        # pile up dozens of pending fast-LLM requests, slow down shutdown,
+        # or trigger provider rate limits. Above this threshold new audits
+        # are dropped (best-effort behaviour — auditor is already an opt-in
+        # bonus layer, missing one turn is fine).
+        self._auditor_max_inflight: int = max(1, int(cfg.get("memory_auditor_max_inflight", 4)))
+        # Belt-and-suspenders: a Semaphore around the actual LLM call so any
+        # future caller of _run_auditor() (not just schedule_audit) is also
+        # bounded.
+        self._auditor_semaphore: Optional[asyncio.Semaphore] = None
         # Confidence ceiling for auditor writes — keeps the main LLM's
         # high-confidence judgements authoritative when both sides write
         # the same key. M6 conflict-detection enforces this naturally:
@@ -599,7 +609,12 @@ class UserMemoryPlugin(BasePlugin):
                 continue
             op = raw.get("op", "")
             key = raw.get("key", "")
-            target = raw.get("user_id") or primary_uid
+            # Only fall back to primary when ``user_id`` is missing/null —
+            # ``or primary_uid`` would silently substitute on falsy values
+            # (``""``, ``0``, ``False``) that the LLM might emit, hiding bad
+            # input from the per-item validator below.
+            raw_target = raw.get("user_id")
+            target = primary_uid if raw_target is None else raw_target
             if op in ("set", "del") and key:
                 dedup_key = (op, key, target)
                 if dedup_key in seen:
@@ -620,7 +635,11 @@ class UserMemoryPlugin(BasePlugin):
             value = item.get("value", "")
 
             # ── M5: per-op user_id with sender whitelist
-            target_uid = item.get("user_id") or primary_uid
+            # Only None/missing falls back; falsy values (""/0/False) flow
+            # through to the validator below so bad LLM input is surfaced
+            # instead of silently routed to the primary speaker.
+            raw_target = item.get("user_id")
+            target_uid = primary_uid if raw_target is None else raw_target
             if not isinstance(target_uid, str) or not target_uid:
                 results.append("skip: invalid target user_id")
                 continue
@@ -774,8 +793,12 @@ class UserMemoryPlugin(BasePlugin):
         primary_uid = self._get_primary_user_id(event)
         if primary_uid == "unknown" and not user_id:
             return "Error: cannot determine user_id"
-        target = user_id or primary_uid
-        if user_id:
+        # Only fall back when user_id wasn't explicitly given (None). An LLM
+        # call passing ``user_id=""`` should flow into the whitelist check
+        # below and get rejected, rather than silently routing to the primary
+        # speaker as ``or primary_uid`` would have done.
+        target = primary_uid if user_id is None else user_id
+        if user_id is not None:
             sender_set = set(self._extract_user_ids(event))
             if primary_uid != "unknown":
                 sender_set.add(primary_uid)
@@ -974,6 +997,19 @@ class UserMemoryPlugin(BasePlugin):
             self._audited_event_ids.add(eid)
             return
 
+        # Inflight cap. Each auditor call can take up to 15s (model timeout),
+        # so an unbounded burst would queue tasks faster than they drain,
+        # slow down terminate(), and could trip provider rate-limits. Drop
+        # excess turns at the door — the auditor is best-effort anyway.
+        if len(self._auditor_tasks) >= self._auditor_max_inflight:
+            logger.info(
+                f"[auditor] inflight cap reached "
+                f"({len(self._auditor_tasks)}/{self._auditor_max_inflight}), "
+                "dropping this turn"
+            )
+            self._audited_event_ids.add(eid)
+            return
+
         self._audited_event_ids.add(eid)
         # Defensive cap on the dedup set so a long session can't bloat it.
         if len(self._audited_event_ids) > self._max_audit_dedup_size:
@@ -1084,8 +1120,19 @@ class UserMemoryPlugin(BasePlugin):
                 user_prompt=[Prompt(payload, name="auditor_payload", source="kiraos")],
             )
             req.assemble_prompt()
+
+            # Lazily build the semaphore on first use — Semaphore must be
+            # created on the running event loop, which __init__ doesn't have
+            # access to. ``schedule_audit``'s inflight check is the primary
+            # throttle; this is a secondary cap so any future direct caller
+            # of ``_run_auditor`` (without the inflight check) still can't
+            # exceed the configured concurrency.
+            if self._auditor_semaphore is None:
+                self._auditor_semaphore = asyncio.Semaphore(self._auditor_max_inflight)
+
             try:
-                resp = await asyncio.wait_for(client.chat(req), timeout=15.0)
+                async with self._auditor_semaphore:
+                    resp = await asyncio.wait_for(client.chat(req), timeout=15.0)
             except asyncio.TimeoutError:
                 logger.warning(f"[auditor] LLM call timed out for user {_mask_id(user_id)}")
                 return
