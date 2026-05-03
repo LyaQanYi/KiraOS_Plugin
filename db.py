@@ -142,18 +142,32 @@ class UserMemoryDB:
             os.makedirs(dir_path, exist_ok=True)
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Return this thread's connection, creating it on first access."""
+        """Return this thread's connection, creating it on first access.
+
+        The "check closed → connect → register" sequence is performed under
+        ``_registry_lock`` so a concurrent ``close()`` cannot slip in between
+        the closed-check and the registry append. Without the guard, a
+        connection created right after ``close()`` finished would be left
+        unregistered and never closed (resource leak).
+        """
         conn = getattr(self._tls, "conn", None)
         if conn is None:
-            if self._closed:
-                raise RuntimeError("UserMemoryDB has been closed")
-            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            self._tls.conn = conn
             with self._registry_lock:
-                self._conn_registry.append(conn)
+                # Re-check under the lock in case another thread on the same
+                # tls instance raced (shouldn't happen with thread-local but
+                # cheap to verify and harmless if redundant).
+                conn = getattr(self._tls, "conn", None)
+                if conn is None:
+                    if self._closed:
+                        raise RuntimeError("UserMemoryDB has been closed")
+                    conn = sqlite3.connect(
+                        self.db_path, check_same_thread=False, timeout=10.0
+                    )
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    self._tls.conn = conn
+                    self._conn_registry.append(conn)
         return conn
 
     def close(self):
@@ -1015,7 +1029,13 @@ class UserMemoryDB:
                         # We don't easily know if it was insert vs update; count as added
                         added += 1
 
-                # Events — always appended (events have no natural unique key)
+                # Events:
+                #   - replace mode: append all (table was already wiped above)
+                #   - merge / upsert: dedupe by natural key
+                #     (user_id, created_at, summary, tag) so re-importing the
+                #     same snapshot is idempotent. Without this, "merge" would
+                #     pollute the timeline with duplicate events on every retry.
+                events_skipped_dup = 0
                 for row in events:
                     if not isinstance(row, dict):
                         skipped += 1
@@ -1029,12 +1049,37 @@ class UserMemoryDB:
                     if isinstance(tag, str) and not tag.strip():
                         tag = None
                     clipped, _ = self._clip_value(summary, MAX_EVENT_LEN)
-                    conn.execute(
-                        "INSERT INTO event_logs (user_id, event_summary, created_at, tag) "
-                        "VALUES (?, ?, ?, ?)",
-                        (uid, clipped, ca, tag),
-                    )
-                    events_added += 1
+
+                    if mode == "replace":
+                        # Table already wiped earlier; just append.
+                        conn.execute(
+                            "INSERT INTO event_logs (user_id, event_summary, created_at, tag) "
+                            "VALUES (?, ?, ?, ?)",
+                            (uid, clipped, ca, tag),
+                        )
+                        events_added += 1
+                    else:
+                        # Idempotent insert: only write if the natural key isn't
+                        # already present. NULL-safe tag comparison via
+                        # IS-equivalent expression (SQLite treats NULL = NULL as
+                        # NULL by default, which would always be falsy).
+                        cur = conn.execute(
+                            """INSERT INTO event_logs
+                                   (user_id, event_summary, created_at, tag)
+                               SELECT ?, ?, ?, ?
+                               WHERE NOT EXISTS (
+                                   SELECT 1 FROM event_logs
+                                   WHERE user_id = ?
+                                     AND event_summary = ?
+                                     AND created_at = ?
+                                     AND ((tag = ?) OR (tag IS NULL AND ? IS NULL))
+                               )""",
+                            (uid, clipped, ca, tag, uid, clipped, ca, tag, tag),
+                        )
+                        if cur.rowcount > 0:
+                            events_added += 1
+                        else:
+                            events_skipped_dup += 1
                 conn.commit()
             except Exception:
                 try:
@@ -1049,4 +1094,7 @@ class UserMemoryDB:
             "profiles_updated": updated,
             "profiles_skipped": skipped,
             "events_added": events_added,
+            # Events that matched an existing row by natural key — only
+            # populated for merge/upsert modes; always 0 for replace.
+            "events_skipped_dup": events_skipped_dup if mode != "replace" else 0,
         }

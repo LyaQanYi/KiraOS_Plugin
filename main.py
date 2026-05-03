@@ -145,6 +145,11 @@ class UserMemoryPlugin(BasePlugin):
         # Bounded so a long-running session doesn't grow this set without limit;
         # purely defensive — id() values are reused after GC anyway.
         self._max_audit_dedup_size = 10_000
+        # Strong references to in-flight auditor tasks. asyncio.create_task
+        # only keeps weak references in the event loop, so a task with no
+        # external reference can be garbage-collected mid-execution and
+        # silently disappear. We park each task here and remove it when done.
+        self._auditor_tasks: set[asyncio.Task] = set()
         # Confidence ceiling for auditor writes — keeps the main LLM's
         # high-confidence judgements authoritative when both sides write
         # the same key. M6 conflict-detection enforces this naturally:
@@ -220,6 +225,25 @@ class UserMemoryPlugin(BasePlugin):
         if self._webui_server:
             await self._webui_server.stop()
             self._webui_server = None
+
+        # Drain any in-flight auditor tasks so we don't try to write to a
+        # closed DB after this point. 5s ceiling — auditor itself has 15s
+        # but during shutdown we'd rather lose late writes than block exit.
+        if self._auditor_tasks:
+            pending = list(self._auditor_tasks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[auditor] {len(pending)} background task(s) still pending at shutdown; cancelling"
+                )
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
+            self._auditor_tasks.clear()
 
         for name in self._registered_skill_names:
             try:
@@ -427,6 +451,33 @@ class UserMemoryPlugin(BasePlugin):
                 return last_msg.sender.user_id
         return "unknown"
 
+    @staticmethod
+    def _coerce_bool(raw) -> Optional[bool]:
+        """Strict-ish boolean coercion for LLM-supplied values.
+
+        Returns the parsed bool, or ``None`` for anything we refuse to guess at
+        (so callers can surface the rejection back to the LLM instead of
+        silently picking ``True``).
+
+        Accepts: ``True``/``False`` (Python bool), strings ``"true"``/``"false"``
+        / ``"1"``/``"0"`` / ``"yes"``/``"no"`` (case-insensitive), and ``None``
+        as ``False``. Anything else (numbers other than 0/1, weird strings,
+        objects) yields ``None``.
+        """
+        if raw is None:
+            return False
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)) and raw in (0, 1):
+            return bool(raw)
+        if isinstance(raw, str):
+            s = raw.strip().lower()
+            if s in ("true", "1", "yes"):
+                return True
+            if s in ("false", "0", "no", ""):
+                return False
+        return None
+
     # ════════════════════════════════════════════════════════════════
     #  Memory — Tools
     # ════════════════════════════════════════════════════════════════
@@ -585,7 +636,15 @@ class UserMemoryPlugin(BasePlugin):
 
                 ttl = item.get("ttl")
                 parsed_ttl = _parse_ttl(ttl) if ttl else None
-                force = bool(item.get("force", False))
+                # ``bool()`` on a non-empty string is True, so ``bool("false")``
+                # would silently bypass M6's conflict protection. Accept only
+                # real booleans, or strings that are explicitly truthy/falsy.
+                force = self._coerce_bool(item.get("force", False))
+                if force is None:
+                    results.append(
+                        f"skip: set {key} 'force' must be boolean (got {item.get('force')!r})"
+                    )
+                    continue
 
                 status, info = self.db.upsert_with_limit(
                     target_uid, key, value,
@@ -914,11 +973,15 @@ class UserMemoryPlugin(BasePlugin):
 
         # Fire-and-forget. We don't await so the step_result handler chain
         # doesn't stall the main agent loop. Errors are logged inside.
-        asyncio.create_task(
+        # The task ref must be retained or asyncio's weak-ref bookkeeping can
+        # GC it mid-flight; we discard it once it finishes.
+        task = asyncio.create_task(
             self._run_auditor(user_id=user_id,
                               user_text=user_text,
                               assistant_reply=assistant_reply)
         )
+        self._auditor_tasks.add(task)
+        task.add_done_callback(self._auditor_tasks.discard)
 
     @staticmethod
     def _extract_latest_user_text(event: KiraMessageBatchEvent) -> str:

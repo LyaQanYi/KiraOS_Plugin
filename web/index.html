@@ -1628,17 +1628,25 @@ async function doLiveUpdate() {
     // Always refresh stats
     await loadStats();
 
-    // Refresh user list if memory nav is expanded
+    // Refresh user list if memory nav is expanded.
+    // When the user is actively searching, route the poll through the same
+    // server-side endpoint as filterUsers() — otherwise live refresh would
+    // overwrite cross-table search hits (profile/event matches) with the
+    // unfiltered full list every second.
     if (memoryNavExpanded) {
       try {
-        const users = await api('/users');
+        const q = document.getElementById('searchInput').value.trim();
+        const path = q ? '/users?q=' + encodeURIComponent(q) : '/users';
+        const users = await api(path);
         const usersJson = JSON.stringify(users);
         if (usersJson !== _lastUsersJson) {
           _lastUsersJson = usersJson;
-          allUsers = users;
-          const q = document.getElementById('searchInput').value.trim().toLowerCase();
-          const filtered = q ? allUsers.filter(u => u.user_id.toLowerCase().includes(q)) : allUsers;
-          renderUsers(filtered);
+          if (!q) {
+            // Only cache the full list — searches return a filtered subset
+            // that shouldn't replace allUsers (used elsewhere as the canonical full list)
+            allUsers = users;
+          }
+          renderUsers(users, { isSearch: Boolean(q) });
         }
       } catch (_) {}
     }

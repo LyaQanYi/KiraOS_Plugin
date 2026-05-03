@@ -202,10 +202,25 @@ class SkillRouter:
         return discovered
 
     def _parse_skill_dir(self, entry: Path) -> Optional[SkillInfo]:
-        """Try SKILL.md first, then fall back to manifest.json + instruction.md."""
+        """Try SKILL.md first, then fall back to manifest.json + instruction.md.
+
+        Previously a present-but-malformed ``SKILL.md`` would short-circuit and
+        the skill was silently dropped, even when a working legacy
+        ``manifest.json + instruction.md`` pair sat next to it. We now treat
+        an unparseable ``SKILL.md`` as "not parsed" and continue to the legacy
+        check (matching what the docstring already promised).
+        """
         skill_md = entry / "SKILL.md"
         if skill_md.is_file():
-            return self._parse_skill_md_file(entry, skill_md)
+            skill = self._parse_skill_md_file(entry, skill_md)
+            if skill is not None:
+                return skill
+            # SKILL.md exists but was unparseable. Warn loudly so the operator
+            # notices, then fall through to the legacy attempt.
+            logger.warning(
+                f"Skill {entry.name}: SKILL.md present but failed to parse, "
+                "falling back to manifest.json + instruction.md if available"
+            )
 
         manifest_path = entry / "manifest.json"
         if manifest_path.is_file():
