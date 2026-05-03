@@ -79,9 +79,10 @@
     },
     "memory_auditor_model_uuid": {
         "name": "Memory auditor model",
-        "type": "string",
+        "type": "model_select",
+        "model_type": "llm",
         "default": "",
-        "hint": "Optional model UUID (provider_id:model_id) for the auditor. Leave empty to use the configured default fast LLM (recommended)."
+        "hint": "Leave empty (recommended) to use the configured default fast LLM. Pick a specific model only when you want to pin the auditor to it."
     },
     "memory_auditor_skip_keywords": {
         "name": "Memory auditor skip keywords",

@@ -656,7 +656,7 @@ class UserMemoryDB:
                 f"SELECT event_summary, created_at, tag FROM event_logs "
                 f"WHERE user_id = ? AND ({tag_clause}) "
                 f"ORDER BY datetime(created_at) DESC LIMIT ?",
-                params + [limit]
+                [*params, limit]
             )
         return cursor.fetchall()
 

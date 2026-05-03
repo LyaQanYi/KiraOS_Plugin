@@ -688,7 +688,7 @@ parameters:
 | `max_context_chars` | integer | 500 | 每用户注入的记忆上下文最大字符数（0 = 不限制），超限时按分类优先级截断 |
 | `inject_categories` | list | `["basic"]` | 每轮自动注入到 system prompt 的画像分类。其余分类不注入但通过 `memory_query(category=...)` 可查。设为 `["*"]` 或 `["all"]` 恢复 v1.2.0 之前"全量注入"的行为 |
 | `memory_auditor_enabled` | switch | `false` | 启用主动记忆审计员（C 层）。开启后每轮额外消耗一次 fast LLM 调用扫描用户消息提取漏记事实 |
-| `memory_auditor_model_uuid` | string | `""` | 审计员使用的模型 UUID（`provider_id:model_id`）。留空则走 `ctx.get_default_fast_llm_client()` |
+| `memory_auditor_model_uuid` | model_select | `""` | 审计员使用的 LLM 模型（WebUI 渲染为下拉选择器，从已配置的 LLM 列表里选）。留空（推荐）走默认 fast LLM；想固定到某个具体模型时再选 |
 | `memory_auditor_skip_keywords` | list | `["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"]` | 用户消息命中任一关键词时审计员整个跳过本轮（隐私守门） |
 | `skills_dir` | string | `null` | 技能目录路径（为空时自动使用 `data/skills/`） |
 | `disabled_skills` | list | `[]` | 要禁用的技能名称列表，如 `["tarot_reading", "daily_fortune"]` |
