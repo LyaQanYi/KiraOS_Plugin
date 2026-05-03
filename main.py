@@ -1216,16 +1216,19 @@ class UserMemoryPlugin(BasePlugin):
         Returns ``[]`` on any error.
         """
         cleaned = _strip_json_fence(text)
-        # Always try to extract the first ``[...]`` block — handles BOTH
-        # leading prose ("根据消息: [...]") AND trailing prose
-        # ("[...]\n说明 ..."). A startswith-only check would let
-        # trailing-prose cases fall through to ``json.loads`` and fail.
+        # Find the first ``[`` and parse from there with ``raw_decode`` rather
+        # than slicing to ``rfind("]")``. ``rfind`` mis-slices when the prose
+        # *after* the JSON happens to contain another ``]`` (e.g.
+        # ``[{...}] 用户提到了 [姓名] 信息``) — it would grab the bracket from
+        # ``[姓名]`` and concatenate garbage onto the JSON.
+        # ``raw_decode`` parses up to the end of the first valid JSON value
+        # and stops cleanly, ignoring everything after.
         start = cleaned.find("[")
-        end = cleaned.rfind("]")
-        if start != -1 and end > start:
-            cleaned = cleaned[start: end + 1]
+        if start == -1:
+            # No array marker at all → nothing to extract
+            return []
         try:
-            data = json.loads(cleaned)
+            data, _consumed = json.JSONDecoder().raw_decode(cleaned[start:])
         except (json.JSONDecodeError, ValueError) as e:
             # The auditor output contains the user facts the model just
             # extracted (nicknames, addresses, relationships, ...). Logging
