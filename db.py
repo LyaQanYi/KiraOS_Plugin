@@ -144,31 +144,28 @@ class UserMemoryDB:
     def _get_conn(self) -> sqlite3.Connection:
         """Return this thread's connection, creating it on first access.
 
-        The "check closed → connect → register" sequence is performed under
-        ``_registry_lock`` so a concurrent ``close()`` cannot slip in between
-        the closed-check and the registry append. Without the guard, a
-        connection created right after ``close()`` finished would be left
-        unregistered and never closed (resource leak).
+        The closed-check covers **both** the "cached tls connection" and the
+        "create new connection" paths — under the same ``_registry_lock``.
+        Without this, a thread that already had a cached connection would
+        keep getting that handle back even after ``close()`` had closed it,
+        producing cryptic SQLite "Cannot operate on a closed database" errors
+        far from the real problem instead of a clean RuntimeError at the
+        point the caller tried to use the DB.
         """
-        conn = getattr(self._tls, "conn", None)
-        if conn is None:
-            with self._registry_lock:
-                # Re-check under the lock in case another thread on the same
-                # tls instance raced (shouldn't happen with thread-local but
-                # cheap to verify and harmless if redundant).
-                conn = getattr(self._tls, "conn", None)
-                if conn is None:
-                    if self._closed:
-                        raise RuntimeError("UserMemoryDB has been closed")
-                    conn = sqlite3.connect(
-                        self.db_path, check_same_thread=False, timeout=10.0
-                    )
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA synchronous=NORMAL")
-                    conn.execute("PRAGMA foreign_keys=ON")
-                    self._tls.conn = conn
-                    self._conn_registry.append(conn)
-        return conn
+        with self._registry_lock:
+            if self._closed:
+                raise RuntimeError("UserMemoryDB has been closed")
+            conn = getattr(self._tls, "conn", None)
+            if conn is None:
+                conn = sqlite3.connect(
+                    self.db_path, check_same_thread=False, timeout=10.0
+                )
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                self._tls.conn = conn
+                self._conn_registry.append(conn)
+            return conn
 
     def close(self):
         """Close every per-thread connection that was opened."""
@@ -1000,7 +997,9 @@ class UserMemoryDB:
                     if not isinstance(row, dict):
                         skipped += 1
                         continue
-                    uid = row.get("user_id"); key = row.get("key"); val = row.get("value")
+                    uid = row.get("user_id")
+                    key = row.get("key")
+                    val = row.get("value")
                     if not uid or not key or val is None:
                         skipped += 1
                         continue
@@ -1053,7 +1052,8 @@ class UserMemoryDB:
                     if not isinstance(row, dict):
                         skipped += 1
                         continue
-                    uid = row.get("user_id"); summary = row.get("summary")
+                    uid = row.get("user_id")
+                    summary = row.get("summary")
                     if not uid or not summary:
                         skipped += 1
                         continue
