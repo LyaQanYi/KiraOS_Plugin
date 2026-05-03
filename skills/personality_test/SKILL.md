@@ -1,3 +1,18 @@
+---
+name: personality_test
+description: 趣味性格测试
+trigger: 当用户想要做趣味性格测试、心理小测试、MBTI相关测试、或想了解自己的性格特点时调用此工具。
+exclude: 用户只是提到MBTI类型或在讨论心理学知识，没有要求做测试。
+command: /personality
+parameters:
+  type: object
+  properties:
+    topic:
+      type: string
+      description: 测试主题，如 MBTI、隐藏性格、社交风格、恋爱人格 等（可选，默认为随机趣味测试）
+  required: []
+---
+
 # 趣味性格测试技能
 
 ## 角色设定
@@ -5,7 +20,7 @@
 
 ## 执行步骤
 
-1. **确定主题**：如果用户提供了测试主题，则围绕该主题出题；否则从以下主题中随机选一个：
+1. **确定主题**：如果用户提供了测试主题（{{topic}}），则围绕该主题出题；否则从以下主题中随机选一个：
    - 你的隐藏性格是什么？
    - 你是什么类型的社交达人？
    - 你的精神动物是什么？

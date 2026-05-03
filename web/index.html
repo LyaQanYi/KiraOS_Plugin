@@ -459,6 +459,61 @@ html:not(.no-transition) .live-toggle {
   margin-bottom: 28px;
 }
 
+.overview-actions {
+  margin-top: 32px;
+  padding: 20px 24px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--glass-shadow);
+}
+.overview-section-title {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.overview-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-height: 16px;
+}
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 12px;
+  align-items: center;
+}
+.select-inline {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-input, 6px);
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* Search-result enrichment on user cards */
+.user-match {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--accent, #4f46e5);
+  letter-spacing: 0.02em;
+}
+.user-snippet {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .stat-card {
   background: var(--glass-bg);
   backdrop-filter: var(--glass-blur);
@@ -821,6 +876,23 @@ html:not(.no-transition) .live-toggle {
             <div class="stat-label">事件记录</div>
           </div>
         </div>
+
+        <!-- Backup / restore actions -->
+        <div class="overview-actions">
+          <h3 class="overview-section-title">备份 &amp; 恢复</h3>
+          <p class="overview-subtitle">将所有用户的画像和事件以 JSON 形式导出，或从备份恢复。</p>
+          <div class="action-row">
+            <button class="btn" onclick="exportMemory()" type="button">⬇ 导出 JSON</button>
+            <label class="btn btn-ghost" for="importFileInput">⬆ 导入 JSON</label>
+            <input type="file" id="importFileInput" accept="application/json,.json" style="display:none" onchange="importMemory(event)">
+            <select id="importModeSelect" class="select-inline" aria-label="导入模式">
+              <option value="merge">merge（仅补充缺失的画像）</option>
+              <option value="upsert">upsert（覆盖同 key 的画像）</option>
+              <option value="replace">replace（先清空再导入，危险）</option>
+            </select>
+          </div>
+          <p class="overview-hint" id="importStatus" aria-live="polite"></p>
+        </div>
       </div>
 
       <!-- Memory Detail Page -->
@@ -1072,19 +1144,50 @@ async function loadUsers() {
   }
 }
 
+// Server-side search: when the input has a query we hit /api/users?q=... so
+// the search covers profile values + event summaries, not just user_id.
+// 200 ms debounce keeps the request rate sane while typing.
+let _searchTimer = null;
+let _searchSeq = 0;
 function filterUsers() {
-  const q = document.getElementById('searchInput').value.trim().toLowerCase();
-  const filtered = q ? allUsers.filter(u => u.user_id.toLowerCase().includes(q)) : allUsers;
-  renderUsers(filtered);
-}
-
-function renderUsers(users) {
-  const listEl = document.getElementById('userList');
-  if (!users.length) {
-    listEl.innerHTML = '<div class="empty-state" role="status"><p>暂无记忆数据</p></div>';
+  const q = document.getElementById('searchInput').value.trim();
+  if (_searchTimer) clearTimeout(_searchTimer);
+  if (!q) {
+    // Reset to the cached full list immediately on empty query
+    renderUsers(allUsers);
     return;
   }
-  listEl.innerHTML = users.map(u => `
+  const mySeq = ++_searchSeq;
+  _searchTimer = setTimeout(async () => {
+    try {
+      const results = await api('/users?q=' + encodeURIComponent(q));
+      // Drop stale responses if a newer query has been issued
+      if (mySeq !== _searchSeq) return;
+      renderUsers(results, { isSearch: true });
+    } catch (e) {
+      const listEl = document.getElementById('userList');
+      listEl.innerHTML = '<div class="empty-state" role="alert"><p>搜索失败: '
+        + escapeHtml(e.message) + '</p></div>';
+    }
+  }, 200);
+}
+
+function renderUsers(users, opts) {
+  opts = opts || {};
+  const listEl = document.getElementById('userList');
+  if (!users.length) {
+    const msg = opts.isSearch ? '没有匹配的用户' : '暂无记忆数据';
+    listEl.innerHTML = '<div class="empty-state" role="status"><p>' + msg + '</p></div>';
+    return;
+  }
+  listEl.innerHTML = users.map(u => {
+    const matches = Array.isArray(u.match_in) && u.match_in.length
+      ? '<div class="user-match" aria-hidden="true">匹配: ' + u.match_in.join(', ') + '</div>'
+      : '';
+    const snippet = u.snippet
+      ? '<div class="user-snippet" aria-hidden="true">' + escapeHtml(u.snippet) + '</div>'
+      : '';
+    return `
     <div class="user-card ${selectedUserId === u.user_id ? 'active' : ''}"
          role="listitem" tabindex="0"
          data-uid="${escapeAttr(u.user_id)}"
@@ -1095,8 +1198,9 @@ function renderUsers(users) {
         <span class="badge" aria-hidden="true">📋 ${u.profile_count}</span>
         <span class="badge events" aria-hidden="true">📅 ${u.event_count}</span>
       </div>
-    </div>
-  `).join('');
+      ${matches}${snippet}
+    </div>`;
+  }).join('');
   setupReveal(document.getElementById('navSub'));
 }
 
@@ -1605,6 +1709,92 @@ requestAnimationFrame(() => {
     document.documentElement.classList.remove('no-transition');
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+   Backup / Restore (M4)
+   ═══════════════════════════════════════════════════════════════ */
+function _setImportStatus(text, kind) {
+  const el = document.getElementById('importStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = kind === 'error' ? '#dc2626'
+                : kind === 'ok'    ? 'var(--accent, #4f46e5)'
+                : '';
+}
+
+async function exportMemory() {
+  _setImportStatus('正在导出…');
+  const token = getToken();
+  const headers = {};
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  try {
+    const res = await fetch('/api/export', { headers });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${txt.slice(0, 200)}`);
+    }
+    const blob = await res.blob();
+    const today = new Date().toISOString().slice(0, 10);
+    // Trigger browser download via anchor click
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `kiraos-memory-${today}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    _setImportStatus(`已导出 (${(blob.size / 1024).toFixed(1)} KB)`, 'ok');
+  } catch (e) {
+    _setImportStatus('导出失败: ' + e.message, 'error');
+  }
+}
+
+async function importMemory(evt) {
+  const fileInput = evt.target;
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+  const mode = (document.getElementById('importModeSelect') || {}).value || 'merge';
+
+  if (mode === 'replace') {
+    // Native confirm() integrates cleanly with the destructive flow and
+    // sidesteps the existing modal's callback model (which has no cancel hook).
+    const ok = window.confirm(
+      `导入模式 "replace" 会先清空所有现有记忆，再用 ${file.name} 的内容覆盖。\n\n此操作不可撤销，是否继续？`
+    );
+    if (!ok) { fileInput.value = ''; return; }
+  }
+
+  _setImportStatus(`正在导入 (${mode}) ${file.name}…`);
+  try {
+    const text = await file.text();
+    // Validate JSON client-side so the user sees the error fast
+    try { JSON.parse(text); }
+    catch (e) { throw new Error('JSON 解析失败: ' + e.message); }
+    const token = getToken();
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    const res = await fetch('/api/import?mode=' + encodeURIComponent(mode), {
+      method: 'POST',
+      headers,
+      body: text,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    _setImportStatus(
+      `导入完成 (${data.mode}): +${data.profiles_added} 画像, ` +
+      `+${data.events_added} 事件, ${data.profiles_skipped} 跳过`,
+      'ok'
+    );
+    // Refresh views so the new data shows up
+    await loadStats();
+    await loadUsers();
+  } catch (e) {
+    _setImportStatus('导入失败: ' + e.message, 'error');
+  } finally {
+    fileInput.value = '';  // allow re-selecting the same file
+  }
+}
 
 /* ═══════════════════════════════════════════════════════════════
    Init

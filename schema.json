@@ -24,7 +24,7 @@
         "name": "Skills directory",
         "type": "string",
         "default": null,
-        "hint": "Path to skills directory (defaults to data/skills/). Each skill is a subfolder with manifest.json + instruction.md"
+        "hint": "Path to skills directory (defaults to data/skills/). Each skill is a subfolder containing either SKILL.md (recommended, single-file YAML frontmatter) or the legacy manifest.json + instruction.md pair."
     },
     "max_context_chars": {
         "name": "Max context chars per user",
@@ -32,6 +32,12 @@
         "default": 500,
         "minimum": 0,
         "hint": "Maximum characters of memory context injected per user (0 = unlimited). Truncates by category priority when exceeded"
+    },
+    "inject_categories": {
+        "name": "Auto-injected categories",
+        "type": "list",
+        "default": ["basic"],
+        "hint": "Profile categories pushed into the system prompt every turn. Other categories stay queryable via memory_query(category=...). Use [\"*\"] to inject every category (legacy behaviour). Default: [\"basic\"]"
     },
     "disabled_skills": {
         "name": "Disabled skills",
@@ -64,5 +70,23 @@
         "type": "string",
         "default": "",
         "hint": "Access token for the memory WebUI (leave empty for no authentication, only safe for local access)"
+    },
+    "memory_auditor_enabled": {
+        "name": "Memory auditor (active recall)",
+        "type": "switch",
+        "default": false,
+        "hint": "Run a separate fast-LLM call after each turn to extract any facts the main LLM missed. Costs one extra LLM call per user batch. Default off — enable if your main LLM is too conservative about calling memory_update."
+    },
+    "memory_auditor_model_uuid": {
+        "name": "Memory auditor model",
+        "type": "string",
+        "default": "",
+        "hint": "Optional model UUID (provider_id:model_id) for the auditor. Leave empty to use the configured default fast LLM (recommended)."
+    },
+    "memory_auditor_skip_keywords": {
+        "name": "Memory auditor skip keywords",
+        "type": "list",
+        "default": ["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"],
+        "hint": "If the user's latest message contains any of these, the auditor skips that turn entirely (privacy guard for messages that shouldn't be recorded)."
     }
 }

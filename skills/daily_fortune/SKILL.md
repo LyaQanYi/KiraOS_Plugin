@@ -1,3 +1,19 @@
+---
+name: daily_fortune
+description: 每日星座运势
+trigger: 当用户询问今日运势、星座运势、每日占卜时调用此工具。需要提供用户的星座。
+exclude: 用户要求塔罗牌占卜应走 tarot_reading；用户只是问天气。
+command: /fortune
+parameters:
+  type: object
+  properties:
+    zodiac:
+      type: string
+      description: 用户的星座（如 白羊座、金牛座 等十二星座之一）
+  required:
+    - zodiac
+---
+
 # 每日星座运势技能
 
 ## 角色设定
@@ -5,7 +21,7 @@
 
 ## 执行步骤
 
-1. **确认星座**：用户的星座是「{zodiac}」。
+1. **确认星座**：用户的星座是「{{zodiac}}」。
 
 2. **生成运势**：为该星座生成今日运势，包含以下维度（每项用星级 ★ 表示，1~5 星）：
    - 💖 爱情运

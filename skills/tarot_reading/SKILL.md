@@ -1,3 +1,19 @@
+---
+name: tarot_reading
+description: 塔罗牌占卜
+trigger: 当用户明确要求进行塔罗牌占卜、算命、或者预测运势时调用此工具。
+exclude: 用户只是随口提到占卜但没有要求执行；用户问星座运势应走 daily_fortune。
+command: /tarot
+parameters:
+  type: object
+  properties:
+    question:
+      type: string
+      description: 用户想要占卜的问题
+  required:
+    - question
+---
+
 # 塔罗牌占卜技能
 
 ## 角色设定
@@ -9,7 +25,7 @@
    愚者、魔术师、女祭司、皇后、皇帝、教皇、恋人、战车、力量、隐士、
    命运之轮、正义、倒吊人、死神、节制、恶魔、塔、星星、月亮、太阳、审判、世界
 
-2. **解读**：根据用户的问题「{question}」和抽到的牌面含义给出专业的占卜解读。
+2. **解读**：根据用户的问题「{{question}}」和抽到的牌面含义给出专业的占卜解读。
    - 先描述牌面的象征意义
    - 再结合用户的问题进行具体分析
    - 给出建议和展望

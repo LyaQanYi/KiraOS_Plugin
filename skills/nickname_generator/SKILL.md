@@ -1,3 +1,22 @@
+---
+name: nickname_generator
+description: 趣味昵称生成器
+trigger: 当用户想要取网名、昵称、游戏名、笔名，或者请求起名建议时调用此工具。
+exclude: 用户在介绍自己的昵称；用户问某个名字的含义或来源。
+command: /nickname
+parameters:
+  type: object
+  properties:
+    theme:
+      type: string
+      description: 昵称的主题或风格偏好，如 二次元、古风、可爱、搞笑、英文、游戏风 等
+    keywords:
+      type: string
+      description: 用户希望包含的关键词或元素（可选）
+  required:
+    - theme
+---
+
 # 趣味昵称生成器技能
 
 ## 角色设定
@@ -6,8 +25,8 @@
 ## 执行步骤
 
 1. **理解需求**：
-   - 主题/风格：「{theme}」
-   - 关键词/元素：「{keywords}」（如未提供关键词则自由发挥，不受关键词约束）
+   - 主题/风格：「{{theme}}」
+   - 关键词/元素：「{{keywords}}」（如未提供关键词则自由发挥，不受关键词约束）
 
 2. **生成昵称**：根据需求生成 5 个风格各异的昵称方案，每个昵称需要：
    - 名字本身（控制在 2~8 个字符）

@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -44,24 +45,34 @@ def _mask_id(value: str) -> str:
 # ════════════════════════════════════════════════════════════════════
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
-    """Optional Bearer-token authentication."""
+    """Optional Bearer-token authentication.
+
+    Compared against the configured token using ``secrets.compare_digest`` so
+    request-time differences cannot leak the token via a timing side-channel.
+
+    Only the ``Authorization: Bearer <token>`` header is honoured for API
+    requests. The previous ``?token=<token>`` query-param fallback was removed
+    because tokens in URLs leak into server access logs, browser history, and
+    HTTP ``Referer`` headers. The SPA bootstraps from ``?token=`` on its own
+    (it reads it from the URL on first paint, stashes it in sessionStorage,
+    rewrites the URL, then sends the Bearer header from then on).
+    """
 
     def __init__(self, app, token: str = ""):
         super().__init__(app)
         self.token = token
+        # Prebuild the expected header value once for compare_digest
+        self._expected_header = f"Bearer {token}".encode("utf-8") if token else b""
 
     async def dispatch(self, request: Request, call_next):
-        # Skip auth if no token configured or if requesting the SPA page
+        # Skip auth if no token configured or if requesting the SPA shell.
+        # The SPA shell is static markup with no embedded data; the token in
+        # ?token= is read by JS on the client side, never validated here.
         if not self.token or request.url.path == "/":
             return await call_next(request)
 
-        # Check Authorization header
-        auth = request.headers.get("authorization", "")
-        if auth == f"Bearer {self.token}":
-            return await call_next(request)
-
-        # Check query parameter (for initial page load)
-        if request.query_params.get("token") == self.token:
+        auth = request.headers.get("authorization", "").encode("utf-8")
+        if auth and secrets.compare_digest(auth, self._expected_header):
             return await call_next(request)
 
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -101,16 +112,95 @@ async def api_stats(request: Request) -> JSONResponse:
 
 
 async def api_list_users(request: Request) -> JSONResponse:
-    """GET /api/users — List all users with memory data."""
+    """GET /api/users — List all users with memory data.
+
+    Optional ``?q=<term>`` triggers a content search across user_id, profile
+    values, and event summaries; the response includes ``match_in`` and
+    ``snippet`` fields per row.
+    """
     db = _get_db(request)
     if not db:
         return JSONResponse({"error": "Database not available"}, status_code=503)
     try:
-        users = db.list_users()
+        q = (request.query_params.get("q") or "").strip()
+        if q:
+            users = db.search_users(q, limit=200)
+        else:
+            users = db.list_users()
         return JSONResponse(users)
     except Exception:
         logger.exception("Error listing users")
         return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+# ── Bulk export / import ──────────────────────────────────────────
+
+# Cap the size of an uploaded import payload so a malicious or runaway
+# request can't OOM the server.
+MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+async def api_export(request: Request) -> JSONResponse:
+    """GET /api/export — Dump all users' profiles and events as JSON."""
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    try:
+        snapshot = db.export_all()
+        return JSONResponse(
+            snapshot,
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename=kiraos-memory-"
+                    f"{snapshot['exported_at'][:10]}.json"
+                )
+            },
+        )
+    except Exception:
+        logger.exception("Error exporting memory")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+async def api_import(request: Request) -> JSONResponse:
+    """POST /api/import — Bulk-load a snapshot produced by /api/export.
+
+    Accepts ``mode=merge|upsert|replace`` (default ``merge``).
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_IMPORT_BYTES:
+        return JSONResponse(
+            {"error": f"Import payload too large (>{MAX_IMPORT_BYTES} bytes)"},
+            status_code=413,
+        )
+    try:
+        body = await request.body()
+    except Exception:
+        return JSONResponse({"error": "Failed to read request body"}, status_code=400)
+    if len(body) > MAX_IMPORT_BYTES:
+        return JSONResponse(
+            {"error": f"Import payload too large (>{MAX_IMPORT_BYTES} bytes)"},
+            status_code=413,
+        )
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "Top-level JSON must be an object"}, status_code=400)
+    mode = (request.query_params.get("mode") or "merge").lower()
+    if mode not in ("merge", "upsert", "replace"):
+        return JSONResponse({"error": f"invalid mode '{mode}'"}, status_code=400)
+    try:
+        result = db.import_all(data, mode=mode)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception:
+        logger.exception("Error importing memory")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+    return JSONResponse({"ok": True, **result})
 
 
 async def api_get_user(request: Request) -> JSONResponse:
@@ -125,6 +215,7 @@ async def api_get_user(request: Request) -> JSONResponse:
         profiles = db.get_profiles(user_id, include_expired=True)
         events = db.get_events_with_id(user_id, limit=200)
 
+        from .db import _epoch_to_iso_date
         profile_list = [
             {
                 "key": key,
@@ -132,7 +223,8 @@ async def api_get_user(request: Request) -> JSONResponse:
                 "updated_at": updated_at,
                 "confidence": confidence,
                 "category": category,
-                "expires_at": expires_at,
+                # expires_at is stored as integer epoch; expose as ISO date for the UI
+                "expires_at": _epoch_to_iso_date(expires_at),
             }
             for key, value, updated_at, confidence, category, expires_at in profiles
         ]
@@ -142,8 +234,9 @@ async def api_get_user(request: Request) -> JSONResponse:
                 "id": eid,
                 "event_summary": summary,
                 "created_at": created_at,
+                "tag": tag,
             }
-            for eid, summary, created_at in events
+            for eid, summary, created_at, tag in events
         ]
 
         return JSONResponse({
@@ -275,9 +368,12 @@ async def api_add_event(request: Request) -> JSONResponse:
         return JSONResponse({"error": "event_summary is required"}, status_code=400)
     if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
         return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
+    tag = body.get("tag")
+    if tag is not None and not isinstance(tag, str):
+        return JSONResponse({"error": "tag must be a string"}, status_code=400)
 
     try:
-        db.save_event(user_id, event_summary)
+        db.save_event(user_id, event_summary, tag=tag)
     except Exception:
         logger.exception("Error adding event for %s", _mask_id(user_id))
         return JSONResponse({"error": "Internal server error"}, status_code=500)
@@ -317,9 +413,18 @@ async def api_update_event(request: Request) -> JSONResponse:
         return JSONResponse({"error": "event_summary is required"}, status_code=400)
     if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
         return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
+    # Tag is optional; ``"tag" in body`` distinguishes "no change" from "clear".
+    tag_provided = "tag" in body
+    tag_value = body.get("tag")
+    if tag_provided and tag_value is not None and not isinstance(tag_value, str):
+        return JSONResponse({"error": "tag must be a string or null"}, status_code=400)
 
     try:
-        updated = db.update_event(event_id, event_summary, user_id=user_id)
+        updated = db.update_event(
+            event_id, event_summary, user_id=user_id,
+            tag=tag_value if tag_provided else None,
+            set_tag=tag_provided,
+        )
         if updated:
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
@@ -365,6 +470,8 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
         Route("/api/users/{user_id}", api_get_user, methods=["GET"]),
         Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
+        Route("/api/export", api_export, methods=["GET"]),
+        Route("/api/import", api_import, methods=["POST"]),
         Route("/api/stats", api_stats, methods=["GET"]),
         Route("/api/users", api_list_users, methods=["GET"]),
     ]
@@ -394,7 +501,14 @@ class WebUIServer:
         self._poll_log_filter: Optional[_PollLogFilter] = None
 
     async def start(self):
-        """Start the web server in a background asyncio task."""
+        """Start the web server in a background asyncio task.
+
+        Raises ``RuntimeError`` if the server fails to come up within a short
+        readiness window — typically because the configured port is already
+        bound. Without this check the failure was silent: ``serve()`` raised
+        inside the task, the plugin logged 'started', and every subsequent
+        request returned a connection error.
+        """
         app = create_app(self.db, self.token, max_event_keep=self.max_event_keep)
         config = uvicorn.Config(
             app,
@@ -416,8 +530,63 @@ class WebUIServer:
         self._original_handler = loop.get_exception_handler()
         loop.set_exception_handler(self._quiet_exception_handler)
 
-        self._task = asyncio.create_task(self._server.serve())
-        logger.info(f"KiraOS Memory WebUI started at http://{self.host}:{self.port}")
+        # uvicorn calls ``sys.exit(1)`` when it can't bind the port. ``SystemExit``
+        # is a ``BaseException`` and asyncio propagates it straight out of
+        # ``run_until_complete``, so a plain ``await self._server.serve()`` would
+        # tear down the whole event loop before we can inspect the failure.
+        # Wrapping it lets us translate to a normal exception that ``.exception()``
+        # surfaces in the polling loop below.
+        server = self._server
+
+        async def _serve_safely():
+            try:
+                await server.serve()
+            except SystemExit as e:
+                raise RuntimeError(f"uvicorn exited with code {e.code}") from e
+
+        self._task = asyncio.create_task(_serve_safely())
+
+        # Wait for uvicorn to flip `started=True` (it does this once it's bound
+        # the socket and entered the accept loop). Polling every 50 ms keeps
+        # the happy path responsive while still surfacing bind failures fast.
+        deadline = loop.time() + 5.0
+        while loop.time() < deadline:
+            if self._task.done():
+                # Task ended before the server became ready — re-raise the
+                # underlying exception so initialize() can fail loudly.
+                exc = self._task.exception()
+                self._task = None
+                self._cleanup_log_handlers()
+                if exc is not None:
+                    raise RuntimeError(
+                        f"KiraOS WebUI failed to start on {self.host}:{self.port}: {exc}"
+                    ) from exc
+                raise RuntimeError(
+                    f"KiraOS WebUI exited immediately on {self.host}:{self.port}"
+                )
+            if getattr(self._server, "started", False):
+                logger.info(f"KiraOS Memory WebUI started at http://{self.host}:{self.port}")
+                return
+            await asyncio.sleep(0.05)
+
+        # Soft timeout — log loudly but don't kill the plugin; the server may
+        # still come up shortly. The next failed request will be the real signal.
+        logger.warning(
+            f"KiraOS WebUI did not report ready within 5s on {self.host}:{self.port}; "
+            "continuing anyway"
+        )
+
+    def _cleanup_log_handlers(self):
+        """Detach the access-log filter and restore the asyncio exception handler."""
+        if self._poll_log_filter:
+            logging.getLogger("uvicorn.access").removeFilter(self._poll_log_filter)
+            self._poll_log_filter = None
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(self._original_handler)
+        except RuntimeError:
+            pass
+        self._original_handler = None
 
     def _quiet_exception_handler(self, loop, context):
         exc = context.get("exception")
@@ -441,16 +610,5 @@ class WebUIServer:
             self._task = None
         self._server = None
 
-        # Remove access log filter
-        if self._poll_log_filter:
-            logging.getLogger("uvicorn.access").removeFilter(self._poll_log_filter)
-            self._poll_log_filter = None
-
-        # Restore original exception handler
-        try:
-            loop = asyncio.get_running_loop()
-            loop.set_exception_handler(self._original_handler)
-        except RuntimeError:
-            pass
-        self._original_handler = None
+        self._cleanup_log_handlers()
         logger.info("KiraOS Memory WebUI stopped")
