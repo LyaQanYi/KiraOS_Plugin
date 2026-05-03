@@ -18,6 +18,7 @@ KiraOS Plugin — Combines two OS-level capabilities:
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from typing import Optional
@@ -243,6 +244,23 @@ class UserMemoryPlugin(BasePlugin):
                 for t in pending:
                     if not t.done():
                         t.cancel()
+                # ``Task.cancel()`` only *requests* cancellation — the task may
+                # still be running its except/finally blocks (and could touch
+                # the DB) until it actually yields. Wait for them to exit
+                # cleanly before we proceed to ``self.db.close()``, otherwise
+                # an in-flight auditor write can race with database teardown.
+                # ``return_exceptions=True`` so a CancelledError doesn't fail
+                # the gather; another short timeout caps the worst case.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[auditor] {sum(1 for t in pending if not t.done())} "
+                        "task(s) did not exit after cancel(); leaking — DB close may race"
+                    )
             self._auditor_tasks.clear()
 
         for name in self._registered_skill_names:
@@ -1134,7 +1152,16 @@ class UserMemoryPlugin(BasePlugin):
         try:
             data = json.loads(cleaned)
         except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"[auditor] failed to parse JSON: {e}; raw: {text[:200]!r}")
+            # The auditor output contains the user facts the model just
+            # extracted (nicknames, addresses, relationships, ...). Logging
+            # the raw text — even truncated — would persist that to the log
+            # file. Record only length + a content hash so we can still
+            # correlate repeated failures across runs without leaking PII.
+            digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+            logger.warning(
+                f"[auditor] failed to parse JSON: {e} "
+                f"(text_len={len(text)}, sha256_12={digest})"
+            )
             return []
         if not isinstance(data, list):
             logger.warning(f"[auditor] expected JSON array, got {type(data).__name__}")

@@ -1057,10 +1057,11 @@ class UserMemoryDB:
                 overwrites profiles by (user_id, key) and appends events.
 
         Returns a dict with counts: ``profiles_added``, ``profiles_updated``,
-        ``profiles_skipped``, ``events_added``.
+        ``profiles_skipped``, ``events_added``, ``events_skipped``,
+        ``events_skipped_dup``.
 
         - merge / upsert: lenient — malformed rows are skipped and counted in
-          ``profiles_skipped``.
+          ``profiles_skipped`` (for profiles) or ``events_skipped`` (for events).
         - replace: strict — the snapshot is **fully validated before** the
           existing tables are wiped. Any malformed row raises ``ValueError``
           and the live DB is left untouched. Without this guard, a corrupt
@@ -1109,7 +1110,11 @@ class UserMemoryDB:
                         f"(user_id/summary)"
                     )
 
-        added = updated = skipped = events_added = 0
+        # Track profile and event skip counts separately so the return dict
+        # can attribute "skipped" to the right table — otherwise a malformed
+        # event row would be misreported as ``profiles_skipped`` and confuse
+        # the WebUI's import summary during backup/restore.
+        added = updated = profiles_skipped = events_skipped = events_added = 0
         with self._write_lock:
             conn = self._get_conn()
             try:
@@ -1121,13 +1126,13 @@ class UserMemoryDB:
                 # Profiles
                 for row in profiles:
                     if not isinstance(row, dict):
-                        skipped += 1
+                        profiles_skipped += 1
                         continue
                     uid = row.get("user_id")
                     key = row.get("key")
                     val = row.get("value")
                     if not uid or not key or val is None:
-                        skipped += 1
+                        profiles_skipped += 1
                         continue
                     cat = row.get("category", "basic")
                     if cat not in VALID_CATEGORIES:
@@ -1182,7 +1187,7 @@ class UserMemoryDB:
                                 added += 1
                             else:
                                 # Live row already there — preserve it (merge contract)
-                                skipped += 1
+                                profiles_skipped += 1
                     else:  # replace or upsert
                         cur = conn.execute(
                             """INSERT INTO user_profiles
@@ -1208,12 +1213,12 @@ class UserMemoryDB:
                 events_skipped_dup = 0
                 for row in events:
                     if not isinstance(row, dict):
-                        skipped += 1
+                        events_skipped += 1
                         continue
                     uid = row.get("user_id")
                     summary = row.get("summary")
                     if not uid or not summary:
-                        skipped += 1
+                        events_skipped += 1
                         continue
                     # Same normalization as profiles.updated_at — guard
                     # against int epoch / datetime objects in the snapshot.
@@ -1268,8 +1273,9 @@ class UserMemoryDB:
             "mode": mode,
             "profiles_added": added,
             "profiles_updated": updated,
-            "profiles_skipped": skipped,
+            "profiles_skipped": profiles_skipped,
             "events_added": events_added,
+            "events_skipped": events_skipped,
             # Events that matched an existing row by natural key — only
             # populated for merge/upsert modes; always 0 for replace.
             "events_skipped_dup": events_skipped_dup if mode != "replace" else 0,

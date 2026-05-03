@@ -1789,9 +1789,18 @@ async function importMemory(evt) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    // Show skip counts attributed to the right table; backend now splits
+    // profiles_skipped vs events_skipped so the user can tell which side of
+    // the snapshot was malformed.
+    const profSkip = data.profiles_skipped ?? 0;
+    const evtSkip = data.events_skipped ?? 0;
+    const skipParts = [];
+    if (profSkip) skipParts.push(`画像跳过 ${profSkip}`);
+    if (evtSkip) skipParts.push(`事件跳过 ${evtSkip}`);
+    const skipText = skipParts.length ? ', ' + skipParts.join(', ') : '';
     _setImportStatus(
       `导入完成 (${data.mode}): +${data.profiles_added} 画像, ` +
-      `+${data.events_added} 事件, ${data.profiles_skipped} 跳过`,
+      `+${data.events_added} 事件${skipText}`,
       'ok'
     );
     // Refresh views so the new data shows up
