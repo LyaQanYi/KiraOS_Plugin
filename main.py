@@ -156,7 +156,14 @@ class UserMemoryPlugin(BasePlugin):
         # or trigger provider rate limits. Above this threshold new audits
         # are dropped (best-effort behaviour — auditor is already an opt-in
         # bonus layer, missing one turn is fine).
-        self._auditor_max_inflight: int = max(1, int(cfg.get("memory_auditor_max_inflight", 4)))
+        # Clamp on **both** ends: schema.json declares max=32, but a hand-
+        # edited config file would bypass that. Belt-and-suspenders here so
+        # one misconfigured user can't overload the provider.
+        try:
+            _raw_inflight = int(cfg.get("memory_auditor_max_inflight", 4))
+        except (TypeError, ValueError):
+            _raw_inflight = 4
+        self._auditor_max_inflight: int = max(1, min(32, _raw_inflight))
         # Belt-and-suspenders: a Semaphore around the actual LLM call so any
         # future caller of _run_auditor() (not just schedule_audit) is also
         # bounded.
@@ -1145,6 +1152,19 @@ class UserMemoryPlugin(BasePlugin):
                 logger.info(f"[auditor] {_mask_id(user_id)}: no facts extracted")
                 return
 
+            # The LLM await above can take up to 15s. If terminate() ran
+            # during that window (e.g. plugin disabled mid-flight) it will
+            # have set self.db = None. Re-check before writing — without
+            # this, upsert_with_limit would raise AttributeError. The outer
+            # except Exception would catch it, but a clean early-return
+            # avoids spurious traceback noise in the logs.
+            if not self.db:
+                logger.info(
+                    f"[auditor] {_mask_id(user_id)}: db closed during LLM call, "
+                    "skipping writes"
+                )
+                return
+
             # Write to DB. Each entry goes through upsert_with_limit so M6
             # conflict-detection (and the confidence cap) protect existing
             # higher-confidence values written by the main LLM.
@@ -1196,12 +1216,14 @@ class UserMemoryPlugin(BasePlugin):
         Returns ``[]`` on any error.
         """
         cleaned = _strip_json_fence(text)
-        # If the model added prose around the JSON, try to find the first [...] block
-        if not cleaned.startswith("["):
-            start = cleaned.find("[")
-            end = cleaned.rfind("]")
-            if start != -1 and end > start:
-                cleaned = cleaned[start: end + 1]
+        # Always try to extract the first ``[...]`` block — handles BOTH
+        # leading prose ("根据消息: [...]") AND trailing prose
+        # ("[...]\n说明 ..."). A startswith-only check would let
+        # trailing-prose cases fall through to ``json.loads`` and fail.
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end > start:
+            cleaned = cleaned[start: end + 1]
         try:
             data = json.loads(cleaned)
         except (json.JSONDecodeError, ValueError) as e:

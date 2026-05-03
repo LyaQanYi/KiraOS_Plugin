@@ -75,7 +75,7 @@
         "name": "Memory auditor (active recall)",
         "type": "switch",
         "default": false,
-        "hint": "Run a separate fast-LLM call after each turn to extract any facts the main LLM missed. Costs one extra LLM call per user batch. Default off — enable if your main LLM is too conservative about calling memory_update."
+        "hint": "Run a separate fast-LLM call after each turn to extract any facts the main LLM missed. Costs one extra LLM call per user batch. Default off — enable if your main LLM is too conservative about calling memory_update. ⚠️ Privacy: enabling this sends the user's latest message AND up to 50 of their existing profile entries (nicknames, locations, relationships, etc.) to the auditor model — which may be a different vendor than your main LLM if you set memory_auditor_model_uuid. Make sure that vendor's data-handling policy is acceptable before turning this on."
     },
     "memory_auditor_model_uuid": {
         "name": "Memory auditor model",

@@ -687,7 +687,7 @@ parameters:
 | `max_event_keep` | integer | 100 | 数据库中每个用户保留的最大事件数（超出自动清理） |
 | `max_context_chars` | integer | 500 | 每用户注入的记忆上下文最大字符数（0 = 不限制），超限时按分类优先级截断 |
 | `inject_categories` | list | `["basic"]` | 每轮自动注入到 system prompt 的画像分类。其余分类不注入但通过 `memory_query(category=...)` 可查。设为 `["*"]` 或 `["all"]` 恢复 v1.2.0 之前"全量注入"的行为 |
-| `memory_auditor_enabled` | switch | `false` | 启用主动记忆审计员（C 层）。开启后每轮额外消耗一次 fast LLM 调用扫描用户消息提取漏记事实 |
+| `memory_auditor_enabled` | switch | `false` | 启用主动记忆审计员（C 层）。开启后每轮额外消耗一次 fast LLM 调用扫描用户消息提取漏记事实。⚠️ **隐私**：开启即向审计员模型发送用户最新消息 + 该用户**最多 50 条已有画像**（昵称/地点/关系等 PII）。若 `memory_auditor_model_uuid` 指向了与主 LLM 不同的 provider，这些数据就会同时共享给那个 provider；启用前请确认其数据处理策略可接受 |
 | `memory_auditor_model_uuid` | model_select | `""` | 审计员使用的 LLM 模型（WebUI 渲染为下拉选择器，从已配置的 LLM 列表里选）。留空（推荐）走默认 fast LLM；想固定到某个具体模型时再选 |
 | `memory_auditor_skip_keywords` | list | `["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"]` | 用户消息命中任一关键词时审计员整个跳过本轮（隐私守门） |
 | `skills_dir` | string | `null` | 技能目录路径（为空时自动使用 `data/skills/`） |
