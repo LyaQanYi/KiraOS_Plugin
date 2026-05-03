@@ -977,7 +977,13 @@ class UserMemoryPlugin(BasePlugin):
         self._audited_event_ids.add(eid)
         # Defensive cap on the dedup set so a long session can't bloat it.
         if len(self._audited_event_ids) > self._max_audit_dedup_size:
-            # Drop oldest half — set ordering is insertion-stable in CPython 3.7+
+            # Drop an arbitrary half to keep the set bounded.
+            # NOTE: Python ``set`` is unordered (only ``dict`` gained
+            # insertion-order semantics in 3.7), so the slice below removes
+            # a hash-dependent half — *not* the oldest entries. That's fine
+            # for our purpose: the dedup is best-effort anyway, since
+            # ``id()`` values are recycled after GC. We only need the size
+            # to stay within ``_max_audit_dedup_size``.
             self._audited_event_ids = set(
                 list(self._audited_event_ids)[self._max_audit_dedup_size // 2:]
             )
