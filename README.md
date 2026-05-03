@@ -267,7 +267,7 @@ LLM 收到这个 hint 后可以：
 
 **返回内容结构**（节选）：
 
-```
+```text
 <consolidation user_id="...">
 ## 最近 30 条事件
 - 2026-04-01 [#daily] 跑了 5km
@@ -304,7 +304,7 @@ KiraOS 的记忆触发由三层机制保证 LLM 不会"漏记"：
 
 `inject_context` 钩子每轮都会在 system prompt 末尾加一段：
 
-```
+```text
 📝 本轮检查: 用户若提到任何自身事实信息(姓名/地点/职业/关系/偏好/经历),
    主动调用 memory_update 记录。宁记错不漏过——低置信度记下来，后续会被高置信度覆盖。
 ```
@@ -436,7 +436,7 @@ token 比较走 `secrets.compare_digest`（防时序攻击）。
 
 技能路由采用**渐进式披露 (Progressive Disclosure)** 模式，灵感来自 Claude 的 Skill 系统：
 
-```
+```text
 ┌─ 启动阶段 ─────────────────────────────────────────┐
 │  扫描 data/skills/ 目录                              │
 │  优先识别 SKILL.md（YAML frontmatter + 正文）        │
@@ -472,7 +472,7 @@ token 比较走 `secrets.compare_digest`（防时序攻击）。
 
 **格式 A（推荐，单文件，贴近 Claude Skills）**：
 
-```
+```text
 data/skills/
 └── my_skill/
     └── SKILL.md          ← YAML frontmatter + 执行指令正文
@@ -482,7 +482,7 @@ data/skills/
 
 **格式 B（传统两文件，向后兼容）**：
 
-```
+```text
 data/skills/
 └── my_skill/
     ├── manifest.json     ← 工具定义（必需）
@@ -576,7 +576,7 @@ parameters:
 
 技能目录下若包含以下任一子目录，里面的文件可作为"按需加载"的资源：
 
-```
+```text
 my_skill/
 ├── SKILL.md
 ├── references/         ← 长篇参考、规范文档
@@ -610,7 +610,7 @@ my_skill/
 
 **目录结构**：
 
-```
+```text
 data/skills/tarot_reading/
 └── SKILL.md
 ```
@@ -748,7 +748,7 @@ CREATE INDEX idx_event_logs_user
 
 ## 架构概览
 
-```
+```text
 KiraOS Plugin (main.py)
 ├── UserMemoryDB (db.py)           ← SQLite 读写（thread-local conn + auto-migrate）
 │   ├── user_profiles 表            ← 长期画像（分类 + 置信度 + TTL）

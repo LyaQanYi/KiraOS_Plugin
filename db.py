@@ -405,8 +405,14 @@ class UserMemoryDB:
             except Exception:
                 try:
                     conn.rollback()
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    # Don't swallow silently — a failed rollback can leave a
+                    # dirty transaction that breaks the next write. Logging
+                    # surfaces it so we can correlate with the outer error.
+                    logger.warning(
+                        f"upsert_with_limit: rollback failed for "
+                        f"{user_id}/{key}: {rb_err}"
+                    )
                 raise
 
     def get_profiles(self, user_id: str, *, include_expired: bool = False,
@@ -848,7 +854,14 @@ class UserMemoryDB:
         q = (q or "").strip()
         if not q:
             return []
-        like = f"%{q}%"
+        # Escape LIKE wildcards so user-supplied terms are treated as literals.
+        # Without this, a query like "50%" would match anything containing
+        # "50", and a single "%" would match every row. We pick "!" as the
+        # escape character (rare in user content) and bind it via ESCAPE '!'
+        # in each LIKE clause below. Order matters: escape "!" first so we
+        # don't double-escape the escape characters we just inserted.
+        q_esc = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        like = f"%{q_esc}%"
         conn = self._get_conn()
 
         # Find candidate user_ids — three sources, unioned, then enriched.
@@ -857,7 +870,7 @@ class UserMemoryDB:
         # match by user_id
         for (uid,) in conn.execute(
             "SELECT DISTINCT user_id FROM (SELECT user_id FROM user_profiles "
-            "UNION SELECT user_id FROM event_logs) WHERE user_id LIKE ? LIMIT ?",
+            "UNION SELECT user_id FROM event_logs) WHERE user_id LIKE ? ESCAPE '!' LIMIT ?",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
@@ -868,7 +881,7 @@ class UserMemoryDB:
         # match by profile value
         for uid, key, value in conn.execute(
             "SELECT user_id, memory_key, memory_value FROM user_profiles "
-            "WHERE memory_value LIKE ? LIMIT ?",
+            "WHERE memory_value LIKE ? ESCAPE '!' LIMIT ?",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
@@ -879,7 +892,7 @@ class UserMemoryDB:
         # match by event summary
         for uid, summary in conn.execute(
             "SELECT user_id, event_summary FROM event_logs "
-            "WHERE event_summary LIKE ? LIMIT ?",
+            "WHERE event_summary LIKE ? ESCAPE '!' LIMIT ?",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
@@ -1084,8 +1097,11 @@ class UserMemoryDB:
             except Exception:
                 try:
                     conn.rollback()
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    # See upsert_with_limit's rollback handler for rationale.
+                    logger.warning(
+                        f"import_all: rollback failed (mode={mode}): {rb_err}"
+                    )
                 raise
 
         return {
