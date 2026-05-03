@@ -783,7 +783,7 @@ KiraOS Plugin (main.py)
 |------|------|
 | `initialize()` | 自动禁用内置 Simple Memory → 初始化数据库（含 expires_at 字符串→epoch / 新增 tag 列等迁移）→ 扫描技能目录（识别 SKILL.md / 老格式）→ 注册技能工具 → 若任一技能带资源子目录则注册 `read_skill_resource` → 构建斜杠命令映射 → 启动 WebUI（含 5s 就绪检测） |
 | 运行中 | `inject_context` 钩子每轮注入记忆段 + memory_hint + 技能列表；`handle_slash_command` 拦截斜杠命令；LLM 按需调用记忆工具和技能工具；若审计员开启，`schedule_audit` 在每个 batch event 异步触发一次 `_run_auditor` 兜底捕获漏记；WebUI 提供 REST API |
-| `terminate()` | 停止 WebUI → 注销所有动态工具（技能 + read_skill_resource）→ 关闭数据库（统一关闭所有 thread-local 连接） |
+| `terminate()` | 停止 WebUI → **排空 `_auditor_tasks`**（5s gather；超时则 cancel 后再 gather 2s 让 in-flight 任务清理收尾，避免对已关闭 DB 写入）→ 注销所有动态工具（技能 + read_skill_resource）→ 关闭数据库（统一关闭所有 thread-local 连接）。整体最长 ~7s |
 
 ---
 

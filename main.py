@@ -601,9 +601,10 @@ class UserMemoryPlugin(BasePlugin):
         if primary_uid == "unknown":
             return "Error: cannot determine user_id"
         # Whitelist of senders: per-op user_id is only honoured if it appears here.
+        # primary_uid is guaranteed != "unknown" past the early return above,
+        # so add it unconditionally.
         sender_set = set(self._extract_user_ids(event))
-        if primary_uid != "unknown":
-            sender_set.add(primary_uid)
+        sender_set.add(primary_uid)
 
         # ── M1: dedupe within batch by (op, key, target_uid). Last wins.
         # event ops are NOT deduped (multiple distinct events are legitimate).
@@ -745,9 +746,11 @@ class UserMemoryPlugin(BasePlugin):
                 results.append(f"skip: unknown op '{op}'")
 
         # Post-summary: show current profile of the primary user so the LLM
-        # can self-check for contradictions next turn.
+        # can self-check for contradictions next turn. primary_uid is
+        # guaranteed != "unknown" by the early return at the top of this
+        # function, so only the db existence check is meaningful here.
         summary_suffix = ""
-        if self.db and primary_uid != "unknown":
+        if self.db:
             profiles = self.db.get_profiles(primary_uid)
             if profiles:
                 top = profiles[:5]
@@ -1195,9 +1198,22 @@ class UserMemoryPlugin(BasePlugin):
                     written += 1
                 else:
                     skipped += 1
+                    # Don't dump ``info`` directly — for status="conflict",
+                    # ``upsert_with_limit`` puts the existing user value into
+                    # ``info['hint']`` (e.g. "现值'小明' (置信度 0.90) ..."),
+                    # and ``f"... {info}"`` would render the whole dict via
+                    # ``repr``, persisting that PII to the log file. Same
+                    # privacy class as the auditor-text-leak fix in round 7.
+                    # We log only metadata: status + a content-hash and length
+                    # so repeated conflicts are still correlatable for ops.
+                    hint_str = (info.get("hint", "") if isinstance(info, dict) else str(info)) or ""
+                    hint_digest = (
+                        hashlib.sha256(hint_str.encode("utf-8", errors="replace")).hexdigest()[:8]
+                        if hint_str else "—"
+                    )
                     logger.info(
                         f"[auditor] {_mask_id(user_id)}: {_mask_id(key)} skipped "
-                        f"({status}: {info})"
+                        f"(status={status}, hint_len={len(hint_str)}, hint_sha8={hint_digest})"
                     )
 
             logger.info(
