@@ -862,9 +862,13 @@ class UserMemoryDB:
         conn = self._get_conn()
 
         # Find candidate user_ids — three sources, unioned, then enriched.
+        # Each source aggregates per user_id IN SQL **before** applying the
+        # row limit. The naive "LIMIT row matches then dedupe in Python"
+        # version was buggy: a single user with N matching rows would consume
+        # the whole quota and starve other matching users out of the result.
         rows: dict = {}
 
-        # match by user_id
+        # Match by user_id (already DISTINCT, naturally per-user)
         for (uid,) in conn.execute(
             "SELECT DISTINCT user_id FROM (SELECT user_id FROM user_profiles "
             "UNION SELECT user_id FROM event_logs) WHERE user_id LIKE ? ESCAPE '!' LIMIT ?",
@@ -875,27 +879,35 @@ class UserMemoryDB:
             if not entry["snippet"]:
                 entry["snippet"] = f"id: {uid}"
 
-        # match by profile value
-        for uid, key, value in conn.execute(
-            "SELECT user_id, memory_key, memory_value FROM user_profiles "
-            "WHERE memory_value LIKE ? ESCAPE '!' LIMIT ?",
+        # Match by profile value — group by user_id so each matching user
+        # occupies exactly one slot. MIN() picks an arbitrary but stable row
+        # to serve as the snippet sample.
+        for uid, sample_key, sample_value in conn.execute(
+            "SELECT user_id, MIN(memory_key), MIN(memory_value) "
+            "FROM user_profiles "
+            "WHERE memory_value LIKE ? ESCAPE '!' "
+            "GROUP BY user_id "
+            "LIMIT ?",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
             entry["match_in"].add("profile")
             if not entry["snippet"]:
-                entry["snippet"] = f"{key}={value[:60]}"
+                entry["snippet"] = f"{sample_key}={(sample_value or '')[:60]}"
 
-        # match by event summary
-        for uid, summary in conn.execute(
-            "SELECT user_id, event_summary FROM event_logs "
-            "WHERE event_summary LIKE ? ESCAPE '!' LIMIT ?",
+        # Match by event summary — same per-user aggregation
+        for uid, sample_summary in conn.execute(
+            "SELECT user_id, MIN(event_summary) "
+            "FROM event_logs "
+            "WHERE event_summary LIKE ? ESCAPE '!' "
+            "GROUP BY user_id "
+            "LIMIT ?",
             (like, limit),
         ).fetchall():
             entry = rows.setdefault(uid, {"match_in": set(), "snippet": ""})
             entry["match_in"].add("event")
             if not entry["snippet"]:
-                entry["snippet"] = f"event: {summary[:60]}"
+                entry["snippet"] = f"event: {(sample_summary or '')[:60]}"
 
         if not rows:
             return []
@@ -922,7 +934,9 @@ class UserMemoryDB:
                 "snippet": entry["snippet"],
             })
         out.sort(key=lambda r: r["user_id"])
-        return out
+        # Three sources can together produce up to 3*limit users — enforce
+        # the caller-requested limit at the very end so the contract holds.
+        return out[:limit]
 
     # ── Bulk export / import (M4) ───────────────────────────────────
 
@@ -1015,16 +1029,44 @@ class UserMemoryDB:
                     clipped, _ = self._clip_value(val, MAX_PROFILE_VALUE_LEN)
 
                     if mode == "merge":
-                        cur = conn.execute(
-                            "INSERT OR IGNORE INTO user_profiles "
-                            "(user_id, memory_key, memory_value, updated_at, confidence, category, expires_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (uid, key, clipped, ua, conf, cat, exp),
-                        )
-                        if cur.rowcount > 0:
+                        # `INSERT OR IGNORE` on the (user_id, memory_key) PK
+                        # alone would silently drop the imported value when an
+                        # existing row exists but is **already expired** —
+                        # callers (`get_profiles` / `profile_exists`) treat it
+                        # as gone, but the PK is still occupied. Restore data
+                        # in that case by overwriting the expired row.
+                        now_epoch = int(time.time())
+                        existing = conn.execute(
+                            "SELECT expires_at FROM user_profiles "
+                            "WHERE user_id = ? AND memory_key = ?",
+                            (uid, key),
+                        ).fetchone()
+                        if existing is None:
+                            # No collision → straight insert
+                            conn.execute(
+                                "INSERT INTO user_profiles "
+                                "(user_id, memory_key, memory_value, updated_at, confidence, category, expires_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (uid, key, clipped, ua, conf, cat, exp),
+                            )
                             added += 1
                         else:
-                            skipped += 1
+                            existing_exp = existing[0]
+                            if existing_exp is not None and existing_exp <= now_epoch:
+                                # Existing row is expired → revive with the
+                                # imported value (other code paths already
+                                # treat it as absent, so this isn't surprising).
+                                conn.execute(
+                                    """UPDATE user_profiles
+                                       SET memory_value = ?, updated_at = ?,
+                                           confidence = ?, category = ?, expires_at = ?
+                                       WHERE user_id = ? AND memory_key = ?""",
+                                    (clipped, ua, conf, cat, exp, uid, key),
+                                )
+                                added += 1
+                            else:
+                                # Live row already there — preserve it (merge contract)
+                                skipped += 1
                     else:  # replace or upsert
                         cur = conn.execute(
                             """INSERT INTO user_profiles
