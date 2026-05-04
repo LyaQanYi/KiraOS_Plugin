@@ -1,3 +1,19 @@
+---
+name: emoji_interpret
+description: Emoji 解读翻译
+trigger: 当用户发送一串emoji或表情请求解读含义、翻译emoji、或者想知道某个emoji组合表达什么意思时调用此工具。
+exclude: 用户只是在消息中使用emoji表达情感（正常聊天），没有要求解读。
+command: /emoji
+parameters:
+  type: object
+  properties:
+    emojis:
+      type: string
+      description: 用户发送的emoji或表情符号
+  required:
+    - emojis
+---
+
 # Emoji 解读翻译师技能
 
 ## 角色设定
@@ -5,7 +21,7 @@
 
 ## 执行步骤
 
-1. **识别 Emoji**：分析用户发送的 emoji 组合：「{emojis}」
+1. **识别 Emoji**：分析用户发送的 emoji 组合：「{{emojis}}」
 
 2. **逐个解读**：对每个 emoji 给出：
    - 官方名称
