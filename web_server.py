@@ -249,6 +249,78 @@ async def api_get_user(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
+async def api_embeddings_backfill(request: Request) -> JSONResponse:
+    """POST /api/embeddings/backfill?dry_run=1[&kinds=event,reflection]
+
+    Drives :func:`embeddings.backfill_async` against the plugin's DB.
+    ``dry_run=1`` returns pending counts without writing or even
+    resolving an embedding backend — safe to expose in any UI as a
+    "what would this do?" preview. ``dry_run=0`` performs the work,
+    bounded by ``batch_size`` (default 100) and ``max_total`` (default
+    5000) so a single click can't try to embed everything in one shot.
+
+    The embedding service is looked up via app.state.embedding_service
+    if the plugin has wired one; otherwise we construct a disabled
+    instance so the dry-run path still works and the real-run path
+    surfaces a clear "no backend" error.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    qp = request.query_params
+    dry_run = qp.get("dry_run", "1") not in ("0", "false", "False", "")
+    kinds_param = qp.get("kinds")
+    kinds: Optional[list[str]]
+    if kinds_param:
+        kinds = [k.strip() for k in kinds_param.split(",") if k.strip()]
+    else:
+        kinds = None
+    try:
+        batch_size = int(qp.get("batch_size", "100"))
+    except (TypeError, ValueError):
+        batch_size = 100
+    batch_size = max(1, min(1000, batch_size))
+    try:
+        max_total = int(qp.get("max_total", "5000"))
+    except (TypeError, ValueError):
+        max_total = 5000
+    max_total = max(1, min(100_000, max_total))
+
+    # Pull the embedding service if the host plugin attached one.
+    # A disabled service still allows dry_run to return useful info.
+    service = getattr(request.app.state, "embedding_service", None)
+    if service is None:
+        # Local fallback — keeps the endpoint self-contained for
+        # tests / standalone runs of the web server.
+        from .embeddings import EmbeddingService
+        service = EmbeddingService(enabled=False)
+
+    try:
+        from .embeddings import backfill_async
+        report = await backfill_async(
+            db, service,
+            kinds=kinds,
+            batch_size=batch_size,
+            max_total=max_total,
+            dry_run=dry_run,
+        )
+    except Exception:
+        logger.exception("Backfill failed")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+    return JSONResponse({
+        "ok": True,
+        "dry_run": report.dry_run,
+        "kinds": report.kinds,
+        "pending_before": report.pending_before,
+        "processed": report.processed,
+        "written": report.written,
+        "skipped": report.skipped,
+        "errors": report.errors[:20],  # cap so a flood of errors doesn't blow the response
+    })
+
+
 async def api_list_reflections(request: Request) -> JSONResponse:
     """GET /api/users/{user_id}/reflections?status= — list reflections.
 
@@ -652,6 +724,7 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
         Route("/api/export", api_export, methods=["GET"]),
         Route("/api/import", api_import, methods=["POST"]),
+        Route("/api/embeddings/backfill", api_embeddings_backfill, methods=["POST"]),
         Route("/api/stats", api_stats, methods=["GET"]),
         Route("/api/users", api_list_users, methods=["GET"]),
     ]

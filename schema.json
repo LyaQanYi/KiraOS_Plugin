@@ -204,5 +204,27 @@
         "minimum": 60,
         "maximum": 86400,
         "hint": "How often the auto-promotion loop sweeps for eligible reflections. 1800s (30 min) is the default — short enough to feel responsive, long enough to avoid hammering SQLite when many users have backlogs. Lower bound 60s; upper bound 24h."
+    },
+    "enable_anti_repeat": {
+        "name": "Enable anti-repeat hint",
+        "type": "switch",
+        "default": false,
+        "hint": "Before each LLM call, scan the recent assistant outputs for tokens (words / CJK trigrams) used across many of them and inject a one-line system hint asking the model to vary its phrasing. The corpus is in-memory only (lost on restart, no persistence overhead) and rebuilds within a few turns."
+    },
+    "anti_repeat_lookback_turns": {
+        "name": "Anti-repeat: lookback turns",
+        "type": "integer",
+        "default": 10,
+        "minimum": 2,
+        "maximum": 100,
+        "hint": "How many of the user's most recent assistant outputs are scanned for over-used tokens. Higher = catches longer-running patterns but slower to react to a deliberate change in style. 10 is the sweet spot for typical chat."
+    },
+    "anti_repeat_df_threshold": {
+        "name": "Anti-repeat: document-frequency threshold",
+        "type": "integer",
+        "default": 5,
+        "minimum": 2,
+        "maximum": 100,
+        "hint": "A token must appear in at least this many of the lookback outputs to be flagged as over-used. Default 5 (half of the default lookback) catches genuinely repetitive patterns without flagging incidental shared vocabulary."
     }
 }

@@ -29,6 +29,7 @@ from core.prompt_manager import Prompt
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, KiraStepResult
 from core.utils.path_utils import get_data_path
 
+from .anti_repeat import AntiRepeatCorpus, format_anti_repeat_hint
 from .cognition.evidence import EvidenceConfig
 from .cognition.facts import fact_hash, importance_from_text, is_dedup_candidate
 from .cognition.reconciler import Reconciler
@@ -166,6 +167,21 @@ class UserMemoryPlugin(BasePlugin):
         self._reconciler: Optional[Reconciler] = None
         self._promote_tick_task: Optional[asyncio.Task] = None
         self._reconciler_tasks: set[asyncio.Task] = set()
+        # ── Phase 4: anti-repeat + embedding backfill ───────────────
+        # Off by default. When enabled, ``inject_context`` runs the
+        # corpus DF check before each LLM call and adds a one-line
+        # hint listing over-used tokens.
+        self._enable_anti_repeat: bool = bool(cfg.get("enable_anti_repeat", False))
+        self._anti_repeat_lookback: int = max(2, int(
+            cfg.get("anti_repeat_lookback_turns", 10)
+        ))
+        self._anti_repeat_df_threshold: int = max(2, int(
+            cfg.get("anti_repeat_df_threshold", 5)
+        ))
+        # Corpus is constructed regardless of the flag so we can be
+        # turned on mid-session without losing the warm-up window —
+        # ``record`` is cheap. The hint just stays empty until enabled.
+        self._anti_repeat = AntiRepeatCorpus(max_size=100)
         self.max_events = int(cfg.get("max_events_per_user", 10))
         self.max_profiles = int(cfg.get("max_profiles_per_user", 50))
         self.max_event_keep = int(cfg.get("max_event_keep", 100))
@@ -1243,6 +1259,10 @@ class UserMemoryPlugin(BasePlugin):
         if user_id == "unknown":
             return "Error: cannot determine user_id"
         profiles_del, events_del = self.db.clear_user_memory(user_id)
+        # Phase 4 — wipe the anti-repeat corpus too. Otherwise the
+        # next turn would still flag this user's vocabulary even
+        # though they explicitly asked us to forget them.
+        self._anti_repeat.clear(user_id)
         logger.info(f"memory_clear for {_mask_id(user_id)}: {profiles_del} profiles, {events_del} events deleted")
         return f"已清除全部记忆: 删除了 {profiles_del} 条画像和 {events_del} 条事件记录。"
 
@@ -1317,6 +1337,31 @@ class UserMemoryPlugin(BasePlugin):
             source="kiraos",
         ))
 
+        # ── C: Phase 4 anti-repeat hint ─────────────────────────────
+        # Only emitted when at least one user has a corpus large
+        # enough to clear ``df_threshold``. The hint lists the
+        # tokens this user has been over-using and instructs the
+        # model to vary phrasing. No-op when the buffer is empty.
+        if self._enable_anti_repeat and self.db:
+            for uid in self._extract_user_ids(event) or []:
+                tokens = self._anti_repeat.overused_tokens(
+                    uid,
+                    lookback=self._anti_repeat_lookback,
+                    df_threshold=self._anti_repeat_df_threshold,
+                )
+                hint = format_anti_repeat_hint(tokens)
+                if hint:
+                    req.system_prompt.append(Prompt(
+                        hint,
+                        name="anti_repeat_hint",
+                        source="kiraos",
+                    ))
+                    # One hint per turn is plenty — multiple users
+                    # only happen in group chat, where the primary
+                    # speaker dominates style continuity. Append once
+                    # for the primary user and stop.
+                    break
+
     # ════════════════════════════════════════════════════════════════
     #  Auditor (C) — passive scan of every turn for missed facts
     # ════════════════════════════════════════════════════════════════
@@ -1382,6 +1427,13 @@ class UserMemoryPlugin(BasePlugin):
         if user_id == "unknown":
             return
         assistant_reply = (step_result.raw_output or "").strip()
+
+        # Phase 4 — feed the anti-repeat corpus regardless of whether
+        # the hint injection is enabled. Keeping the buffer warm lets
+        # the operator flip enable_anti_repeat on mid-session without
+        # waiting K turns for signal to build up.
+        if assistant_reply:
+            self._anti_repeat.record(user_id, assistant_reply)
 
         # Fire-and-forget. We don't await so the step_result handler chain
         # doesn't stall the main agent loop. Errors are logged inside.

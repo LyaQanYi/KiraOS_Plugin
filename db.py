@@ -1451,6 +1451,85 @@ class UserMemoryDB:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ── Phase 4: embedding backfill helpers ─────────────────────────
+
+    # Tables backfill_async knows about. Each row pairs a "kind" name
+    # (as used in EmbeddingService.backfill_async / web /api/embeddings
+    # /backfill output) with the table + key columns. Adding a new
+    # target (e.g. reflections.embedding) is a one-line extension.
+    BACKFILL_TARGETS = {
+        "event": ("event_logs", "id", "event_summary"),
+        "profile": ("user_profiles", "rowid", "memory_value"),
+        "reflection": ("reflections", "id", "summary"),
+    }
+
+    def count_rows_needing_embedding(self, kind: str) -> int:
+        """Cheap dashboard query: how many rows of ``kind`` have a
+        NULL ``embedding`` column? Used by the backfill HTTP endpoint
+        in dry-run mode so a UI can show "would process N rows".
+        """
+        spec = self.BACKFILL_TARGETS.get(kind)
+        if spec is None:
+            return 0
+        table, _key_col, _text_col = spec
+        conn = self._get_conn()
+        cursor = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE embedding IS NULL"
+        )
+        return int(cursor.fetchone()[0] or 0)
+
+    def list_rows_needing_embedding(
+        self, kind: str, limit: int = 100,
+    ) -> List[Tuple[int, str]]:
+        """Page of rows missing an embedding for ``kind``.
+
+        Returns ``[(rowkey, text), ...]`` where ``rowkey`` matches
+        ``BACKFILL_TARGETS[kind][1]`` (``id`` for event_logs /
+        reflections, ``rowid`` for user_profiles whose primary key is
+        composite). Ordering is by rowkey ASC so callers iterating
+        page-by-page see deterministic progress.
+        """
+        spec = self.BACKFILL_TARGETS.get(kind)
+        if spec is None:
+            return []
+        table, key_col, text_col = spec
+        conn = self._get_conn()
+        cursor = conn.execute(
+            f"SELECT {key_col}, {text_col} FROM {table} "
+            f"WHERE embedding IS NULL ORDER BY {key_col} ASC LIMIT ?",
+            (max(int(limit), 0),),
+        )
+        return [(int(row[0]), row[1] or "") for row in cursor.fetchall()]
+
+    def write_embedding(
+        self, kind: str, rowkey: int, blob: bytes, sha: str,
+    ) -> bool:
+        """Persist an embedding BLOB + its content-tag hash.
+
+        Returns True iff the row was found and updated. Errors are
+        caught and turned into False so the backfill worker can keep
+        going even if one row is malformed.
+        """
+        spec = self.BACKFILL_TARGETS.get(kind)
+        if spec is None:
+            return False
+        table, key_col, _text_col = spec
+        with self._write_lock:
+            try:
+                conn = self._get_conn()
+                cursor = conn.execute(
+                    f"UPDATE {table} SET embedding = ?, embedding_sha = ? "
+                    f"WHERE {key_col} = ?",
+                    (blob, sha, rowkey),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+            except sqlite3.Error as exc:
+                logger.warning(
+                    f"write_embedding({kind}, {rowkey}) failed: {exc}"
+                )
+                return False
+
     def list_unabsorbed_events(
         self,
         user_id: str,

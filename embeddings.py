@@ -22,11 +22,13 @@ the embedding column is stale" without decoding the BLOB.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import math
 import struct
-from typing import Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Iterable, Optional, Sequence
 
 from core.logging_manager import get_logger
 
@@ -264,3 +266,151 @@ class EmbeddingService:
             "EmbeddingService: no backend available (this is fine — "
             "recaller will run FTS-only)"
         )
+
+
+# ── Phase 4: backfill worker ───────────────────────────────────────
+
+@dataclass
+class BackfillReport:
+    """Telemetry returned by :func:`backfill_async`. ``processed`` is
+    rows we tried to embed; ``written`` is rows whose embedding made
+    it back to disk; ``skipped`` is rows we skipped (empty text or
+    pre-flight pass on dry_run). Callers (WebUI, logs) format what
+    they care about; absent fields stay zero.
+    """
+    kinds: list[str] = field(default_factory=list)
+    processed: int = 0
+    written: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+    dry_run: bool = False
+    pending_before: dict[str, int] = field(default_factory=dict)
+
+
+async def backfill_async(
+    db,
+    service: "EmbeddingService",
+    *,
+    kinds: Optional[Iterable[str]] = None,
+    batch_size: int = 100,
+    max_total: int = 5000,
+    dry_run: bool = False,
+    sleep_between_batches_s: float = 0.05,
+) -> BackfillReport:
+    """Walk rows with NULL embedding for each ``kind`` and fill them in.
+
+    Args:
+        db: UserMemoryDB — must already have the Phase 1 schema
+            (embedding columns) applied.
+        service: EmbeddingService. If ``service.is_available()`` is
+            False, the function short-circuits with the pending counts
+            so a UI can still surface "you've got N legacy rows but
+            no embedding backend wired".
+        kinds: subset of ``db.BACKFILL_TARGETS`` to process. ``None``
+            means all of them. Unknown kinds are silently skipped.
+        batch_size: rows per DB page. The total work is also bounded by
+            ``max_total`` so a runaway plugin can't try to embed a
+            million rows in one call.
+        max_total: hard upper bound on rows touched across all kinds.
+            Hit it and the function returns the partial report — the
+            caller is expected to invoke again to resume.
+        dry_run: True → no writes, just counts the work that *would*
+            happen. Useful for "click backfill" UX confirmation flows.
+        sleep_between_batches_s: yield control between batches so a
+            long backfill doesn't starve other asyncio work.
+
+    Never raises into the caller. All errors are captured in
+    ``report.errors`` so the worker can be invoked from a fire-and-
+    forget HTTP handler without try/except boilerplate.
+    """
+    report = BackfillReport(dry_run=dry_run)
+    target_kinds = list(kinds) if kinds is not None else list(
+        getattr(db, "BACKFILL_TARGETS", {}).keys()
+    )
+    report.kinds = target_kinds
+    # Pre-flight counts so the report shape is the same in dry_run
+    # and real-run modes. These are the basis for the UI's progress
+    # bar in the WebUI Phase 5 work.
+    for kind in target_kinds:
+        try:
+            report.pending_before[kind] = int(db.count_rows_needing_embedding(kind))
+        except Exception as exc:
+            report.errors.append(f"count {kind}: {exc}")
+            report.pending_before[kind] = 0
+
+    if dry_run:
+        # In dry-run we don't even resolve the embedding backend.
+        # Counts are all the caller wants here.
+        return report
+
+    if not service.is_available():
+        # Real run but no backend — that's a soft error; we return
+        # the pending counts so the operator can see how much work
+        # is still pending and decide whether to configure a backend.
+        report.errors.append(
+            "embedding backend not available — backfill skipped"
+        )
+        return report
+
+    total_done = 0
+    for kind in target_kinds:
+        spec = getattr(db, "BACKFILL_TARGETS", {}).get(kind)
+        if spec is None:
+            report.errors.append(f"unknown kind: {kind}")
+            continue
+        # Per-kind seen-rowkey set: rows we've already touched in this
+        # backfill call (whether written, skipped, or errored). Without
+        # this, a row we skipped (empty text, backend returned None)
+        # would stay NULL in the DB and get re-fetched on the next
+        # batch — looping forever until max_total. The set lives only
+        # for the call, so a subsequent backfill_async still retries
+        # transient failures.
+        seen: set[int] = set()
+        while total_done < max_total:
+            try:
+                rows = db.list_rows_needing_embedding(kind, limit=batch_size)
+            except Exception as exc:
+                report.errors.append(f"list {kind}: {exc}")
+                break
+            # Filter out anything already touched this call. If every
+            # row in the page is a repeat, we've hit a steady state
+            # (only un-embeddable rows remain) and can exit cleanly.
+            fresh = [(k, t) for k, t in rows if k not in seen]
+            if not fresh:
+                break
+            for rowkey, text in fresh:
+                if total_done >= max_total:
+                    break
+                seen.add(rowkey)
+                report.processed += 1
+                total_done += 1
+                if not text or not str(text).strip():
+                    report.skipped += 1
+                    continue
+                try:
+                    blob = await service.aembed(text)
+                except Exception as exc:
+                    report.errors.append(f"embed {kind}:{rowkey}: {exc}")
+                    continue
+                if blob is None:
+                    # Backend transient failure or returned no vector.
+                    # Don't count as an error — just skip and let the
+                    # next backfill round retry.
+                    report.skipped += 1
+                    continue
+                sha = compute_text_sha(text, service.model_tag)
+                ok = db.write_embedding(kind, rowkey, blob, sha)
+                if ok:
+                    report.written += 1
+                else:
+                    report.errors.append(f"write {kind}:{rowkey} failed")
+            # Yield so concurrent work (HTTP requests, the auditor,
+            # the promote tick) isn't starved by a long backfill.
+            try:
+                await asyncio.sleep(max(0.0, float(sleep_between_batches_s)))
+            except asyncio.CancelledError:
+                # Treat cancellation as a graceful stop, not an error.
+                return report
+        if total_done >= max_total:
+            break
+    return report
