@@ -24,12 +24,49 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-import jieba
-
 from core.logging_manager import get_logger
 from .memory_paths import get_index_db_path
 
 logger = get_logger("kiraos_memory_index", "green")
+
+# jieba 是中文分词的最佳选择，但不应该作为插件加载的硬依赖。
+# 没装的话，降级为按字符切分 + ASCII whitespace —— FTS5 仍可工作，
+# 只是中文查准率会差一些。运行时会打一次明显的 warning 提醒。
+try:
+    import jieba  # type: ignore
+    _JIEBA_AVAILABLE = True
+except ImportError:
+    jieba = None  # type: ignore
+    _JIEBA_AVAILABLE = False
+    logger.warning(
+        "jieba 未安装，中文记忆检索会降级为字符级分词。"
+        "建议执行: pip install jieba"
+    )
+
+
+def _fallback_tokenize(text: str) -> list[str]:
+    """无 jieba 时的兜底分词：按 whitespace 切英文，按字符切中文。
+
+    对 FTS5 检索来说这并不完美（中文会变成单字 token），但比把整段中文当一个
+    token 强得多——至少同字开头的句子能命中。
+    """
+    if not text:
+        return []
+    tokens: list[str] = []
+    buf = ""
+    for ch in text:
+        # ASCII 字母数字 → 累积进 buf 当成一个 word
+        if ch.isascii() and (ch.isalnum() or ch == "_"):
+            buf += ch
+        else:
+            if buf:
+                tokens.append(buf)
+                buf = ""
+            if not ch.isspace():
+                tokens.append(ch)
+    if buf:
+        tokens.append(buf)
+    return tokens
 
 
 class MemoryIndex:
@@ -162,10 +199,13 @@ class MemoryIndex:
 
     @staticmethod
     def _segment_for_fts(text: str) -> str:
-        """用 jieba 分词后用空格连接，使 FTS5 unicode61 能正确检索中文"""
+        """用 jieba（可选）分词后用空格连接，使 FTS5 unicode61 能正确检索中文"""
         if not text:
             return ""
-        tokens = [t for t in jieba.lcut(text) if t.strip()]
+        if _JIEBA_AVAILABLE:
+            tokens = [t for t in jieba.lcut(text) if t.strip()]
+        else:
+            tokens = [t for t in _fallback_tokenize(text) if t.strip()]
         return " ".join(tokens)
 
     # ==========================================
@@ -853,8 +893,11 @@ class MemoryIndex:
         if not cleaned:
             return ""
 
-        # jieba 分词
-        tokens = [t.strip() for t in jieba.lcut(cleaned) if t.strip()]
+        # jieba 分词（可选；未安装时降级到字符级 fallback）
+        if _JIEBA_AVAILABLE:
+            tokens = [t.strip() for t in jieba.lcut(cleaned) if t.strip()]
+        else:
+            tokens = [t.strip() for t in _fallback_tokenize(cleaned) if t.strip()]
 
         # 过滤单字符（中文停用词）但保留英文单字符
         tokens = [t for t in tokens if len(t) > 1 or t.isascii()]
