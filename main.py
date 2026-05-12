@@ -111,9 +111,6 @@ class UserMemoryPlugin(BasePlugin):
         self._reranker_model_uuid: str = str(
             cfg.get("memory_reranker_model_uuid", "") or ""
         )
-        self._enable_query_aware_inject: bool = bool(
-            cfg.get("enable_query_aware_inject", False)
-        )
         self._recaller: Optional[MemoryRecaller] = None
         self._embedding_service: Optional[EmbeddingService] = None
         # ── Phase 3a: cognition + evidence ──────────────────────────
@@ -1643,6 +1640,22 @@ class UserMemoryPlugin(BasePlugin):
                 )
                 if status in ("set", "updated", "truncated"):
                     written += 1
+                    # Mirror the rein-signal emission that
+                    # memory_update(op='set') performs at line ~936,
+                    # so auditor-written profiles also accumulate
+                    # evidence weight and appear on the Phase 5
+                    # timeline view. ``source='auditor'`` keeps them
+                    # distinguishable from main-LLM and user-directive
+                    # writes in WebUI per-signal telemetry.
+                    try:
+                        self.db.record_evidence_signal(
+                            "profile",
+                            self.db.evidence_target_id_for_profile(user_id, key),
+                            rein_delta=0.3,  # lower than memory_update's 0.5; auditor is a guess
+                            source="auditor",
+                        )
+                    except Exception as exc:
+                        logger.warning(f"[auditor] evidence signal failed: {exc}")
                 else:
                     skipped += 1
                     # Don't dump ``info`` directly — for status="conflict",

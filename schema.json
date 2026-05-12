@@ -123,12 +123,6 @@
         "default": "",
         "hint": "Leave empty (recommended) to reuse the auditor's model chain (configured uuid → fast LLM → default). Pin a specific model only when you want the reranker isolated from the auditor."
     },
-    "enable_query_aware_inject": {
-        "name": "Query-aware context injection (experimental)",
-        "type": "switch",
-        "default": false,
-        "hint": "When enabled, the most recent user message is used as a query to pull relevant events into the system prompt instead of (or alongside) the default 'last-N' window. Saves tokens but the LLM may not see context that wasn't keyword-related to the latest turn. Off by default — Phase 2 wires the recaller, Phase 3 will activate this fully."
-    },
     "enable_fact_dedup": {
         "name": "Deduplicate restated events",
         "type": "switch",
