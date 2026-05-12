@@ -128,5 +128,45 @@
         "type": "switch",
         "default": false,
         "hint": "When enabled, the most recent user message is used as a query to pull relevant events into the system prompt instead of (or alongside) the default 'last-N' window. Saves tokens but the LLM may not see context that wasn't keyword-related to the latest turn. Off by default — Phase 2 wires the recaller, Phase 3 will activate this fully."
+    },
+    "enable_fact_dedup": {
+        "name": "Deduplicate restated events",
+        "type": "switch",
+        "default": true,
+        "hint": "Compute a content hash for each memory_update(op='event') write. Restatements of the same fact (modulo case, whitespace, and filler particles) bump the existing row's importance + emit a reinforcement signal instead of inserting a duplicate. Disable to keep every event_logs write verbatim (legacy v2.0.0 behaviour)."
+    },
+    "evidence_half_life_days_rein": {
+        "name": "Evidence reinforcement half-life (days)",
+        "type": "integer",
+        "default": 14,
+        "minimum": 1,
+        "maximum": 365,
+        "hint": "How fast reinforcement decays when no fresh signals arrive. After this many days an unreinforced fact's effective rein weight halves. Higher = stickier memory; lower = more forgiving of past patterns. Independent from the disp half-life (RFC §3.1.1)."
+    },
+    "evidence_half_life_days_disp": {
+        "name": "Evidence disputation half-life (days)",
+        "type": "integer",
+        "default": 7,
+        "minimum": 1,
+        "maximum": 365,
+        "hint": "How fast a disputation signal decays. Shorter than rein by default — a user's objection should fade once they stop reasserting it, but a single 'I love cats' shouldn't need constant reaffirmation."
+    },
+    "evidence_promoted_threshold": {
+        "name": "Evidence threshold: promoted",
+        "type": "float",
+        "default": 1.0,
+        "hint": "Net evidence score (rein − disp, post-decay) at which a reflection is eligible for auto-promote to persona. Phase 3b uses this; Phase 3a stores the value but doesn't yet act on it."
+    },
+    "evidence_confirmed_threshold": {
+        "name": "Evidence threshold: confirmed",
+        "type": "float",
+        "default": 0.3,
+        "hint": "Score above which a reflection counts as 'confirmed' (visible in the WebUI as a promoted-eligible candidate)."
+    },
+    "evidence_archive_threshold": {
+        "name": "Evidence threshold: archive candidate",
+        "type": "float",
+        "default": -0.5,
+        "hint": "Score at or below which a reflection is archive-eligible. Negative because net disputation has overwhelmed reinforcement; Phase 3b's reconciler will eventually move these out of active memory."
     }
 }

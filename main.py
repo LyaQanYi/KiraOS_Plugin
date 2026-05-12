@@ -29,6 +29,8 @@ from core.prompt_manager import Prompt
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, KiraStepResult
 from core.utils.path_utils import get_data_path
 
+from .cognition.evidence import EvidenceConfig
+from .cognition.facts import fact_hash, importance_from_text, is_dedup_candidate
 from .db import UserMemoryDB, _parse_ttl, VALID_CATEGORIES, CATEGORY_PRIORITY, _mask_id
 from .embeddings import EmbeddingService
 from .recall import MemoryRecaller, RecallConfig
@@ -112,6 +114,29 @@ class UserMemoryPlugin(BasePlugin):
         )
         self._recaller: Optional[MemoryRecaller] = None
         self._embedding_service: Optional[EmbeddingService] = None
+        # ── Phase 3a: cognition + evidence ──────────────────────────
+        # Fact dedup is on by default — it's purely a write-side
+        # optimization (deduplicate restatements of the same event) and
+        # shouldn't surprise existing users. Evidence math is harmless
+        # until Phase 3b lights up the reconciler that uses it.
+        self._enable_fact_dedup: bool = bool(cfg.get("enable_fact_dedup", True))
+        self._evidence_config = EvidenceConfig(
+            rein_half_life_days=float(
+                cfg.get("evidence_half_life_days_rein", 14.0)
+            ),
+            disp_half_life_days=float(
+                cfg.get("evidence_half_life_days_disp", 7.0)
+            ),
+            promoted_threshold=float(
+                cfg.get("evidence_promoted_threshold", 1.0)
+            ),
+            confirmed_threshold=float(
+                cfg.get("evidence_confirmed_threshold", 0.3)
+            ),
+            archive_threshold=float(
+                cfg.get("evidence_archive_threshold", -0.5)
+            ),
+        )
         self.max_events = int(cfg.get("max_events_per_user", 10))
         self.max_profiles = int(cfg.get("max_profiles_per_user", 50))
         self.max_event_keep = int(cfg.get("max_event_keep", 100))
@@ -741,6 +766,30 @@ class UserMemoryPlugin(BasePlugin):
                 )
                 touched_users.add(target_uid)
 
+                # Phase 3a — every accepted profile write is also a
+                # rein signal on that profile's evidence row. Limit
+                # / conflict outcomes don't emit a signal because no
+                # information was actually persisted. ``force=True``
+                # is a user-directive signal (heavier weight); plain
+                # set is auto-strength.
+                if status in ("set", "updated", "truncated"):
+                    target_eid = (
+                        self.db.evidence_target_id_for_profile(target_uid, key)
+                    )
+                    try:
+                        self.db.record_evidence_signal(
+                            "profile",
+                            target_eid,
+                            rein_delta=1.0 if force else 0.5,
+                            source="user_directive" if force else "auto",
+                        )
+                    except Exception as exc:
+                        # Never propagate evidence write failures into
+                        # the user-facing tool result — Phase 3a's
+                        # signals are advisory; the primary write
+                        # already succeeded.
+                        logger.warning(f"evidence signal (profile set) failed: {exc}")
+
                 target_tag = "" if target_uid == primary_uid else f" @{target_uid}"
                 if status == "limit_exceeded":
                     results.append(
@@ -766,12 +815,58 @@ class UserMemoryPlugin(BasePlugin):
                     results.append("skip: event requires value")
                     continue
                 tag = item.get("tag")
-                self.db.save_event(target_uid, value, tag=tag)
+                # Phase 3a — fact_hash dedup: if the normalized form of
+                # this event matches an existing row for the same user,
+                # we bump the existing row's importance + emit a rein
+                # signal on its evidence ledger instead of inserting
+                # a duplicate. Skipped when:
+                #   - flag is off (legacy behaviour preserved)
+                #   - text is too short to dedup safely
+                # In both skip cases we fall through to the plain
+                # save_event path, leaving fact_hash NULL.
+                dedup_status: Optional[str] = None
+                event_id: Optional[int] = None
+                if self._enable_fact_dedup and is_dedup_candidate(value):
+                    fhash = fact_hash(value)
+                    if fhash:
+                        imp = importance_from_text(value)
+                        event_id, dedup_status = self.db.save_event_with_dedup(
+                            target_uid, value,
+                            fact_hash=fhash, importance=imp, tag=tag,
+                        )
+                        # Emit a rein signal keyed by the FACT, not the
+                        # event row, so repeated restatements collapse
+                        # onto one ledger entry. We use the fact_hash
+                        # itself as the target_id under a synthetic
+                        # 'fact' kind — Phase 3b's reflection synthesis
+                        # is the natural consumer.
+                        try:
+                            self.db.record_evidence_signal(
+                                "fact",
+                                f"{target_uid}::{fhash}",
+                                rein_delta=0.5,
+                                source="user_fact",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                f"evidence signal (fact) failed: {exc}"
+                            )
+                if dedup_status is None:
+                    # Legacy path: no fact_hash, plain save.
+                    event_id = self.db.save_event(target_uid, value, tag=tag)
+                    dedup_status = "inserted"
+
                 self.db.cleanup_old_events(target_uid, keep=self.max_event_keep)
                 touched_users.add(target_uid)
                 target_tag = "" if target_uid == primary_uid else f" @{target_uid}"
                 tag_str = f" #{tag}" if tag else ""
-                results.append(f"event{tag_str}{target_tag}: {value}")
+                # Surface dedup outcome in the result so the LLM can
+                # tell when its memory_update was a repeat — useful for
+                # the model's own self-correction loop.
+                dedup_note = ""
+                if dedup_status == "deduped":
+                    dedup_note = " [已合并到既有事件]"
+                results.append(f"event{tag_str}{target_tag}: {value}{dedup_note}")
 
             elif op == "del":
                 if not key:

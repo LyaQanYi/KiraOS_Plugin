@@ -20,6 +20,7 @@ Expiration:
 """
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -1082,6 +1083,393 @@ class UserMemoryDB:
             (user_id, now_epoch, pattern, pattern, max(int(limit), 0)),
         )
         return cursor.fetchall()
+
+    # ── Phase 3a: fact identity + evidence ledger ───────────────────
+
+    @staticmethod
+    def evidence_target_id_for_profile(user_id: str, memory_key: str) -> str:
+        """Compose the (target_kind='profile', target_id=…) shape used
+        in evidence_ledger so callers stay decoupled from the storage
+        encoding. We embed user_id so cross-user profiles with the same
+        key (e.g. two users both have 'nickname') don't share an
+        evidence row.
+        """
+        return f"{user_id}::{memory_key}"
+
+    def find_event_by_fact_hash(
+        self,
+        user_id: str,
+        fact_hash: str,
+    ) -> Optional[Tuple[int, str, int, Optional[str]]]:
+        """Look up an existing event row by its content hash.
+
+        Returns ``(id, event_summary, importance, tag)`` or None. Used
+        by ``save_event_with_dedup`` and the auditor's Stage-1 fact
+        extraction to decide whether a new fact is genuinely new or
+        just a restatement of a previously-logged one.
+
+        The (user_id, fact_hash) composite index added in Phase 1 makes
+        this O(log N) regardless of corpus size.
+        """
+        if not fact_hash:
+            return None
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT id, event_summary, importance, tag "
+            "FROM event_logs "
+            "WHERE user_id = ? AND fact_hash = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id, fact_hash),
+        ).fetchone()
+        return row if row else None
+
+    def save_event_with_dedup(
+        self,
+        user_id: str,
+        event_summary: str,
+        *,
+        fact_hash: str,
+        importance: int = 5,
+        tag: Optional[str] = None,
+    ) -> Tuple[int, str]:
+        """Insert an event or, if its fact_hash already exists for this
+        user, return the existing row id (no insert).
+
+        Returns ``(event_id, status)`` where status ∈ {"inserted", "deduped"}.
+        Callers typically follow up with ``record_evidence_signal`` to
+        attribute a rein impulse — Phase 3a memory_update wires this
+        through automatically.
+
+        Importance is updated to ``max(existing, new)`` on dedup so a
+        later high-importance restatement doesn't get its signal
+        downgraded by an earlier low-importance log of the same fact.
+        """
+        if not fact_hash:
+            # No identity → can't dedup. Fall through to the original
+            # save_event path. Callers should have screened by
+            # is_dedup_candidate before invoking this.
+            return self.save_event(user_id, event_summary, tag=tag), "inserted"
+
+        existing = self.find_event_by_fact_hash(user_id, fact_hash)
+        if existing is not None:
+            eid, _, existing_imp, _ = existing
+            new_imp = max(int(existing_imp or 5), int(importance))
+            with self._write_lock:
+                self._get_conn().execute(
+                    "UPDATE event_logs SET importance = ? WHERE id = ?",
+                    (new_imp, eid),
+                )
+                self._get_conn().commit()
+            return eid, "deduped"
+
+        # Genuinely new fact. We bypass save_event() here so we can pin
+        # fact_hash + importance atomically with the insert and not race
+        # a second writer that might try to insert the same hash.
+        clipped, was_truncated = self._clip_value(event_summary, MAX_EVENT_LEN)
+        if was_truncated:
+            logger.warning(
+                f"Event summary for {_mask_id(user_id)} truncated from "
+                f"{len(str(event_summary))} to {MAX_EVENT_LEN} chars"
+            )
+        tag_norm = tag.strip() if isinstance(tag, str) and tag.strip() else None
+        with self._write_lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # Re-check inside the transaction so a parallel writer
+                # that just inserted the same hash doesn't produce a
+                # duplicate. UNIQUE(user_id, fact_hash) would be cleaner
+                # but we can't add it post-migration without rebuilding
+                # the table — the index covers the lookup anyway.
+                race = conn.execute(
+                    "SELECT id FROM event_logs "
+                    "WHERE user_id = ? AND fact_hash = ? LIMIT 1",
+                    (user_id, fact_hash),
+                ).fetchone()
+                if race is not None:
+                    conn.commit()
+                    return race[0], "deduped"
+                cur = conn.execute(
+                    "INSERT INTO event_logs "
+                    "(user_id, event_summary, created_at, tag, "
+                    " fact_hash, importance, absorbed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                    (user_id, clipped, datetime.now().isoformat(),
+                     tag_norm, fact_hash, int(importance)),
+                )
+                conn.commit()
+                return cur.lastrowid, "inserted"
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def record_evidence_signal(
+        self,
+        target_kind: str,
+        target_id: str,
+        *,
+        rein_delta: float = 0.0,
+        disp_delta: float = 0.0,
+        source: str = "auto",
+        combo_threshold: int = 2,
+        combo_bonus: float = 0.5,
+    ) -> Dict:
+        """Append a rein/disp impulse to the evidence ledger for a target.
+
+        ``target_kind`` is ``'profile'`` or ``'reflection'``. ``target_id``
+        is the matching key (see ``evidence_target_id_for_profile`` and,
+        in Phase 3b, the reflection's primary key).
+
+        The combo bonus mirrors ``cognition.evidence.compute_evidence_
+        snapshot`` semantics — we replicate it here at the SQL layer so
+        callers don't need to load the snapshot just to apply the
+        increment. Pure functions on the snapshot still own the read-time
+        decay; this method only manipulates the persisted counters.
+
+        Returns the new (rein, disp, last_*_at, count) row as a dict for
+        the caller's telemetry.
+        """
+        now_epoch = int(time.time())
+        with self._write_lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "SELECT rein, disp, rein_last_signal_at, "
+                    "       disp_last_signal_at, sub_zero_days, "
+                    "       user_fact_reinforce_count "
+                    "FROM evidence_ledger "
+                    "WHERE target_kind = ? AND target_id = ? LIMIT 1",
+                    (target_kind, target_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    rein = 0.0
+                    disp = 0.0
+                    rein_ts = None
+                    disp_ts = None
+                    sub_zero = 0.0
+                    count = 0
+                else:
+                    rein, disp, rein_ts, disp_ts, sub_zero, count = row
+
+                # Apply the delta. Disputation clamps non-negative; rein
+                # can dip below zero on explicit negative writes (rare).
+                rein = float(rein or 0.0) + float(rein_delta)
+                disp = max(0.0, float(disp or 0.0) + float(disp_delta))
+                # Only stamp the side that moved this turn — independent
+                # half-life clocks (RFC §3.1.1).
+                if rein_delta != 0.0:
+                    rein_ts = now_epoch
+                if disp_delta != 0.0:
+                    disp_ts = now_epoch
+                # Combo bonus for repeated user_fact reinforces.
+                if source == "user_fact" and rein_delta > 0:
+                    count = int(count or 0) + 1
+                    if count > combo_threshold:
+                        rein += float(combo_bonus)
+
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO evidence_ledger "
+                        "(target_kind, target_id, rein, disp, "
+                        " rein_last_signal_at, disp_last_signal_at, "
+                        " sub_zero_days, user_fact_reinforce_count) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (target_kind, target_id, rein, disp,
+                         rein_ts, disp_ts, sub_zero, count),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE evidence_ledger SET "
+                        "rein=?, disp=?, rein_last_signal_at=?, "
+                        "disp_last_signal_at=?, "
+                        "user_fact_reinforce_count=? "
+                        "WHERE target_kind=? AND target_id=?",
+                        (rein, disp, rein_ts, disp_ts, count,
+                         target_kind, target_id),
+                    )
+                conn.commit()
+                return {
+                    "rein": rein, "disp": disp,
+                    "rein_last_signal_at": rein_ts,
+                    "disp_last_signal_at": disp_ts,
+                    "user_fact_reinforce_count": count,
+                    "source": source,
+                }
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def get_evidence_snapshot(
+        self,
+        target_kind: str,
+        target_id: str,
+    ) -> Optional[Dict]:
+        """Read a ledger row as a dict, or None if untouched.
+
+        Callers that want the effective decayed value should pass this
+        to ``cognition.evidence.evidence_score`` along with their
+        EvidenceConfig — the DB layer never computes decay itself, by
+        design (see evidence.py's module docstring).
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT rein, disp, rein_last_signal_at, disp_last_signal_at, "
+            "       sub_zero_days, user_fact_reinforce_count "
+            "FROM evidence_ledger "
+            "WHERE target_kind = ? AND target_id = ? LIMIT 1",
+            (target_kind, target_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "rein": float(row[0] or 0.0),
+            "disp": float(row[1] or 0.0),
+            "rein_last_signal_at": row[2],
+            "disp_last_signal_at": row[3],
+            "sub_zero_days": float(row[4] or 0.0),
+            "user_fact_reinforce_count": int(row[5] or 0),
+        }
+
+    # ── Phase 3a: reflection access (skeleton; populated in 3b) ─────
+
+    def save_reflection(
+        self,
+        user_id: str,
+        summary: str,
+        *,
+        entity: Optional[str] = None,
+        relation_type: Optional[str] = None,
+        source_fact_ids: Optional[List[int]] = None,
+        status: str = "pending",
+    ) -> int:
+        """Insert a Tier-2 reflection. Phase 3a writers don't yet exist;
+        Phase 3b's reflection synthesis stage is the primary caller.
+        We provision the method now so the DB layer ships as one
+        coherent surface and the sanity test can exercise it.
+        """
+        now = int(time.time())
+        ids_json = json.dumps(source_fact_ids) if source_fact_ids else None
+        with self._write_lock:
+            conn = self._get_conn()
+            cur = conn.execute(
+                "INSERT INTO reflections "
+                "(user_id, summary, entity, relation_type, source_fact_ids, "
+                " status, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, summary, entity, relation_type, ids_json,
+                 status, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def list_reflections(
+        self,
+        user_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Return reflections for ``user_id`` filtered by status.
+
+        Returns each row as a dict (not a tuple) so Phase 3b reconciler
+        + Phase 5 WebUI can rely on stable field names regardless of
+        future column additions.
+        """
+        conn = self._get_conn()
+        if status is None:
+            cursor = conn.execute(
+                "SELECT id, summary, entity, relation_type, "
+                "       source_fact_ids, status, created_at, "
+                "       updated_at, promoted_at "
+                "FROM reflections WHERE user_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (user_id, max(int(limit), 0)),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT id, summary, entity, relation_type, "
+                "       source_fact_ids, status, created_at, "
+                "       updated_at, promoted_at "
+                "FROM reflections WHERE user_id = ? AND status = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (user_id, status, max(int(limit), 0)),
+            )
+        out = []
+        for (rid, summary, entity, relation_type, ids_json, status_val,
+             created_at, updated_at, promoted_at) in cursor.fetchall():
+            try:
+                fact_ids = json.loads(ids_json) if ids_json else []
+            except (ValueError, TypeError):
+                fact_ids = []
+            out.append({
+                "id": rid,
+                "summary": summary,
+                "entity": entity,
+                "relation_type": relation_type,
+                "source_fact_ids": fact_ids,
+                "status": status_val,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "promoted_at": promoted_at,
+            })
+        return out
+
+    def update_reflection_status(
+        self,
+        reflection_id: int,
+        new_status: str,
+        *,
+        promoted_at: Optional[int] = None,
+    ) -> bool:
+        """FSM transition. Phase 3b's reconciler is the primary caller;
+        the WebUI's promote / deny buttons also route here. Returns
+        True iff the row existed and was updated.
+        """
+        now = int(time.time())
+        with self._write_lock:
+            conn = self._get_conn()
+            if promoted_at is not None:
+                cursor = conn.execute(
+                    "UPDATE reflections SET status = ?, updated_at = ?, "
+                    "promoted_at = ? WHERE id = ?",
+                    (new_status, now, int(promoted_at), reflection_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE reflections SET status = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (new_status, now, reflection_id),
+                )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def mark_facts_absorbed(self, fact_ids: List[int]) -> int:
+        """Bulk-set ``absorbed=1`` on the listed event_logs rows.
+
+        Called by Phase 3b after a reflection consumes a set of facts
+        so subsequent reflection-synthesis passes don't double-count
+        them. Returns rows affected.
+        """
+        if not fact_ids:
+            return 0
+        placeholders = ",".join("?" * len(fact_ids))
+        with self._write_lock:
+            conn = self._get_conn()
+            cursor = conn.execute(
+                f"UPDATE event_logs SET absorbed = 1 "
+                f"WHERE id IN ({placeholders})",
+                fact_ids,
+            )
+            conn.commit()
+            return cursor.rowcount
 
     def cleanup_old_events(self, user_id: str, keep: int = 50) -> int:
         """Delete oldest events beyond the *keep* threshold. Returns rows deleted."""
