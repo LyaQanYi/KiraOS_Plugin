@@ -403,6 +403,22 @@ class UserMemoryDB:
             );
             CREATE INDEX IF NOT EXISTS idx_evidence_target
                 ON evidence_ledger (target_kind, target_id);
+
+            -- Phase 5: per-signal audit log so the WebUI can render
+            -- a real evidence timeline (the ledger above is just the
+            -- current state). One row per signal applied; ledger
+            -- itself is derived from this log + read-time decay math.
+            CREATE TABLE IF NOT EXISTS evidence_signals_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_kind  TEXT NOT NULL,
+                target_id    TEXT NOT NULL,
+                rein_delta   REAL DEFAULT 0,
+                disp_delta   REAL DEFAULT 0,
+                source       TEXT,
+                applied_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_signals_target_time
+                ON evidence_signals_log (target_kind, target_id, applied_at DESC);
             """
         )
         conn.commit()
@@ -1292,6 +1308,22 @@ class UserMemoryDB:
                         (rein, disp, rein_ts, disp_ts, count,
                          target_kind, target_id),
                     )
+                # Phase 5: append a row to the signal log so the WebUI
+                # timeline can reconstruct individual events. We only
+                # log signals that actually changed something
+                # (rein_delta or disp_delta non-zero) — combo-bonus
+                # auto-additions are part of the same logical signal
+                # and shouldn't double-count.
+                if rein_delta != 0.0 or disp_delta != 0.0:
+                    conn.execute(
+                        "INSERT INTO evidence_signals_log "
+                        "(target_kind, target_id, rein_delta, "
+                        " disp_delta, source, applied_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (target_kind, target_id,
+                         float(rein_delta), float(disp_delta),
+                         source, now_epoch),
+                    )
                 conn.commit()
                 return {
                     "rein": rein, "disp": disp,
@@ -1336,6 +1368,151 @@ class UserMemoryDB:
             "disp_last_signal_at": row[3],
             "sub_zero_days": float(row[4] or 0.0),
             "user_fact_reinforce_count": int(row[5] or 0),
+        }
+
+    # ── Phase 5: evidence history + entity aggregation + preview ────
+
+    def list_evidence_history(
+        self,
+        target_kind: str,
+        target_id: str,
+        *,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """Return the applied-signal log for one target, newest-first.
+
+        Used by the WebUI evidence-timeline view to render a strip of
+        per-signal events. Limited to ``limit`` rows so a chatty user
+        with hundreds of signals doesn't drown the front-end. Older
+        rows can still be inspected by paging via SQL directly.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT id, rein_delta, disp_delta, source, applied_at "
+            "FROM evidence_signals_log "
+            "WHERE target_kind = ? AND target_id = ? "
+            "ORDER BY applied_at DESC, id DESC LIMIT ?",
+            (target_kind, target_id, max(int(limit), 0)),
+        )
+        return [
+            {
+                "id": row[0],
+                "rein_delta": float(row[1] or 0.0),
+                "disp_delta": float(row[2] or 0.0),
+                "source": row[3] or "",
+                "applied_at": int(row[4] or 0),
+            }
+            for row in cursor.fetchall()
+        ]
+
+    def list_entities(self, user_id: str) -> List[Dict]:
+        """Aggregate persona rows by their Phase 1 ``entity`` column.
+
+        Returns a list of dicts ``{entity, count, profiles: [...]}``
+        with one entry per distinct entity for this user. Rows with
+        ``entity IS NULL`` are bucketed under the synthetic
+        ``"_unscoped"`` entity so the WebUI graph view can still
+        render them as a fallback node.
+
+        Profiles inside each entry are ordered by ``updated_at`` DESC
+        so the freshest information surfaces first. Confidence and
+        relation_type are included for the graph's edge styling.
+        """
+        conn = self._get_conn()
+        now_epoch = int(time.time())
+        cursor = conn.execute(
+            "SELECT memory_key, memory_value, confidence, category, "
+            "       entity, relation_type, source, updated_at "
+            "FROM user_profiles WHERE user_id = ? "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            "ORDER BY updated_at DESC",
+            (user_id, now_epoch),
+        )
+        buckets: Dict[str, Dict] = {}
+        for (key, value, confidence, category, entity, relation_type,
+             source, updated_at) in cursor.fetchall():
+            ent_key = entity or "_unscoped"
+            bucket = buckets.setdefault(ent_key, {
+                "entity": ent_key,
+                "count": 0,
+                "profiles": [],
+            })
+            bucket["count"] += 1
+            bucket["profiles"].append({
+                "key": key,
+                "value": value,
+                "confidence": float(confidence or 0.5),
+                "category": category or "other",
+                "relation_type": relation_type,
+                "source": source or "llm",
+                "updated_at": updated_at,
+            })
+        # Return entities ordered by count desc so the dense / "main"
+        # node is the first thing the user sees in the graph view.
+        return sorted(buckets.values(),
+                      key=lambda b: (-b["count"], b["entity"]))
+
+    def preview_evidence_score(
+        self,
+        target_kind: str,
+        target_id: str,
+        *,
+        rein_half_life_days: float,
+        disp_half_life_days: float,
+        now_epoch: Optional[int] = None,
+    ) -> Dict:
+        """Pure-compute "what would the effective rein/disp be if we
+        used these half-lives?" against the stored ledger snapshot.
+
+        Used by the Phase 5 Half-life Playground so a user can drag
+        sliders and see live impact without writing anything to the
+        DB. No state changes — caller-supplied parameters override
+        EvidenceConfig only for this calculation.
+
+        Returns a dict ``{rein, disp, effective_rein, effective_disp,
+        score}``. ``score`` is ``effective_rein - effective_disp``.
+
+        ``now_epoch`` is exposed for deterministic tests; defaults to
+        wall-clock time.
+        """
+        snap = self.get_evidence_snapshot(target_kind, target_id)
+        if snap is None:
+            # No ledger row → all zeros. Caller can treat this as the
+            # "untouched" baseline.
+            return {
+                "rein": 0.0, "disp": 0.0,
+                "effective_rein": 0.0, "effective_disp": 0.0,
+                "score": 0.0,
+                "rein_half_life_days": float(rein_half_life_days),
+                "disp_half_life_days": float(disp_half_life_days),
+            }
+        if now_epoch is None:
+            now_epoch = int(time.time())
+        # Apply the same decay formula as cognition.evidence — we
+        # duplicate the math here (~6 lines) instead of importing it
+        # because db.py is also used by the standalone web server,
+        # which shouldn't pull in the cognition package for a single
+        # arithmetic operation.
+        rein = float(snap["rein"] or 0.0)
+        disp = float(snap["disp"] or 0.0)
+        rein_age = max(0.0,
+                       (now_epoch - (snap["rein_last_signal_at"] or now_epoch))
+                       / 86400.0)
+        disp_age = max(0.0,
+                       (now_epoch - (snap["disp_last_signal_at"] or now_epoch))
+                       / 86400.0)
+        rein_hl = max(0.01, float(rein_half_life_days))
+        disp_hl = max(0.01, float(disp_half_life_days))
+        eff_rein = rein * (0.5 ** (rein_age / rein_hl)) if rein else 0.0
+        eff_disp = disp * (0.5 ** (disp_age / disp_hl)) if disp else 0.0
+        return {
+            "rein": rein,
+            "disp": disp,
+            "effective_rein": eff_rein,
+            "effective_disp": eff_disp,
+            "score": eff_rein - eff_disp,
+            "rein_half_life_days": rein_hl,
+            "disp_half_life_days": disp_hl,
         }
 
     # ── Phase 3a: reflection access (skeleton; populated in 3b) ─────

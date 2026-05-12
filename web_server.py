@@ -321,6 +321,107 @@ async def api_embeddings_backfill(request: Request) -> JSONResponse:
     })
 
 
+async def api_evidence_timeline(request: Request) -> JSONResponse:
+    """GET /api/evidence/timeline/{kind}/{target_id} — signal history.
+
+    Returns the applied-signal log + the current ledger snapshot in
+    one round-trip so the WebUI can render both the per-event strip
+    and the current rein/disp state without two requests.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    kind = request.path_params.get("kind", "")
+    target_id = request.path_params.get("target_id", "")
+    if kind not in ("profile", "reflection", "fact"):
+        return JSONResponse(
+            {"error": f"invalid target_kind: {kind}"}, status_code=400,
+        )
+    try:
+        limit = int(request.query_params.get("limit", "200"))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(2000, limit))
+    try:
+        history = db.list_evidence_history(kind, target_id, limit=limit)
+        snapshot = db.get_evidence_snapshot(kind, target_id)
+        return JSONResponse({
+            "target_kind": kind,
+            "target_id": target_id,
+            "snapshot": snapshot,
+            "history": history,
+        })
+    except Exception:
+        logger.exception("Error fetching timeline for %s/%s", kind, target_id)
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+async def api_user_entities(request: Request) -> JSONResponse:
+    """GET /api/users/{user_id}/entities — entity aggregation.
+
+    Returns ``{user_id, entities: [{entity, count, profiles: [...]}]}``.
+    Used by the entity-graph view to lay out nodes + edges.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    try:
+        ents = db.list_entities(user_id)
+        return JSONResponse({"user_id": user_id, "entities": ents})
+    except Exception:
+        logger.exception("Error listing entities for %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+async def api_evidence_preview(request: Request) -> JSONResponse:
+    """POST /api/evidence/preview — what-if half-life calculator.
+
+    JSON body: ``{target_kind, target_id, rein_half_life_days,
+    disp_half_life_days}``. Returns the would-be effective rein/disp
+    + net score. Read-only — never touches the ledger.
+
+    Useful for the WebUI Half-life Playground: drag the slider, send
+    a preview request per target, render the new score next to the
+    stored one. Targets are evaluated independently so the response
+    is a single object per call.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    kind = body.get("target_kind", "")
+    if kind not in ("profile", "reflection", "fact"):
+        return JSONResponse(
+            {"error": f"invalid target_kind: {kind!r}"}, status_code=400,
+        )
+    target_id = str(body.get("target_id", "") or "")
+    if not target_id:
+        return JSONResponse({"error": "target_id required"}, status_code=400)
+    try:
+        rhl = float(body.get("rein_half_life_days", 14.0))
+        dhl = float(body.get("disp_half_life_days", 7.0))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "half_life_days fields must be numeric"}, status_code=400,
+        )
+    try:
+        result = db.preview_evidence_score(
+            kind, target_id,
+            rein_half_life_days=rhl,
+            disp_half_life_days=dhl,
+        )
+        return JSONResponse(result)
+    except Exception:
+        logger.exception("Error in evidence preview")
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
 async def api_list_reflections(request: Request) -> JSONResponse:
     """GET /api/users/{user_id}/reflections?status= — list reflections.
 
@@ -717,6 +818,7 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         Route("/api/users/{user_id}/events/{event_id:int}", api_delete_event, methods=["DELETE"]),
         Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
         Route("/api/users/{user_id}/recall", api_user_recall, methods=["GET"]),
+        Route("/api/users/{user_id}/entities", api_user_entities, methods=["GET"]),
         Route("/api/users/{user_id}/reflections", api_list_reflections, methods=["GET"]),
         Route("/api/users/{user_id}/reflections/{rid}/promote", api_promote_reflection, methods=["POST"]),
         Route("/api/users/{user_id}/reflections/{rid}/deny", api_deny_reflection, methods=["POST"]),
@@ -725,6 +827,8 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         Route("/api/export", api_export, methods=["GET"]),
         Route("/api/import", api_import, methods=["POST"]),
         Route("/api/embeddings/backfill", api_embeddings_backfill, methods=["POST"]),
+        Route("/api/evidence/timeline/{kind}/{target_id}", api_evidence_timeline, methods=["GET"]),
+        Route("/api/evidence/preview", api_evidence_preview, methods=["POST"]),
         Route("/api/stats", api_stats, methods=["GET"]),
         Route("/api/users", api_list_users, methods=["GET"]),
     ]

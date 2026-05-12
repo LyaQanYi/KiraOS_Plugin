@@ -803,6 +803,151 @@ html:not(.no-transition) .live-toggle {
   .modal { border: 2px solid ButtonText; }
   .toast { border: 2px solid ButtonText; }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   Phase 5: Insights (Reflections / Entities / Half-life / Timeline)
+   ═══════════════════════════════════════════════════════════════ */
+.insights-section { margin-top: 16px; }
+.insights-tab-strip {
+  display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--glass-border);
+}
+.insights-tab {
+  padding: 6px 12px; border-radius: 999px; cursor: pointer;
+  background: transparent; border: 1px solid var(--glass-border);
+  color: var(--text); font-size: 13px;
+}
+.insights-tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+.insights-tab:hover:not(.active) { background: var(--glass-bg); }
+
+/* Reflections */
+.reflection-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 0; border-bottom: 1px dashed var(--glass-border);
+}
+.reflection-row:last-child { border-bottom: none; }
+.reflection-badge {
+  flex-shrink: 0; min-width: 60px; text-align: center;
+  padding: 2px 8px; border-radius: 4px; font-size: 11px;
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.rf-pending   { background: #fde68a; color: #92400e; }
+.rf-confirmed { background: #bfdbfe; color: #1e40af; }
+.rf-promoted  { background: #bbf7d0; color: #047857; }
+.rf-denied    { background: #fecaca; color: #991b1b; }
+.rf-archived  { background: #e5e7eb; color: #4b5563; }
+.reflection-body { flex: 1; }
+.reflection-summary { font-size: 14px; line-height: 1.5; }
+.reflection-meta {
+  font-size: 11px; opacity: 0.7; margin-top: 2px;
+  display: flex; gap: 12px; flex-wrap: wrap;
+}
+.reflection-actions { display: flex; gap: 4px; }
+
+/* Entity buckets */
+.entity-bucket {
+  margin: 12px 0; padding: 10px 12px;
+  border: 1px solid var(--glass-border); border-radius: 8px;
+  background: var(--glass-bg);
+}
+.entity-header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 10px; margin-bottom: 8px;
+}
+.entity-name { font-size: 14px; font-weight: 600; }
+.entity-count {
+  background: var(--accent); color: white;
+  padding: 1px 8px; border-radius: 999px; font-size: 11px;
+}
+.entity-profiles { display: flex; flex-direction: column; gap: 4px; }
+.entity-profile-row {
+  display: flex; gap: 8px; font-size: 12px;
+  padding: 3px 0; align-items: center;
+}
+.entity-profile-row .relation-chip {
+  font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  background: var(--accent); opacity: 0.7; color: white;
+}
+
+/* Half-life Playground */
+.halflife-pad {
+  display: flex; flex-direction: column; gap: 12px;
+}
+.halflife-slider-row {
+  display: flex; align-items: center; gap: 10px; font-size: 13px;
+}
+.halflife-slider-row label { min-width: 110px; }
+.halflife-slider-row input[type=range] { flex: 1; }
+.halflife-slider-row .halflife-value {
+  min-width: 50px; text-align: right; font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.halflife-target-list {
+  margin-top: 8px; max-height: 240px; overflow-y: auto;
+  font-size: 12px;
+}
+.halflife-target-row {
+  display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px;
+  padding: 4px 0; border-bottom: 1px dashed var(--glass-border);
+  align-items: center;
+}
+.halflife-target-row:last-child { border-bottom: none; }
+.halflife-score {
+  font-variant-numeric: tabular-nums; font-weight: 600;
+}
+.halflife-score.score-pos { color: #047857; }
+.halflife-score.score-neg { color: #b91c1c; }
+.halflife-score.score-zero { opacity: 0.6; }
+
+/* Evidence timeline modal-ish drawer */
+.timeline-drawer {
+  margin-top: 12px; padding: 12px;
+  border: 1px solid var(--glass-border); border-radius: 8px;
+  background: var(--glass-bg);
+}
+.timeline-drawer-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px;
+}
+.timeline-snapshot {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  font-size: 12px; opacity: 0.85;
+  padding: 6px 0 10px;
+}
+.timeline-snapshot strong { font-variant-numeric: tabular-nums; }
+.timeline-events {
+  display: flex; flex-direction: column; gap: 3px;
+  max-height: 240px; overflow-y: auto;
+  font-size: 11px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.timeline-event-row {
+  display: grid;
+  grid-template-columns: 120px 70px 70px 1fr;
+  gap: 8px; padding: 2px 0;
+}
+.te-rein { color: #047857; }
+.te-disp { color: #b91c1c; }
+.decay-svg {
+  width: 100%; height: 120px;
+  background: var(--glass-bg); border-radius: 6px;
+  margin-top: 8px;
+}
+.decay-svg .rein-line { stroke: #047857; stroke-width: 1.5; fill: none; }
+.decay-svg .disp-line { stroke: #b91c1c; stroke-width: 1.5; fill: none; }
+.decay-svg .axis { stroke: var(--glass-border); stroke-width: 1; }
+.decay-svg .axis-label {
+  fill: var(--text); opacity: 0.6;
+  font-size: 9px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* Inline launcher button for the timeline drawer */
+.btn-tiny {
+  font-size: 10px; padding: 2px 6px;
+  border-radius: 4px; border: 1px solid var(--glass-border);
+  background: transparent; color: var(--text); cursor: pointer;
+  opacity: 0.7;
+}
+.btn-tiny:hover { opacity: 1; background: var(--glass-bg); }
 </style>
 </head>
 <body>
@@ -946,6 +1091,24 @@ let _lastUserDataJson = '';
 let addingProfile = false;
 let addingEvent = false;
 let editingEventId = null;
+/* ── Phase 5: insights state ──────────────────────────────────── */
+// 'reflections' | 'entities' | 'halflife' — persists across re-renders
+// so a live-refresh on the user detail doesn't snap back to the
+// default tab while the user is reading something else.
+let currentInsightTab = 'reflections';
+let lastReflections = [];
+let lastEntities = [];
+// Half-life slider state — user-adjustable, defaults match the
+// EvidenceConfig defaults in schema.json.
+let halflifeRein = 14;
+let halflifeDisp = 7;
+// Preview map: target_id → effective score, refreshed when sliders
+// move so renderHalfLife() can show "would-be" numbers per target.
+let halflifePreviewById = {};
+// Mounted timeline drawer state. We keep at most one drawer open at
+// a time so clicking a new row replaces the previous drawer rather
+// than stacking them.
+let timelineDrawerKey = null;
 
 /* ═══════════════════════════════════════════════════════════════
    API Helpers
@@ -1375,8 +1538,29 @@ function renderDetail() {
       <button class="btn btn-ghost" onclick="startAddEvent()" aria-label="添加事件">＋ 添加事件</button>
     </div>
     ${eventHtml || '<div class="glass-card section" role="status"><div class="empty-state" style="padding:24px"><p>暂无事件记录</p></div></div>'}
+
+    <!-- Phase 5: Insights stack — Reflections, Entities, Half-life,
+         and a per-target Evidence Timeline drawer (lazy-mounted). -->
+    <div class="insights-section">
+      <div class="section-title-row" style="margin-top:8px;">
+        <h3 class="section-title">洞察 <span style="font-size:11px;opacity:0.6;margin-left:6px;">三层认知 · Evidence · 实体</span></h3>
+        <div class="insights-tab-strip" id="insightsTabs" role="tablist" aria-label="洞察视图切换">
+          <button class="insights-tab active" data-insight-tab="reflections" onclick="switchInsightTab('reflections')">反思</button>
+          <button class="insights-tab" data-insight-tab="entities" onclick="switchInsightTab('entities')">实体</button>
+          <button class="insights-tab" data-insight-tab="halflife" onclick="switchInsightTab('halflife')">半衰期</button>
+        </div>
+      </div>
+      <div class="glass-card section" id="insightPanel">
+        <div class="empty-state" style="padding:16px"><p>加载中…</p></div>
+      </div>
+      <div id="timelineDrawerMount"></div>
+    </div>
   `;
   setupReveal(document.getElementById('contentArea'));
+  // Render the currently-selected insights tab. Defaults to
+  // "reflections" on first detail load; preserves whatever tab the
+  // user previously clicked across renderDetail() invocations.
+  switchInsightTab(currentInsightTab || 'reflections');
 }
 
 function renderEditForm(p) {
@@ -1816,6 +2000,420 @@ async function importMemory(evt) {
 /* ═══════════════════════════════════════════════════════════════
    Init
    ═══════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════
+   Phase 5: Insights (Reflections / Entities / Half-life / Timeline)
+   ═══════════════════════════════════════════════════════════════ */
+function switchInsightTab(tab) {
+  currentInsightTab = tab;
+  document.querySelectorAll('.insights-tab').forEach(el => {
+    el.classList.toggle('active', el.dataset.insightTab === tab);
+  });
+  // The drawer is per-target; switching tabs hides it so a stale
+  // drilldown from the previous tab doesn't visually attach to a
+  // newly-rendered view.
+  closeTimelineDrawer();
+  if (tab === 'reflections') return loadReflectionsTab();
+  if (tab === 'entities') return loadEntitiesTab();
+  if (tab === 'halflife') return loadHalfLifeTab();
+}
+
+function _statusBadge(status) {
+  const cls = {
+    pending: 'rf-pending', confirmed: 'rf-confirmed',
+    promoted: 'rf-promoted', denied: 'rf-denied',
+    archived: 'rf-archived', merged: 'rf-archived',
+  }[status] || 'rf-pending';
+  return `<span class="reflection-badge ${cls}">${escapeHtml(status)}</span>`;
+}
+
+function _formatEpoch(sec) {
+  if (!sec) return '—';
+  try {
+    const d = new Date(Number(sec) * 1000);
+    return d.toISOString().substring(0, 16).replace('T', ' ');
+  } catch (_) { return '—'; }
+}
+
+/* ── Reflections tab ─────────────────────────────────────────── */
+async function loadReflectionsTab() {
+  const panel = document.getElementById('insightPanel');
+  if (!panel || !selectedUserId) return;
+  panel.innerHTML = '<div class="empty-state" style="padding:16px"><p>加载反思中…</p></div>';
+  try {
+    const resp = await api('/users/' + encodeURIComponent(selectedUserId) + '/reflections');
+    lastReflections = resp.reflections || [];
+    renderReflectionsTab();
+  } catch (e) {
+    panel.innerHTML = '<div class="empty-state" style="padding:16px" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';
+  }
+}
+
+function renderReflectionsTab() {
+  const panel = document.getElementById('insightPanel');
+  if (!panel) return;
+  if (!lastReflections.length) {
+    panel.innerHTML = '<div class="empty-state" style="padding:16px"><p>暂无反思 — 启用 enable_reflection_synthesis 并积累 ≥5 条原子事件后会自动出现。</p></div>';
+    return;
+  }
+  // Sort: pending → confirmed → promoted → denied/archived
+  const order = { pending: 0, confirmed: 1, promoted: 2, denied: 3, archived: 4, merged: 4 };
+  const sorted = lastReflections.slice().sort((a, b) =>
+    (order[a.status] ?? 5) - (order[b.status] ?? 5) || (b.id - a.id)
+  );
+  panel.innerHTML = sorted.map(r => `
+    <div class="reflection-row" data-reflection-id="${r.id}">
+      ${_statusBadge(r.status)}
+      <div class="reflection-body">
+        <div class="reflection-summary">${escapeHtml(r.summary)}</div>
+        <div class="reflection-meta">
+          ${r.entity ? `<span>实体: <strong>${escapeHtml(r.entity)}</strong></span>` : ''}
+          ${r.relation_type ? `<span>关系: ${escapeHtml(r.relation_type)}</span>` : ''}
+          <span>支撑事件: ${(r.source_fact_ids || []).length}</span>
+          <span>创建: ${_formatEpoch(r.created_at)}</span>
+          <button class="btn-tiny" onclick="openTimelineDrawer('reflection', '${r.id}', '反思 #${r.id}')">📈 时间线</button>
+        </div>
+      </div>
+      <div class="reflection-actions">
+        ${r.status === 'pending' || r.status === 'confirmed' ? `
+          <button class="btn btn-icon btn-primary" onclick="promoteReflection(${r.id})" title="晋升到画像" aria-label="晋升反思 #${r.id}">✓</button>
+          <button class="btn btn-icon btn-danger" onclick="denyReflection(${r.id})" title="拒绝该反思" aria-label="拒绝反思 #${r.id}">×</button>
+        ` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+async function promoteReflection(rid) {
+  try {
+    await api('/users/' + encodeURIComponent(selectedUserId) + '/reflections/' + rid + '/promote',
+              { method: 'POST' });
+    showToast('反思已晋升为画像', 'success');
+    await refreshSelectedUser();
+    loadReflectionsTab();
+  } catch (e) {
+    showToast('晋升失败: ' + e.message, 'error');
+  }
+}
+
+async function denyReflection(rid) {
+  try {
+    await api('/users/' + encodeURIComponent(selectedUserId) + '/reflections/' + rid + '/deny',
+              { method: 'POST' });
+    showToast('已记录否决信号', 'success');
+    loadReflectionsTab();
+  } catch (e) {
+    showToast('操作失败: ' + e.message, 'error');
+  }
+}
+
+/* ── Entities tab ─────────────────────────────────────────────── */
+async function loadEntitiesTab() {
+  const panel = document.getElementById('insightPanel');
+  if (!panel || !selectedUserId) return;
+  panel.innerHTML = '<div class="empty-state" style="padding:16px"><p>加载实体中…</p></div>';
+  try {
+    const resp = await api('/users/' + encodeURIComponent(selectedUserId) + '/entities');
+    lastEntities = resp.entities || [];
+    renderEntitiesTab();
+  } catch (e) {
+    panel.innerHTML = '<div class="empty-state" style="padding:16px" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div>';
+  }
+}
+
+function renderEntitiesTab() {
+  const panel = document.getElementById('insightPanel');
+  if (!panel) return;
+  if (!lastEntities.length) {
+    panel.innerHTML = '<div class="empty-state" style="padding:16px"><p>暂无实体数据 — 反思晋升或手动设置 entity 列后会出现在这里。</p></div>';
+    return;
+  }
+  panel.innerHTML = lastEntities.map(e => `
+    <div class="entity-bucket">
+      <div class="entity-header">
+        <span class="entity-name">${escapeHtml(e.entity === '_unscoped' ? '（未归类）' : e.entity)}</span>
+        <span class="entity-count">${e.count} 条</span>
+      </div>
+      <div class="entity-profiles">
+        ${e.profiles.map(p => `
+          <div class="entity-profile-row">
+            <span style="font-weight:600">${escapeHtml(p.key)}</span>
+            <span style="opacity:0.8">${escapeHtml(p.value)}</span>
+            ${p.relation_type ? `<span class="relation-chip">${escapeHtml(p.relation_type)}</span>` : ''}
+            <span style="margin-left:auto;font-size:11px;opacity:0.6">conf ${Number(p.confidence).toFixed(2)} · ${escapeHtml(p.source || 'llm')}</span>
+            <button class="btn-tiny" onclick="openTimelineDrawer('profile', '${escapeAttr(selectedUserId + '::' + p.key)}', '画像 ${escapeAttr(p.key)}')">📈</button>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `).join('');
+}
+
+/* ── Half-life Playground ─────────────────────────────────────── */
+async function loadHalfLifeTab() {
+  const panel = document.getElementById('insightPanel');
+  if (!panel) return;
+  // Reuse the entities + reflections lists to enumerate targets so the
+  // playground covers everything the user can see on this page.
+  // Loading is lazy: if we haven't fetched them this session, do it now.
+  if (!lastEntities.length) {
+    try {
+      const resp = await api('/users/' + encodeURIComponent(selectedUserId) + '/entities');
+      lastEntities = resp.entities || [];
+    } catch (_) {}
+  }
+  if (!lastReflections.length) {
+    try {
+      const resp = await api('/users/' + encodeURIComponent(selectedUserId) + '/reflections');
+      lastReflections = resp.reflections || [];
+    } catch (_) {}
+  }
+  renderHalfLifeTab();
+  // Kick off an initial preview so the table isn't full of '—' on first
+  // render. updateHalfLifePreviews is throttled so subsequent slider
+  // moves don't pile up requests.
+  scheduleHalfLifePreview();
+}
+
+function renderHalfLifeTab() {
+  const panel = document.getElementById('insightPanel');
+  if (!panel) return;
+  const targets = collectHalfLifeTargets();
+  panel.innerHTML = `
+    <div class="halflife-pad">
+      <div class="halflife-slider-row">
+        <label for="hl-rein">Rein 半衰期</label>
+        <input type="range" id="hl-rein" min="1" max="90" step="1"
+               value="${halflifeRein}"
+               oninput="onHalfLifeChange('rein', this.value)"
+               aria-valuemin="1" aria-valuemax="90" aria-valuenow="${halflifeRein}">
+        <span class="halflife-value" id="hl-rein-val">${halflifeRein} 天</span>
+      </div>
+      <div class="halflife-slider-row">
+        <label for="hl-disp">Disp 半衰期</label>
+        <input type="range" id="hl-disp" min="1" max="90" step="1"
+               value="${halflifeDisp}"
+               oninput="onHalfLifeChange('disp', this.value)"
+               aria-valuemin="1" aria-valuemax="90" aria-valuenow="${halflifeDisp}">
+        <span class="halflife-value" id="hl-disp-val">${halflifeDisp} 天</span>
+      </div>
+      <div style="font-size:11px;opacity:0.7;line-height:1.4;">
+        拖动滑块查看每个目标在新半衰期下的 effective score（read-only，不写入 DB）。
+        score = effective_rein − effective_disp；绿色表示净支持，红色表示净否决。
+      </div>
+      <div class="halflife-target-list" id="hlTargetList">
+        ${targets.length === 0
+          ? '<div class="empty-state" style="padding:12px"><p>没有可预览的目标。</p></div>'
+          : targets.map(t => {
+              const score = halflifePreviewById[t.key];
+              const scoreCls = score === undefined ? 'score-zero'
+                              : score > 0.01 ? 'score-pos'
+                              : score < -0.01 ? 'score-neg'
+                              : 'score-zero';
+              const scoreText = score === undefined ? '—' : score.toFixed(3);
+              return `<div class="halflife-target-row">
+                <span>${escapeHtml(t.label)}</span>
+                <span style="font-size:11px;opacity:0.6">${t.kind}</span>
+                <span class="halflife-score ${scoreCls}">${scoreText}</span>
+                <button class="btn-tiny" onclick="openTimelineDrawer('${t.kind}', '${escapeAttr(t.id)}', '${escapeAttr(t.label)}')">📈</button>
+              </div>`;
+            }).join('')
+        }
+      </div>
+    </div>
+  `;
+}
+
+function collectHalfLifeTargets() {
+  const out = [];
+  for (const e of lastEntities) {
+    for (const p of e.profiles) {
+      out.push({
+        kind: 'profile',
+        id: selectedUserId + '::' + p.key,
+        label: '画像 · ' + p.key,
+      });
+    }
+  }
+  for (const r of lastReflections) {
+    out.push({
+      kind: 'reflection',
+      id: String(r.id),
+      label: '反思 #' + r.id + ' · ' + (r.summary || '').slice(0, 24),
+    });
+  }
+  return out;
+}
+
+let _hlPreviewTimer = null;
+function onHalfLifeChange(which, value) {
+  // Update both the model state and the visible numeric chip.
+  if (which === 'rein') {
+    halflifeRein = Number(value);
+    document.getElementById('hl-rein-val').textContent = halflifeRein + ' 天';
+  } else {
+    halflifeDisp = Number(value);
+    document.getElementById('hl-disp-val').textContent = halflifeDisp + ' 天';
+  }
+  // Debounce so dragging the slider doesn't fire dozens of requests.
+  scheduleHalfLifePreview();
+}
+
+function scheduleHalfLifePreview() {
+  if (_hlPreviewTimer) clearTimeout(_hlPreviewTimer);
+  _hlPreviewTimer = setTimeout(updateHalfLifePreviews, 150);
+}
+
+async function updateHalfLifePreviews() {
+  const targets = collectHalfLifeTargets();
+  if (!targets.length) return;
+  // Fire all preview calls concurrently — backend computation is
+  // O(1) per call (just a decay formula), so latency is dominated
+  // by request RTT. Promise.all is the simplest way to fan out.
+  const results = await Promise.all(targets.map(async t => {
+    try {
+      const r = await api('/evidence/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target_kind: t.kind, target_id: t.id,
+          rein_half_life_days: halflifeRein,
+          disp_half_life_days: halflifeDisp,
+        }),
+      });
+      return [t.key !== undefined ? t.key : (t.kind + ':' + t.id),
+              r.score === undefined ? 0 : Number(r.score)];
+    } catch (_) {
+      return [(t.kind + ':' + t.id), undefined];
+    }
+  }));
+  halflifePreviewById = {};
+  for (const t of targets) halflifePreviewById[t.key !== undefined ? t.key : (t.kind + ':' + t.id)] = undefined;
+  for (const [k, v] of results) halflifePreviewById[k] = v;
+  // Re-render the target list only (not the sliders) so the user's
+  // grip on the slider thumb doesn't get reset by a DOM swap.
+  const list = document.getElementById('hlTargetList');
+  if (!list) return;
+  const targets2 = collectHalfLifeTargets();
+  list.innerHTML = targets2.map(t => {
+    const key = t.kind + ':' + t.id;
+    const score = halflifePreviewById[key];
+    const scoreCls = score === undefined ? 'score-zero'
+                    : score > 0.01 ? 'score-pos'
+                    : score < -0.01 ? 'score-neg'
+                    : 'score-zero';
+    const scoreText = score === undefined ? '—' : score.toFixed(3);
+    return `<div class="halflife-target-row">
+      <span>${escapeHtml(t.label)}</span>
+      <span style="font-size:11px;opacity:0.6">${t.kind}</span>
+      <span class="halflife-score ${scoreCls}">${scoreText}</span>
+      <button class="btn-tiny" onclick="openTimelineDrawer('${t.kind}', '${escapeAttr(t.id)}', '${escapeAttr(t.label)}')">📈</button>
+    </div>`;
+  }).join('');
+}
+
+/* ── Evidence Timeline drilldown drawer ──────────────────────── */
+async function openTimelineDrawer(kind, targetId, label) {
+  const mount = document.getElementById('timelineDrawerMount');
+  if (!mount) return;
+  const key = kind + ':' + targetId;
+  // Click the same row's launcher again → close (toggle).
+  if (timelineDrawerKey === key) {
+    closeTimelineDrawer();
+    return;
+  }
+  timelineDrawerKey = key;
+  mount.innerHTML = '<div class="timeline-drawer"><div class="empty-state" style="padding:8px"><p>加载时间线…</p></div></div>';
+  try {
+    const r = await api('/evidence/timeline/' + encodeURIComponent(kind) + '/' + encodeURIComponent(targetId));
+    renderTimelineDrawer(mount, label, r);
+  } catch (e) {
+    mount.innerHTML = '<div class="timeline-drawer"><div class="empty-state" style="padding:8px" role="alert"><p>加载失败: ' + escapeHtml(e.message) + '</p></div></div>';
+  }
+}
+
+function closeTimelineDrawer() {
+  const mount = document.getElementById('timelineDrawerMount');
+  if (mount) mount.innerHTML = '';
+  timelineDrawerKey = null;
+}
+
+function renderTimelineDrawer(mount, label, data) {
+  const snap = data.snapshot || {};
+  const history = data.history || [];
+  const decaySvg = buildDecayCurveSvg(snap);
+  const eventsHtml = history.length === 0
+    ? '<div class="empty-state" style="padding:8px"><p>暂无信号记录。</p></div>'
+    : history.map(h => {
+        const cls = h.rein_delta > 0 ? 'te-rein' : h.disp_delta > 0 ? 'te-disp' : '';
+        const delta = h.rein_delta > 0
+          ? '+' + Number(h.rein_delta).toFixed(2) + ' rein'
+          : h.disp_delta > 0
+            ? '+' + Number(h.disp_delta).toFixed(2) + ' disp'
+            : '0';
+        return `<div class="timeline-event-row ${cls}">
+          <span>${_formatEpoch(h.applied_at)}</span>
+          <span>${escapeHtml(h.source || '—')}</span>
+          <span>${delta}</span>
+          <span></span>
+        </div>`;
+      }).join('');
+  mount.innerHTML = `
+    <div class="timeline-drawer">
+      <div class="timeline-drawer-header">
+        <strong>📈 ${escapeHtml(label)}</strong>
+        <button class="btn btn-icon btn-ghost" onclick="closeTimelineDrawer()" aria-label="关闭时间线">×</button>
+      </div>
+      <div class="timeline-snapshot">
+        <span>当前 rein: <strong>${(snap.rein ?? 0).toFixed(3)}</strong></span>
+        <span>当前 disp: <strong>${(snap.disp ?? 0).toFixed(3)}</strong></span>
+        <span>last rein signal: <strong>${_formatEpoch(snap.rein_last_signal_at)}</strong></span>
+        <span>last disp signal: <strong>${_formatEpoch(snap.disp_last_signal_at)}</strong></span>
+        <span>user_fact 计数: <strong>${snap.user_fact_reinforce_count ?? 0}</strong></span>
+      </div>
+      ${decaySvg}
+      <div class="timeline-events" role="log">${eventsHtml}</div>
+    </div>
+  `;
+}
+
+function buildDecayCurveSvg(snap) {
+  // Renders rein & disp values across the next 60 days using the
+  // current half-life sliders. Purely client-side math — no extra
+  // backend round-trip needed.
+  const W = 600, H = 120, PAD = 18;
+  const rein0 = Number(snap.rein || 0);
+  const disp0 = Number(snap.disp || 0);
+  const reinHl = halflifeRein || 14;
+  const dispHl = halflifeDisp || 7;
+  const days = 60;
+  // Build polylines
+  const reinPoints = [];
+  const dispPoints = [];
+  let maxVal = Math.max(rein0, disp0, 0.5);
+  for (let d = 0; d <= days; d++) {
+    const r = rein0 * Math.pow(0.5, d / reinHl);
+    const dv = disp0 * Math.pow(0.5, d / dispHl);
+    reinPoints.push([d, r]);
+    dispPoints.push([d, dv]);
+  }
+  const toX = d => PAD + (W - 2 * PAD) * (d / days);
+  const toY = v => H - PAD - (H - 2 * PAD) * (v / maxVal);
+  const polyline = pts => pts.map(([d, v]) => toX(d) + ',' + toY(v).toFixed(1)).join(' ');
+  // X-axis tick at "now" (d=0) + 30d + 60d
+  const axisTicks = [0, 30, 60].map(d =>
+    `<line class="axis" x1="${toX(d)}" y1="${H - PAD}" x2="${toX(d)}" y2="${H - PAD + 3}"/>` +
+    `<text class="axis-label" x="${toX(d)}" y="${H - 4}" text-anchor="middle">${d}d</text>`
+  ).join('');
+  return `<svg class="decay-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="衰减曲线 60 天预测">
+    <line class="axis" x1="${PAD}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}"/>
+    <line class="axis" x1="${PAD}" y1="${PAD}" x2="${PAD}" y2="${H - PAD}"/>
+    ${axisTicks}
+    <polyline class="rein-line" points="${polyline(reinPoints)}"/>
+    <polyline class="disp-line" points="${polyline(dispPoints)}"/>
+    <text class="axis-label" x="${W - PAD - 4}" y="${PAD + 10}" text-anchor="end">绿: rein · 红: disp</text>
+  </svg>`;
+}
+
 loadStats();
 loadUsers();
 if (liveUpdateEnabled) startLiveUpdate();
