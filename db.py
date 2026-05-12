@@ -1451,6 +1451,79 @@ class UserMemoryDB:
             conn.commit()
             return cursor.rowcount > 0
 
+    def list_unabsorbed_events(
+        self,
+        user_id: str,
+        limit: int = 30,
+    ) -> List[Tuple[int, str, int, Optional[str]]]:
+        """Return events that haven't been folded into a reflection yet.
+
+        Phase 3b's reconciler calls this to assemble the input for
+        Stage-2 LLM synthesis. We surface ``importance`` so the
+        reflection seed-rein math can read it without a second query.
+
+        Ordering by id DESC favours recent facts — older unabsorbed
+        events are usually too stale to combine meaningfully with new
+        ones. ``limit`` keeps the LLM prompt bounded.
+        """
+        limit = max(int(limit), 0)
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT id, event_summary, importance, tag "
+            "FROM event_logs "
+            "WHERE user_id = ? AND (absorbed = 0 OR absorbed IS NULL) "
+            "ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+        return cursor.fetchall()
+
+    def list_promotion_candidates(
+        self,
+        *,
+        age_seconds: float,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """Return pending reflections older than ``age_seconds``.
+
+        Stage-3 reconciler iterates these and decides per-row whether
+        to actually promote (evidence + disp checks happen in
+        cognition/reconciler.py, not here — the DB doesn't know about
+        EvidenceConfig).
+
+        Returns dicts (not tuples) for the same reason
+        ``list_reflections`` does — the reconciler reads several
+        fields by name, and field-order churn would hurt readability.
+        """
+        cutoff_epoch = int(time.time() - max(0.0, float(age_seconds)))
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT id, user_id, summary, entity, relation_type, "
+            "       source_fact_ids, status, created_at, updated_at "
+            "FROM reflections "
+            "WHERE status = 'pending' AND created_at <= ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (cutoff_epoch, max(int(limit), 0)),
+        )
+        out = []
+        for (rid, user_id, summary, entity, relation_type, ids_json,
+             status_val, created_at, updated_at) in cursor.fetchall():
+            try:
+                fact_ids = json.loads(ids_json) if ids_json else []
+            except (ValueError, TypeError):
+                fact_ids = []
+            out.append({
+                "id": rid,
+                "user_id": user_id,
+                "summary": summary,
+                "entity": entity,
+                "relation_type": relation_type,
+                "source_fact_ids": fact_ids,
+                "status": status_val,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            })
+        return out
+
     def mark_facts_absorbed(self, fact_ids: List[int]) -> int:
         """Bulk-set ``absorbed=1`` on the listed event_logs rows.
 

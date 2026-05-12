@@ -31,6 +31,7 @@ from core.utils.path_utils import get_data_path
 
 from .cognition.evidence import EvidenceConfig
 from .cognition.facts import fact_hash, importance_from_text, is_dedup_candidate
+from .cognition.reconciler import Reconciler
 from .db import UserMemoryDB, _parse_ttl, VALID_CATEGORIES, CATEGORY_PRIORITY, _mask_id
 from .embeddings import EmbeddingService
 from .recall import MemoryRecaller, RecallConfig
@@ -137,6 +138,34 @@ class UserMemoryPlugin(BasePlugin):
                 cfg.get("evidence_archive_threshold", -0.5)
             ),
         )
+        # ── Phase 3b: reflection synthesis + auto-promote ───────────
+        # Both off by default — synthesis costs one LLM call per
+        # eligible audit cycle, and auto-promotion writes to the
+        # persona table without a human-in-the-loop. Users opt in
+        # via schema.json when they're ready.
+        self._enable_reflection_synthesis: bool = bool(
+            cfg.get("enable_reflection_synthesis", False)
+        )
+        self._enable_auto_promotion: bool = bool(
+            cfg.get("enable_auto_promotion", False)
+        )
+        self._reflection_min_facts: int = max(
+            2, int(cfg.get("reflection_min_facts", 5))
+        )
+        self._reflection_promote_age_days: float = float(
+            cfg.get("reflection_promote_age_days", 3.0)
+        )
+        # 30-min tick by default; bounded to [60s, 24h] so a hand-
+        # edited config can't accidentally either hammer the DB
+        # every second or stall promotion for weeks.
+        self._promote_tick_seconds: float = max(
+            60.0, min(86400.0, float(
+                cfg.get("auto_promote_tick_seconds", 1800.0)
+            ))
+        )
+        self._reconciler: Optional[Reconciler] = None
+        self._promote_tick_task: Optional[asyncio.Task] = None
+        self._reconciler_tasks: set[asyncio.Task] = set()
         self.max_events = int(cfg.get("max_events_per_user", 10))
         self.max_profiles = int(cfg.get("max_profiles_per_user", 50))
         self.max_event_keep = int(cfg.get("max_event_keep", 100))
@@ -249,6 +278,32 @@ class UserMemoryPlugin(BasePlugin):
             ),
         )
 
+        # ── Phase 3b: build the reconciler ──────────────────────────
+        # We always construct it (cheap), but only fire its stages
+        # when the corresponding feature flag is on. Stage 2 piggy-
+        # backs on schedule_audit; Stage 3 runs on its own tick.
+        self._reconciler = Reconciler(
+            self.db,
+            llm_client_provider=self._get_auditor_client,
+            evidence_config=self._evidence_config,
+            min_facts=self._reflection_min_facts,
+            promote_age_days=self._reflection_promote_age_days,
+            max_inflight=self._auditor_max_inflight,
+            auditor_confidence_cap=self._auditor_confidence_cap,
+        )
+        if self._enable_auto_promotion:
+            # Single long-running coroutine that wakes every
+            # ``promote_tick_seconds``. Held in self so terminate()
+            # can cancel it on shutdown.
+            self._promote_tick_task = asyncio.create_task(
+                self._auto_promote_loop()
+            )
+            logger.info(
+                f"Reflection auto-promotion tick started "
+                f"(every {int(self._promote_tick_seconds)}s, "
+                f"age threshold {self._reflection_promote_age_days}d)"
+            )
+
         # ── Discover & register skills ──────────────────────────────
         skills = self.skill_router.discover()
         any_with_resources = False
@@ -304,10 +359,95 @@ class UserMemoryPlugin(BasePlugin):
         except Exception as e:
             logger.warning(f"检查内置记忆插件状态时出错: {e}")
 
+    async def _auto_promote_loop(self):
+        """Long-running coroutine: every ``_promote_tick_seconds``,
+        sweep pending reflections and auto-promote the eligible ones.
+
+        Exits cleanly on cancel (terminate path). Per-tick errors are
+        swallowed — a bad tick must not kill the loop.
+        """
+        try:
+            while True:
+                try:
+                    await asyncio.sleep(self._promote_tick_seconds)
+                except asyncio.CancelledError:
+                    return
+                if not self.db or self._reconciler is None:
+                    return
+                try:
+                    result = await self._reconciler.promote_pending()
+                    if result.promotions or result.denials or result.errors:
+                        logger.info(
+                            f"[reconciler] promote tick: "
+                            f"+{result.promotions} promoted, "
+                            f"{result.denials} blocked by disp, "
+                            f"{len(result.errors)} errors"
+                        )
+                except Exception as exc:
+                    # Catch-all: never let one bad tick kill the loop.
+                    logger.warning(f"[reconciler] promote tick errored: {exc}")
+        except asyncio.CancelledError:
+            return
+
+    async def _maybe_synthesize_reflections(self, user_id: str) -> None:
+        """Stage-2 hook: called after the auditor finishes for a user.
+        Cheap when the user hasn't accumulated enough unabsorbed facts;
+        does one LLM call when they have. Fire-and-forget — errors
+        are logged and swallowed inside the reconciler.
+        """
+        if not self._enable_reflection_synthesis or self._reconciler is None:
+            return
+        try:
+            result = await self._reconciler.synthesize_if_ready(user_id)
+            if result.reflections_persisted:
+                logger.info(
+                    f"[reconciler] synthesis for {_mask_id(user_id)}: "
+                    f"{result.facts_considered} facts → "
+                    f"{result.reflections_persisted} reflections, "
+                    f"{result.facts_absorbed} absorbed"
+                )
+            elif result.errors:
+                logger.warning(
+                    f"[reconciler] synthesis errors for "
+                    f"{_mask_id(user_id)}: {result.errors[:3]}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[reconciler] synthesize_if_ready failed for "
+                f"{_mask_id(user_id)}: {exc}"
+            )
+
     async def terminate(self):
         if self._webui_server:
             await self._webui_server.stop()
             self._webui_server = None
+
+        # Stop the auto-promote tick first so it doesn't try to write
+        # mid-shutdown. cancel() then await with short timeout — the
+        # tick spends most of its time in asyncio.sleep, which yields
+        # to CancelledError immediately.
+        if self._promote_tick_task and not self._promote_tick_task.done():
+            self._promote_tick_task.cancel()
+            try:
+                await asyncio.wait_for(self._promote_tick_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        self._promote_tick_task = None
+
+        # Drain any in-flight reconciler synthesis tasks alongside the
+        # auditor tasks. They share the same auditor LLM client chain
+        # so the shutdown deadline (5s) applies to the combined pool.
+        if self._reconciler_tasks:
+            pending = list(self._reconciler_tasks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
 
         # Drain any in-flight auditor tasks so we don't try to write to a
         # closed DB after this point. 5s ceiling — auditor itself has 15s
@@ -1254,6 +1394,19 @@ class UserMemoryPlugin(BasePlugin):
         )
         self._auditor_tasks.add(task)
         task.add_done_callback(self._auditor_tasks.discard)
+
+        # Phase 3b — opportunistically run reflection synthesis on the
+        # same turn. The reconciler does a cheap unabsorbed-fact count
+        # first and short-circuits if it's below the threshold, so
+        # most turns are a no-op at the SQL layer. Independent task so
+        # a slow synthesis LLM call can't delay the auditor's writes.
+        if (self._enable_reflection_synthesis
+                and self._reconciler is not None):
+            synth_task = asyncio.create_task(
+                self._maybe_synthesize_reflections(user_id)
+            )
+            self._reconciler_tasks.add(synth_task)
+            synth_task.add_done_callback(self._reconciler_tasks.discard)
 
     @staticmethod
     def _extract_latest_user_text(event: KiraMessageBatchEvent) -> str:

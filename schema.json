@@ -168,5 +168,41 @@
         "type": "float",
         "default": -0.5,
         "hint": "Score at or below which a reflection is archive-eligible. Negative because net disputation has overwhelmed reinforcement; Phase 3b's reconciler will eventually move these out of active memory."
+    },
+    "enable_reflection_synthesis": {
+        "name": "Enable reflection synthesis (Stage 2)",
+        "type": "switch",
+        "default": false,
+        "hint": "After each turn, if the user has accumulated enough unabsorbed atomic facts, run a fast LLM call to synthesize one-sentence reflections (e.g. 'user has been running regularly') and store them as Tier-2 pending records. ⚠️ Adds one extra LLM call per eligible turn — same privacy considerations as the auditor: the unabsorbed event_logs rows are sent to the synthesizer."
+    },
+    "enable_auto_promotion": {
+        "name": "Enable auto-promotion to persona (Stage 3)",
+        "type": "switch",
+        "default": false,
+        "hint": "Start a background tick (default every 30 minutes) that scans pending reflections older than the configured age threshold. Reflections with no disputation signal and net evidence above the 'confirmed' threshold are auto-upserted into user_profiles with source='reflection_promote'. The WebUI lets you revoke any promotion with a single click."
+    },
+    "reflection_min_facts": {
+        "name": "Reflection synthesis: min unabsorbed facts",
+        "type": "integer",
+        "default": 5,
+        "minimum": 2,
+        "maximum": 50,
+        "hint": "How many unabsorbed atomic facts a user must accumulate before synthesis fires for them. Lower = faster reflections but more LLM cost; higher = denser groundings per reflection. Hard floor of 2 because reflections must be supported by ≥2 facts to be persisted."
+    },
+    "reflection_promote_age_days": {
+        "name": "Reflection promote age (days)",
+        "type": "float",
+        "default": 3.0,
+        "minimum": 0.0,
+        "maximum": 365.0,
+        "hint": "Minimum age (since creation) for a pending reflection to be eligible for auto-promotion. Three days lets the user encounter and potentially dispute a new claim before it becomes part of their persona. Set to 0.0 for immediate eligibility (still gated by evidence threshold)."
+    },
+    "auto_promote_tick_seconds": {
+        "name": "Auto-promotion tick interval (seconds)",
+        "type": "integer",
+        "default": 1800,
+        "minimum": 60,
+        "maximum": 86400,
+        "hint": "How often the auto-promotion loop sweeps for eligible reflections. 1800s (30 min) is the default — short enough to feel responsive, long enough to avoid hammering SQLite when many users have backlogs. Lower bound 60s; upper bound 24h."
     }
 }

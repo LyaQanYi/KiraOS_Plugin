@@ -249,6 +249,130 @@ async def api_get_user(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
+async def api_list_reflections(request: Request) -> JSONResponse:
+    """GET /api/users/{user_id}/reflections?status= — list reflections.
+
+    Optional ``?status=`` filter passes through to db.list_reflections.
+    Always returns the full row dict (id, summary, entity,
+    relation_type, source_fact_ids, status, timestamps) so the
+    Phase 5 WebUI can render the FSM view without a second round-trip.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    status = request.query_params.get("status")
+    try:
+        limit = int(request.query_params.get("limit", "100"))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(1000, limit))
+    try:
+        rows = db.list_reflections(user_id, status=status, limit=limit)
+        return JSONResponse({
+            "user_id": user_id,
+            "status_filter": status,
+            "reflections": rows,
+        })
+    except Exception:
+        logger.exception("Error listing reflections for %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+async def api_promote_reflection(request: Request) -> JSONResponse:
+    """POST /api/users/{user_id}/reflections/{rid}/promote — force-promote.
+
+    Bypasses the evidence-threshold check that auto-promotion enforces.
+    Designed for the WebUI's manual "I want this in my persona right
+    now" button. The reflection's row is upserted into user_profiles
+    under key ``reflection_{rid}`` with source='reflection_promote'
+    and the FSM transitions to 'promoted'.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    try:
+        rid = int(request.path_params["rid"])
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Invalid reflection id"}, status_code=400)
+
+    rows = db.list_reflections(user_id, limit=100_000)
+    ref = next((r for r in rows if r["id"] == rid), None)
+    if ref is None:
+        return JSONResponse({"error": "Reflection not found"}, status_code=404)
+    try:
+        # Upsert into persona. We don't need the reconciler here — its
+        # manual path is just a thin wrapper around the same DB calls
+        # we make below. Keeping the web endpoint self-contained means
+        # the standalone Starlette server doesn't need a back-reference
+        # to the running plugin.
+        status, _info = db.upsert_with_limit(
+            user_id,
+            f"reflection_{rid}", ref["summary"],
+            max_profiles=10_000,
+            confidence=0.7,
+            category="other",
+        )
+        if status not in ("set", "updated", "truncated"):
+            return JSONResponse(
+                {"error": f"Promotion failed (status={status})"},
+                status_code=409,
+            )
+        # Stamp Phase 3a metadata + flip FSM.
+        with db._write_lock:
+            db._get_conn().execute(
+                "UPDATE user_profiles SET source = ?, entity = ?, "
+                "relation_type = ? "
+                "WHERE user_id = ? AND memory_key = ?",
+                ("reflection_promote", ref.get("entity"),
+                 ref.get("relation_type"), user_id, f"reflection_{rid}"),
+            )
+            db._get_conn().commit()
+        import time as _t
+        db.update_reflection_status(rid, "promoted", promoted_at=int(_t.time()))
+        return JSONResponse({"ok": True, "reflection_id": rid, "status": "promoted"})
+    except Exception:
+        logger.exception("Error promoting reflection %d for %s",
+                         rid, _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+async def api_deny_reflection(request: Request) -> JSONResponse:
+    """POST /api/users/{user_id}/reflections/{rid}/deny — register a
+    disputation signal and flip the reflection's status to 'denied'.
+
+    Subsequent auto-promotion sweeps skip denied reflections; the
+    evidence ledger entry now has a non-zero disp that decays with
+    its own half-life (see EvidenceConfig). If the user later changes
+    their mind, the WebUI's manual promote button still works.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    try:
+        rid = int(request.path_params["rid"])
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Invalid reflection id"}, status_code=400)
+
+    rows = db.list_reflections(user_id, limit=100_000)
+    if not any(r["id"] == rid for r in rows):
+        return JSONResponse({"error": "Reflection not found"}, status_code=404)
+    try:
+        db.record_evidence_signal(
+            "reflection", str(rid),
+            disp_delta=1.0,
+            source="user_directive",
+        )
+        db.update_reflection_status(rid, "denied")
+        return JSONResponse({"ok": True, "reflection_id": rid, "status": "denied"})
+    except Exception:
+        logger.exception("Error denying reflection %d for %s",
+                         rid, _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
 async def api_user_recall(request: Request) -> JSONResponse:
     """GET /api/users/{user_id}/recall?q=&k= — BM25-ranked event recall.
 
@@ -521,6 +645,9 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         Route("/api/users/{user_id}/events/{event_id:int}", api_delete_event, methods=["DELETE"]),
         Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
         Route("/api/users/{user_id}/recall", api_user_recall, methods=["GET"]),
+        Route("/api/users/{user_id}/reflections", api_list_reflections, methods=["GET"]),
+        Route("/api/users/{user_id}/reflections/{rid}/promote", api_promote_reflection, methods=["POST"]),
+        Route("/api/users/{user_id}/reflections/{rid}/deny", api_deny_reflection, methods=["POST"]),
         Route("/api/users/{user_id}", api_get_user, methods=["GET"]),
         Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
         Route("/api/export", api_export, methods=["GET"]),
