@@ -30,6 +30,8 @@ from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, Kir
 from core.utils.path_utils import get_data_path
 
 from .db import UserMemoryDB, _parse_ttl, VALID_CATEGORIES, CATEGORY_PRIORITY, _mask_id
+from .embeddings import EmbeddingService
+from .recall import MemoryRecaller, RecallConfig
 from .skill_router import SkillRouter, SkillInfo
 
 # ────────────────────────────────────────────────────────────────────
@@ -95,6 +97,21 @@ class UserMemoryPlugin(BasePlugin):
         db_dir = get_data_path() / "memory"
         self.db_path = str(db_dir / "kiraos.db")
         self.db: UserMemoryDB | None = None
+        self._enable_fts5: bool = bool(cfg.get("enable_fts5", True))
+        # ── Phase 2: recall pipeline knobs ──────────────────────────
+        # All recall features default OFF except FTS5 (zero-dep). The
+        # plugin still works when each is disabled — recall.py
+        # transparently skips absent stages.
+        self._enable_embedding: bool = bool(cfg.get("enable_embedding", False))
+        self._enable_llm_rerank: bool = bool(cfg.get("enable_llm_rerank", False))
+        self._reranker_model_uuid: str = str(
+            cfg.get("memory_reranker_model_uuid", "") or ""
+        )
+        self._enable_query_aware_inject: bool = bool(
+            cfg.get("enable_query_aware_inject", False)
+        )
+        self._recaller: Optional[MemoryRecaller] = None
+        self._embedding_service: Optional[EmbeddingService] = None
         self.max_events = int(cfg.get("max_events_per_user", 10))
         self.max_profiles = int(cfg.get("max_profiles_per_user", 50))
         self.max_event_keep = int(cfg.get("max_event_keep", 100))
@@ -181,8 +198,31 @@ class UserMemoryPlugin(BasePlugin):
     async def initialize(self):
         await self._disable_builtin_memory()
 
-        self.db = UserMemoryDB(self.db_path)
-        logger.info("User memory database ready")
+        self.db = UserMemoryDB(self.db_path, enable_fts5=self._enable_fts5)
+        logger.info(
+            f"User memory database ready (FTS5={'on' if self.db.fts5_enabled else 'off'})"
+        )
+
+        # ── Phase 2: assemble the recall pipeline ───────────────────
+        # The embedding service is lazy — it doesn't touch any backend
+        # until first use, so it's cheap to construct even when disabled.
+        # The LLM rerank provider reuses the auditor's client-resolution
+        # chain (configured uuid → fast → default) unless a separate
+        # ``memory_reranker_model_uuid`` is set, in which case we try
+        # that first and fall back to the auditor chain on failure.
+        self._embedding_service = EmbeddingService(
+            enabled=self._enable_embedding,
+            llm_client_provider=self._safe_default_llm_client,
+        )
+        self._recaller = MemoryRecaller(
+            self.db,
+            embedding_service=self._embedding_service,
+            llm_client_provider=self._get_reranker_client,
+            config=RecallConfig(
+                enable_embedding=self._enable_embedding,
+                enable_llm_rerank=self._enable_llm_rerank,
+            ),
+        )
 
         # ── Discover & register skills ──────────────────────────────
         skills = self.skill_router.discover()
@@ -775,9 +815,11 @@ class UserMemoryPlugin(BasePlugin):
             "查询用户记忆。无参数时返回全部画像和近期事件；"
             "传 category 可只查指定分类（basic/preference/social/other），"
             "适合在 system prompt 里只注入了 basic 类，需要其他类信息时主动调用。"
+            "传 query 进行关键词/语义搜索事件日志（按相关度排序，BM25 + 可选语义重排）。"
             "群聊场景可传 user_id 指定查询哪个发言者(必须是当前对话中的用户)。"
             "触发例: 用户问 '你记得我什么'、'你知道我的信息吗'、'我的画像'，"
-            "或对话上下文显示需要 preference/social 类信息时。"
+            "或对话上下文显示需要 preference/social 类信息时；"
+            "用户问 '上次我说过 X 吗'、'我之前提到 Y 没有' 时传 query=X/Y。"
         ),
         params={
             "type": "object",
@@ -790,6 +832,14 @@ class UserMemoryPlugin(BasePlugin):
                 "user_id": {
                     "type": "string",
                     "description": "可选: 群聊场景查指定发言者（必须是当前对话中的用户）"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "可选: 关键词或短语，命中后按相关度排序返回事件日志"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "可选: query 模式下返回的最大条数（默认 10，上限 30）"
                 }
             },
             "required": []
@@ -797,7 +847,10 @@ class UserMemoryPlugin(BasePlugin):
     )
     async def memory_query(self, event: KiraMessageBatchEvent,
                            category: Optional[str] = None,
-                           user_id: Optional[str] = None, **_) -> str:
+                           user_id: Optional[str] = None,
+                           query: Optional[str] = None,
+                           limit: Optional[int] = None,
+                           **_) -> str:
         if not self.db:
             return "Error: memory database not initialized"
         primary_uid = self._get_primary_user_id(event)
@@ -819,11 +872,65 @@ class UserMemoryPlugin(BasePlugin):
                 )
         if category is not None and category not in VALID_CATEGORIES:
             return f"Error: invalid category '{category}', must be one of {sorted(VALID_CATEGORIES)}"
+
+        # Phase 2 — query-aware recall path. Only taken when the caller
+        # explicitly passes ``query``; legacy callers (no query) keep
+        # the v2.0.0 "dump everything" behaviour exactly.
+        if query is not None and str(query).strip():
+            return await self._recall_query(target, str(query).strip(), limit)
+
         return self.db.get_all_profiles_formatted(
             target,
             max_events=self.max_events,
             category=category,
         )
+
+    async def _recall_query(self, user_id: str, query: str,
+                            limit: Optional[int]) -> str:
+        """Run the Phase 2 MemoryRecaller and format results for the LLM.
+
+        Falls back to a one-shot LIKE search through the DB if the
+        recaller isn't constructed yet (e.g. called before initialize()
+        finished — shouldn't happen in practice but the fallback keeps
+        the contract simple).
+        """
+        # Cap to keep the LLM tool response under a reasonable size.
+        try:
+            k = int(limit) if limit is not None else 10
+        except (TypeError, ValueError):
+            k = 10
+        k = max(1, min(30, k))
+
+        if self._recaller is not None:
+            try:
+                hits = await self._recaller.recall(user_id, query, budget=k)
+            except Exception as exc:
+                logger.warning(f"memory_query recall failed: {exc}")
+                hits = []
+        else:
+            rows = self.db.search_events_fts(user_id, query, limit=k)
+            from .recall import RecallCandidate  # local import to avoid cycle at import time
+            hits = [
+                RecallCandidate(
+                    event_id=r[0], summary=r[1], created_at=r[2],
+                    tag=r[3], score=float(r[4]),
+                    stage_scores={"fts": float(r[4])},
+                )
+                for r in rows
+            ]
+
+        if not hits:
+            return f"未在事件日志中找到与 '{query}' 相关的记录。"
+
+        lines = [f"<recall query=\"{self.db._sanitize(query)}\" user=\"{user_id}\">"]
+        lines.append(f"\n## 最相关的 {len(hits)} 条事件（按相关度排序）\n")
+        for cand in hits:
+            tag_s = f" [#{cand.tag}]" if cand.tag else ""
+            # ts is ISO, slice the date prefix for compactness
+            date_prefix = (cand.created_at or "")[:10]
+            lines.append(f"- {date_prefix}{tag_s} {cand.summary}")
+        lines.append("</recall>")
+        return "\n".join(lines)
 
     @register_tool(
         name="consolidate_memory",
@@ -1068,6 +1175,46 @@ class UserMemoryPlugin(BasePlugin):
             if isinstance(elem, Text):
                 parts.append(elem.text or "")
         return "".join(parts).strip()
+
+    def _safe_default_llm_client(self):
+        """Return the host's default LLM client or None — never raises.
+
+        Used as the ``llm_client_provider`` for EmbeddingService. The
+        plugin host can throw various errors before any LLM is wired
+        up (during early initialize, in tests, when the user hasn't
+        configured a provider); swallowing them here keeps the
+        embedding service in a clean "disabled" state instead of
+        propagating into recall calls.
+        """
+        try:
+            return self.ctx.get_default_llm_client()
+        except Exception:
+            return None
+
+    def _get_reranker_client(self):
+        """LLM client for Stage-C reranker (recall.py).
+
+        Priority chain, mirroring the auditor's pattern:
+          1. ``memory_reranker_model_uuid`` if set
+          2. The auditor client chain (configured / fast / default)
+
+        Returning None opts the recall pipeline out of Stage C without
+        any other recovery — the recaller treats None as "skip".
+        """
+        if self._reranker_model_uuid:
+            try:
+                client = self.ctx.get_llm_client(
+                    model_uuid=self._reranker_model_uuid
+                )
+                if client is not None:
+                    return client
+                logger.warning(
+                    f"[recall] reranker model '{self._reranker_model_uuid}' "
+                    "not available, falling back to auditor chain"
+                )
+            except Exception as exc:
+                logger.warning(f"[recall] reranker model load failed: {exc}")
+        return self._get_auditor_client()
 
     def _get_auditor_client(self):
         """Pick the LLM client to drive the auditor.

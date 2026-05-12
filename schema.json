@@ -97,5 +97,36 @@
         "minimum": 1,
         "maximum": 32,
         "hint": "Maximum number of concurrent in-flight auditor LLM calls. When this many audits are already running, new turns are dropped (best-effort; auditor is an opt-in bonus layer). Lower = stricter, fewer rate-limit hits; higher = more thorough but more provider load."
+    },
+    "enable_fts5": {
+        "name": "Enable FTS5 full-text search",
+        "type": "switch",
+        "default": true,
+        "hint": "Create a SQLite FTS5 virtual table over event_logs so memory_query(query=...) can do BM25 ranking instead of substring matching. Zero new dependencies (FTS5 is built into Python's bundled sqlite3 on every supported platform). Disable only if your SQLite build lacks FTS5 or you don't want the per-write trigger overhead — falls back to LIKE search."
+    },
+    "enable_embedding": {
+        "name": "Enable semantic embedding recall",
+        "type": "switch",
+        "default": false,
+        "hint": "Add a cosine-similarity rerank stage to memory_query(query=...). Off by default — needs either an LLM client that exposes an embed/aembed method OR a local sentence-transformers install (~480MB). When unavailable, the pipeline silently falls back to FTS5/LIKE results without erroring."
+    },
+    "enable_llm_rerank": {
+        "name": "Enable LLM rerank of recall results",
+        "type": "switch",
+        "default": false,
+        "hint": "Add a fast-LLM precision pass after FTS5/embedding ranking. Costs one extra LLM call per memory_query(query=...) invocation. ⚠️ Same privacy note as the auditor: the user's query and up to 20 candidate event summaries are sent to the rerank model. Skip this when latency or cost matters more than precision."
+    },
+    "memory_reranker_model_uuid": {
+        "name": "Memory reranker model",
+        "type": "model_select",
+        "model_type": "llm",
+        "default": "",
+        "hint": "Leave empty (recommended) to reuse the auditor's model chain (configured uuid → fast LLM → default). Pin a specific model only when you want the reranker isolated from the auditor."
+    },
+    "enable_query_aware_inject": {
+        "name": "Query-aware context injection (experimental)",
+        "type": "switch",
+        "default": false,
+        "hint": "When enabled, the most recent user message is used as a query to pull relevant events into the system prompt instead of (or alongside) the default 'last-N' window. Saves tokens but the LLM may not see context that wasn't keyword-related to the latest turn. Off by default — Phase 2 wires the recaller, Phase 3 will activate this fully."
     }
 }

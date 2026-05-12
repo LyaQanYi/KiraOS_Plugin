@@ -249,6 +249,58 @@ async def api_get_user(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
+async def api_user_recall(request: Request) -> JSONResponse:
+    """GET /api/users/{user_id}/recall?q=&k= — BM25-ranked event recall.
+
+    Mirrors the ``memory_query(query=…)`` tool but exposes the
+    per-event score and tokenizer source for the WebUI to render
+    debugging information. Embedding cosine + LLM rerank are
+    intentionally omitted from the HTTP surface — they require the
+    plugin's runtime context (LLM client) that the standalone server
+    doesn't have access to. Callers wanting the full pipeline should
+    use the tool from the LLM side.
+    """
+    db = _get_db(request)
+    if not db:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    user_id = request.path_params["user_id"]
+    q = (request.query_params.get("q") or "").strip()
+    if not q:
+        return JSONResponse(
+            {"error": "missing required query parameter 'q'"}, status_code=400
+        )
+    try:
+        k = int(request.query_params.get("k", "20"))
+    except (TypeError, ValueError):
+        k = 20
+    k = max(1, min(100, k))
+
+    try:
+        rows = db.search_events_fts(user_id, q, limit=k)
+        # The fts5_enabled flag drives the "source" hint so a user
+        # debugging "why am I getting LIKE results" can see at a glance
+        # whether the trigram path was actually exercised.
+        source = "fts5_bm25"
+        if not db.fts5_enabled or len(q) < db.FTS_MIN_QUERY_LEN:
+            source = "like_fallback"
+        return JSONResponse({
+            "user_id": user_id,
+            "query": q,
+            "source": source,
+            "results": [
+                {
+                    "id": eid, "event_summary": summary,
+                    "created_at": created_at, "tag": tag, "score": score,
+                }
+                for eid, summary, created_at, tag, score in rows
+            ],
+        })
+    except Exception:
+        logger.exception("Error in recall for %s", _mask_id(user_id))
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
 async def api_update_profile(request: Request) -> JSONResponse:
     """PUT /api/users/{user_id}/profiles/{key} — Update a profile entry."""
     db = _get_db(request)
@@ -468,6 +520,7 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         Route("/api/users/{user_id}/events/{event_id:int}", api_update_event, methods=["PUT"]),
         Route("/api/users/{user_id}/events/{event_id:int}", api_delete_event, methods=["DELETE"]),
         Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
+        Route("/api/users/{user_id}/recall", api_user_recall, methods=["GET"]),
         Route("/api/users/{user_id}", api_get_user, methods=["GET"]),
         Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
         Route("/api/export", api_export, methods=["GET"]),

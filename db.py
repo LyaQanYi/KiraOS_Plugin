@@ -166,7 +166,7 @@ class UserMemoryDB:
             .replace("\n", " ")
         )
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, enable_fts5: bool = True):
         self.db_path = db_path
         self._tls = threading.local()
         # Registry of every connection ever handed out (one per thread that
@@ -175,6 +175,9 @@ class UserMemoryDB:
         self._registry_lock = Lock()
         self._write_lock = Lock()
         self._closed = False
+        # FTS5 toggle — flipped to False inside _init_extended_schema if the
+        # installed SQLite wasn't compiled with FTS5 support.
+        self._enable_fts5 = bool(enable_fts5)
         self._ensure_dir()
         # Initialize schema (runs in the caller's thread; that connection is
         # registered like any other).
@@ -257,16 +260,36 @@ class UserMemoryDB:
             """)
             conn.commit()
             self._migrate(conn)
+            self._init_extended_schema(conn)
             logger.info(f"User memory database initialized at {self.db_path}")
 
     def _migrate(self, conn: sqlite3.Connection):
-        """Auto-add new columns and rewrite legacy ISO-string expires_at values."""
+        """Auto-add new columns and rewrite legacy ISO-string expires_at values.
+
+        Each new column appended here will be NULL for pre-existing rows;
+        no reader code is permitted to fail when these are NULL.
+        """
         cursor = conn.execute("PRAGMA table_info(user_profiles)")
         existing_cols = {row[1] for row in cursor.fetchall()}
         migrations = [
             ("confidence", "REAL DEFAULT 0.5"),
             ("category", "TEXT DEFAULT 'basic'"),
             ("expires_at", "INTEGER DEFAULT NULL"),
+            # Phase 1 — NEKO-inspired persona / evidence / embedding columns.
+            # entity + relation_type let a profile row participate in the
+            # entity graph (e.g. entity='neko', relation_type='likes_food');
+            # source records who wrote the row ('llm' | 'auditor' |
+            # 'reflection_promote' | 'user_directive'); protected=1 pins a
+            # row against eviction regardless of evidence_score (see
+            # cognition/evidence.py); embedding holds an fp16 base64-encoded
+            # vector blob and embedding_sha caches the model+text hash so we
+            # can cheaply detect "vector is still valid for this value".
+            ("entity", "TEXT DEFAULT NULL"),
+            ("relation_type", "TEXT DEFAULT NULL"),
+            ("source", "TEXT DEFAULT 'llm'"),
+            ("protected", "INTEGER DEFAULT 0"),
+            ("embedding", "BLOB DEFAULT NULL"),
+            ("embedding_sha", "TEXT DEFAULT NULL"),
         ]
         for col_name, col_def in migrations:
             if col_name not in existing_cols:
@@ -274,13 +297,25 @@ class UserMemoryDB:
                 logger.info(f"Migrated user_profiles: added column '{col_name}'")
         conn.commit()
 
-        # event_logs.tag was added in this revision
         cursor = conn.execute("PRAGMA table_info(event_logs)")
         event_cols = {row[1] for row in cursor.fetchall()}
-        if "tag" not in event_cols:
-            conn.execute("ALTER TABLE event_logs ADD COLUMN tag TEXT DEFAULT NULL")
-            logger.info("Migrated event_logs: added column 'tag'")
-            conn.commit()
+        event_migrations = [
+            ("tag", "TEXT DEFAULT NULL"),
+            # Phase 1 — fact identity (fact_hash for dedup), importance for
+            # rein-seed mapping (cognition/evidence.py:initial_reinforcement
+            # _from_importance), absorbed=1 once a reflection has consumed
+            # this fact, and an optional vector for semantic recall.
+            ("fact_hash", "TEXT DEFAULT NULL"),
+            ("importance", "INTEGER DEFAULT 5"),
+            ("absorbed", "INTEGER DEFAULT 0"),
+            ("embedding", "BLOB DEFAULT NULL"),
+            ("embedding_sha", "TEXT DEFAULT NULL"),
+        ]
+        for col_name, col_def in event_migrations:
+            if col_name not in event_cols:
+                conn.execute(f"ALTER TABLE event_logs ADD COLUMN {col_name} {col_def}")
+                logger.info(f"Migrated event_logs: added column '{col_name}'")
+        conn.commit()
 
         # One-shot conversion: any expires_at still stored as TEXT (legacy ISO)
         # gets rewritten to INTEGER epoch so subsequent reads can use a plain
@@ -301,6 +336,204 @@ class UserMemoryDB:
                 converted += 1
             conn.commit()
             logger.info(f"Migrated {converted} expires_at value(s) from ISO text to epoch integer")
+
+    # ── Phase 1: Extended schema (NEKO-inspired cognition tables) ───
+
+    def _init_extended_schema(self, conn: sqlite3.Connection):
+        """Create supplementary tables + indexes + optional FTS5 index.
+
+        Runs after ``_migrate`` so the new columns on base tables already
+        exist. All statements are idempotent — running this on a fresh DB,
+        a partially migrated DB, or a fully up-to-date DB all reach the
+        same state.
+
+        The reflections + evidence_ledger tables are wired in Phase 3;
+        Phase 1 only provisions them so subsequent migrations don't have
+        to redo schema work.
+
+        Caller contract: ``_write_lock`` is already held (invoked from
+        ``_init_db`` inside the same ``with`` block). ``threading.Lock``
+        is non-reentrant, so re-acquiring would deadlock.
+        """
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_event_logs_fact_hash
+                ON event_logs (user_id, fact_hash);
+            CREATE INDEX IF NOT EXISTS idx_event_logs_absorbed
+                ON event_logs (user_id, absorbed, created_at);
+            CREATE INDEX IF NOT EXISTS idx_user_profiles_entity
+                ON user_profiles (user_id, entity);
+
+            -- Tier-2 reflections: multi-fact syntheses that live in
+            -- a finite-state machine (see cognition/reflection.py).
+            CREATE TABLE IF NOT EXISTS reflections (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         TEXT NOT NULL,
+                summary         TEXT NOT NULL,
+                entity          TEXT,
+                relation_type   TEXT,
+                source_fact_ids TEXT,
+                status          TEXT DEFAULT 'pending',
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                promoted_at     INTEGER,
+                embedding       BLOB,
+                embedding_sha   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_reflections_user_status
+                ON reflections (user_id, status);
+            CREATE INDEX IF NOT EXISTS idx_reflections_status_age
+                ON reflections (status, created_at);
+
+            -- Evidence ledger: rein/disp with independent half-life
+            -- clocks (RFC §3.1.1, evidence.py). Shared by profile +
+            -- reflection rows via the (target_kind, target_id) tuple.
+            CREATE TABLE IF NOT EXISTS evidence_ledger (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_kind                 TEXT NOT NULL,
+                target_id                   TEXT NOT NULL,
+                rein                        REAL DEFAULT 0,
+                disp                        REAL DEFAULT 0,
+                rein_last_signal_at         INTEGER,
+                disp_last_signal_at         INTEGER,
+                sub_zero_days               REAL DEFAULT 0,
+                user_fact_reinforce_count   INTEGER DEFAULT 0,
+                UNIQUE (target_kind, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_evidence_target
+                ON evidence_ledger (target_kind, target_id);
+            """
+        )
+        conn.commit()
+
+        if self._enable_fts5:
+            try:
+                self._init_fts5(conn)
+            except sqlite3.OperationalError as e:
+                # FTS5 isn't compiled into this SQLite build (rare on
+                # modern Python distributions, common on Alpine/min
+                # builds). Degrade gracefully to LIKE-based search.
+                logger.warning(
+                    f"FTS5 unavailable ({e}); falling back to LIKE search. "
+                    "Set enable_fts5=false in plugin config to silence."
+                )
+                self._enable_fts5 = False
+        else:
+            # User-disabled — tear down anything an earlier run created
+            # so we don't keep half-stale triggers updating a phantom
+            # table that the rest of the code no longer queries.
+            self._drop_fts5(conn)
+
+    def _init_fts5(self, conn: sqlite3.Connection):
+        """Create FTS5 virtual tables + sync triggers (idempotent).
+
+        ``event_logs_fts`` uses external-content mode (content='event_logs'),
+        so no data duplication — the FTS index just stores tokens that
+        reference rowid back into event_logs. Three triggers keep it in
+        sync on INSERT / DELETE / UPDATE.
+
+        On first creation against an existing DB, we issue the FTS5
+        'rebuild' command so historical rows become searchable
+        immediately rather than only future writes. We detect that
+        first-creation case by probing sqlite_master BEFORE the CREATE
+        statement — an external-content FTS5 table's ``COUNT(*)`` always
+        reports the base-table count regardless of index state, so the
+        naive "is FTS empty?" check would never fire.
+        """
+        fts_existed = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'event_logs_fts'"
+        ).fetchone() is not None
+        # FTS5 external-content tables require column names to match the
+        # content table exactly — the indexer reads them back via
+        # SELECT <col> FROM <content_table>, so a mismatch surfaces as
+        # "no such column: T.summary" at rebuild time. We mirror
+        # event_logs' columns 1:1 here. Callers that want column-agnostic
+        # search can use `event_logs_fts MATCH 'kw'`; for column-scoped
+        # search use `event_summary MATCH 'kw'`.
+        #
+        # Tokenizer choice — `trigram` (SQLite 3.34+):
+        #   unicode61 stores each contiguous Han run as ONE token, so a
+        #   query like MATCH '跑步' would never hit "今天去跑步了" (a
+        #   single fused token). trigram extracts overlapping 3-char
+        #   windows, which lets CJK phrases of ≥ 3 chars search correctly
+        #   and still indexes English words for substring matches.
+        #   Queries of 1-2 chars (CJK or otherwise) return no FTS hits;
+        #   callers should fall back to LIKE for those (handled in
+        #   recall.py in Phase 2).
+        conn.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS event_logs_fts USING fts5(
+                user_id UNINDEXED,
+                event_summary,
+                tag UNINDEXED,
+                content='event_logs',
+                content_rowid='id',
+                tokenize='trigram'
+            );
+            CREATE TRIGGER IF NOT EXISTS event_logs_ai
+                AFTER INSERT ON event_logs BEGIN
+                    INSERT INTO event_logs_fts(rowid, user_id, event_summary, tag)
+                    VALUES (new.id, new.user_id, new.event_summary,
+                            COALESCE(new.tag, ''));
+                END;
+            CREATE TRIGGER IF NOT EXISTS event_logs_ad
+                AFTER DELETE ON event_logs BEGIN
+                    INSERT INTO event_logs_fts(event_logs_fts, rowid, user_id, event_summary, tag)
+                    VALUES ('delete', old.id, old.user_id, old.event_summary,
+                            COALESCE(old.tag, ''));
+                END;
+            CREATE TRIGGER IF NOT EXISTS event_logs_au
+                AFTER UPDATE ON event_logs BEGIN
+                    INSERT INTO event_logs_fts(event_logs_fts, rowid, user_id, event_summary, tag)
+                    VALUES ('delete', old.id, old.user_id, old.event_summary,
+                            COALESCE(old.tag, ''));
+                    INSERT INTO event_logs_fts(rowid, user_id, event_summary, tag)
+                    VALUES (new.id, new.user_id, new.event_summary,
+                            COALESCE(new.tag, ''));
+                END;
+            """
+        )
+        conn.commit()
+        # Backfill historical rows on first-time creation only. 'rebuild'
+        # is O(N) over event_logs and would be wasteful on every startup
+        # for a large DB. The fts_existed probe above tells us whether
+        # this is a brand-new index or an existing one that the triggers
+        # have been keeping in sync.
+        if not fts_existed:
+            base_count = conn.execute(
+                "SELECT COUNT(*) FROM event_logs"
+            ).fetchone()[0]
+            if base_count > 0:
+                conn.execute(
+                    "INSERT INTO event_logs_fts(event_logs_fts) VALUES ('rebuild')"
+                )
+                conn.commit()
+                logger.info(
+                    f"FTS5: rebuilt index from {base_count} existing event_logs rows"
+                )
+
+    def _drop_fts5(self, conn: sqlite3.Connection):
+        """Tear down FTS objects when the user disables FTS via config."""
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS event_logs_ai;
+            DROP TRIGGER IF EXISTS event_logs_ad;
+            DROP TRIGGER IF EXISTS event_logs_au;
+            DROP TABLE IF EXISTS event_logs_fts;
+            """
+        )
+        conn.commit()
+
+    @property
+    def fts5_enabled(self) -> bool:
+        """Whether FTS5 is currently active for this DB instance.
+
+        May differ from the constructor argument if FTS5 wasn't compiled
+        into the running SQLite — _init_fts5 catches that and flips the
+        flag to False so callers can fall back to LIKE search.
+        """
+        return self._enable_fts5
 
     # ── Profile Operations ──────────────────────────────────────────
 
@@ -715,6 +948,140 @@ class UserMemoryDB:
             (user_id,)
         )
         return cursor.fetchone()[0]
+
+    # ── Phase 2: query-aware event recall ───────────────────────────
+
+    # Below this length we skip FTS5 entirely and go straight to LIKE.
+    # trigram-tokenized FTS5 returns nothing for sub-3-char MATCH queries
+    # (each token is exactly 3 chars), so a short CJK query like "猫"
+    # would otherwise produce an empty FTS result and a confusing "no
+    # match" downstream — even though the user clearly meant a substring
+    # lookup. LIKE picks up these cases cleanly.
+    FTS_MIN_QUERY_LEN = 3
+
+    def search_events_fts(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> List[Tuple[int, str, str, Optional[str], float]]:
+        """BM25-ranked search via the FTS5 index.
+
+        Returns ``[(id, event_summary, created_at, tag, bm25_score), …]``
+        ordered best-first. SQLite's ``bm25()`` is signed: more-negative =
+        more-relevant, so we negate for an intuitive "higher is better"
+        score in the result tuple.
+
+        Falls back to ``search_events_like`` when FTS5 is disabled (or
+        unavailable at runtime) or when the query is below the trigram
+        tokenizer's minimum length. Callers can rely on this always
+        returning *something* for a non-empty query and corpus.
+
+        The query is wrapped in an FTS5 phrase ("…") so callers don't have
+        to escape MATCH operators themselves; an empty query short-circuits
+        to an empty list rather than raising.
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+        if not self._enable_fts5 or len(q) < self.FTS_MIN_QUERY_LEN:
+            return self.search_events_like(user_id, q, limit=limit)
+        # Escape embedded double quotes so the FTS5 MATCH phrase stays
+        # well-formed. The pattern ""…"" is the FTS5-native escape for a
+        # literal " inside a phrase. Without this, a query like 谁说"对"
+        # would be parsed as two separate phrases.
+        phrase = '"' + q.replace('"', '""') + '"'
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute(
+                "SELECT e.id, e.event_summary, e.created_at, e.tag, "
+                "       bm25(event_logs_fts) AS score "
+                "FROM event_logs e "
+                "JOIN event_logs_fts f ON f.rowid = e.id "
+                "WHERE f.event_logs_fts MATCH ? AND e.user_id = ? "
+                "ORDER BY score LIMIT ?",
+                (phrase, user_id, max(int(limit), 0)),
+            )
+        except sqlite3.OperationalError as exc:
+            # Malformed FTS5 expression (rare — phrase quoting should
+            # prevent it) or runtime FTS5 unavailability. Log once and
+            # serve a LIKE-based fallback so the caller still gets data.
+            logger.warning(
+                f"FTS5 query failed ({exc}); falling back to LIKE for "
+                f"user={_mask_id(user_id)} query={q!r}"
+            )
+            return self.search_events_like(user_id, q, limit=limit)
+        rows = cursor.fetchall()
+        return [
+            (row[0], row[1], row[2], row[3], -float(row[4]))
+            for row in rows
+        ]
+
+    def search_events_like(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> List[Tuple[int, str, str, Optional[str], float]]:
+        """Substring search via SQL LIKE. The score in the returned tuple
+        is a synthetic ``1.0`` so the shape matches ``search_events_fts``
+        and downstream re-ranking can blend the two sources.
+
+        Used as the universal fallback when FTS5 isn't an option (config
+        off, runtime failure, sub-trigram-length query). The ESCAPE clause
+        neutralizes literal %, _, and \\ in the user's query so a search
+        for ``100%`` doesn't wildcard-match the entire corpus.
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+        # SQLite's LIKE wildcards are % and _; backslash is our chosen
+        # escape character. Escape it FIRST so we don't re-escape the
+        # escape introductions added for % / _.
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT id, event_summary, created_at, tag "
+            "FROM event_logs WHERE user_id = ? "
+            "AND event_summary LIKE ? ESCAPE '\\' "
+            "ORDER BY datetime(created_at) DESC LIMIT ?",
+            (user_id, pattern, max(int(limit), 0)),
+        )
+        return [
+            (row[0], row[1], row[2], row[3], 1.0)
+            for row in cursor.fetchall()
+        ]
+
+    def search_profiles_like(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> List[Tuple[str, str, str, float, str]]:
+        """Substring search over profile keys + values via SQL LIKE.
+
+        Returns ``[(memory_key, memory_value, updated_at, confidence,
+        category), …]``. Profiles are far fewer than events in typical
+        use (capped by ``max_profiles_per_user``, default 50), so the
+        LIKE-only path is fast enough — no FTS index for profiles yet.
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        conn = self._get_conn()
+        now_epoch = int(time.time())
+        cursor = conn.execute(
+            "SELECT memory_key, memory_value, updated_at, confidence, category "
+            "FROM user_profiles WHERE user_id = ? "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            "AND (memory_key LIKE ? ESCAPE '\\' OR memory_value LIKE ? ESCAPE '\\') "
+            "ORDER BY confidence DESC, updated_at DESC LIMIT ?",
+            (user_id, now_epoch, pattern, pattern, max(int(limit), 0)),
+        )
+        return cursor.fetchall()
 
     def cleanup_old_events(self, user_id: str, keep: int = 50) -> int:
         """Delete oldest events beyond the *keep* threshold. Returns rows deleted."""
