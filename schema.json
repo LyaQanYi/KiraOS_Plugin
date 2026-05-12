@@ -1,55 +1,195 @@
 {
-    "max_events_per_user": {
-        "name": "Max events in context",
+    "memory_top_k": {
+        "name": "Memories per turn",
         "type": "integer",
-        "default": 10,
+        "default": 5,
         "minimum": 0,
-        "hint": "Maximum number of recent events injected into LLM context per user"
+        "maximum": 50,
+        "hint": "How many long-term memories to recall and inject into the LLM context each turn",
+        "locales": {
+            "zh": {
+                "name": "每轮召回条数",
+                "hint": "每轮注入 LLM 上下文的长期记忆条数"
+            }
+        }
     },
-    "max_profiles_per_user": {
-        "name": "Max profile entries",
+    "memory_inject_max_chars": {
+        "name": "Max memory context chars",
         "type": "integer",
-        "default": 50,
+        "default": 800,
         "minimum": 0,
-        "hint": "Maximum number of profile key-value pairs allowed per user"
+        "hint": "Hard cap on the memory + profile block size injected per turn (0 = unlimited)",
+        "locales": {
+            "zh": {
+                "name": "记忆注入字符上限",
+                "hint": "每轮注入的记忆 + 画像总块大小上限（0 = 不限制）"
+            }
+        }
     },
-    "max_event_keep": {
-        "name": "Max events stored",
+    "enable_vector_search": {
+        "name": "Enable vector search",
+        "type": "switch",
+        "default": false,
+        "hint": "Use sqlite-vec for hybrid (FTS5 + vector) retrieval. Requires the sqlite-vec extension; falls back to FTS5-only when unavailable.",
+        "locales": {
+            "zh": {
+                "name": "启用向量检索",
+                "hint": "使用 sqlite-vec 进行向量 + FTS5 混合检索。需安装 sqlite-vec 扩展；未安装时自动回退到纯 FTS5。"
+            }
+        }
+    },
+    "vector_dim": {
+        "name": "Vector dimension",
         "type": "integer",
-        "default": 100,
-        "minimum": 0,
-        "hint": "Maximum number of event logs kept in database per user (oldest auto-deleted)"
+        "default": 768,
+        "minimum": 64,
+        "maximum": 4096,
+        "hint": "Embedding dimension when vector search is enabled (must match your embedder)",
+        "locales": {
+            "zh": {
+                "name": "向量维度",
+                "hint": "启用向量检索时的嵌入维度（必须与 embedder 输出一致）"
+            }
+        }
+    },
+    "decay_enabled": {
+        "name": "Memory decay",
+        "type": "switch",
+        "default": true,
+        "hint": "Enable retention-score-based decay and garbage collection of low-value memories",
+        "locales": {
+            "zh": {
+                "name": "启用记忆衰减",
+                "hint": "按保留分数对低价值记忆做衰减 + 自动回收"
+            }
+        }
+    },
+    "decay_interval_days": {
+        "name": "Decay cycle interval (days)",
+        "type": "integer",
+        "default": 14,
+        "minimum": 1,
+        "hint": "How often the full forgetting cycle runs",
+        "locales": {
+            "zh": {
+                "name": "衰减周期间隔（天）",
+                "hint": "完整遗忘周期的运行间隔"
+            }
+        }
+    },
+    "gc_importance_threshold": {
+        "name": "GC importance threshold",
+        "type": "integer",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "hint": "Facts with importance ≤ this value AND unaccessed for gc_unaccessed_days will be archived",
+        "locales": {
+            "zh": {
+                "name": "GC 重要性阈值",
+                "hint": "importance ≤ 此值且超过 gc_unaccessed_days 未访问的事实将被归档"
+            }
+        }
+    },
+    "gc_unaccessed_days": {
+        "name": "GC unaccessed days",
+        "type": "integer",
+        "default": 30,
+        "minimum": 1,
+        "hint": "Memories unaccessed this many days become eligible for garbage collection",
+        "locales": {
+            "zh": {
+                "name": "GC 未访问天数",
+                "hint": "超过此天数未访问的记忆将成为 GC 候选"
+            }
+        }
+    },
+    "hippocampus_enabled": {
+        "name": "Hippocampus (async fact extractor)",
+        "type": "switch",
+        "default": true,
+        "hint": "Run a background fact-extraction pass after every assistant turn. Uses the configured fast LLM. Disable to save tokens, but the LLM must then call memory_add explicitly. ⚠️ Privacy: the hippocampus sees the user's latest message and the assistant's reply.",
+        "locales": {
+            "zh": {
+                "name": "海马体（异步事实提取）",
+                "hint": "每轮回复后跑一次后台事实提取（用配置的 fast LLM）。关闭以节省 token，但 LLM 需主动调用 memory_add。⚠️ 隐私：海马体会看到用户最新消息和助手回复。"
+            }
+        }
+    },
+    "hippocampus_model_uuid": {
+        "name": "Hippocampus model",
+        "type": "model_select",
+        "model_type": "llm",
+        "default": "",
+        "hint": "Leave empty to use the configured default fast LLM. Pick a specific model only if you want to pin the extractor to it.",
+        "locales": {
+            "zh": {
+                "name": "海马体模型",
+                "hint": "留空使用默认 fast LLM；仅当需固定特定模型用于提取时再选择。"
+            }
+        }
+    },
+    "hippocampus_max_inflight": {
+        "name": "Hippocampus max concurrent calls",
+        "type": "integer",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 32,
+        "hint": "Cap on concurrent in-flight hippocampus passes. Excess turns are dropped (best-effort).",
+        "locales": {
+            "zh": {
+                "name": "海马体最大并发数",
+                "hint": "同时进行中的海马体提取数上限。超额的轮次会被丢弃（尽力而为）。"
+            }
+        }
+    },
+    "hippocampus_skip_keywords": {
+        "name": "Hippocampus skip keywords",
+        "type": "list",
+        "default": ["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"],
+        "hint": "If the user's latest message contains any of these, the hippocampus skips that turn entirely (privacy guard).",
+        "locales": {
+            "zh": {
+                "name": "海马体跳过关键词",
+                "hint": "用户最新消息含其中任一关键词时，海马体跳过该轮（隐私保护）。"
+            }
+        }
     },
     "skills_dir": {
         "name": "Skills directory",
         "type": "string",
         "default": null,
-        "hint": "Path to skills directory (defaults to data/skills/). Each skill is a subfolder containing either SKILL.md (recommended, single-file YAML frontmatter) or the legacy manifest.json + instruction.md pair."
-    },
-    "max_context_chars": {
-        "name": "Max context chars per user",
-        "type": "integer",
-        "default": 500,
-        "minimum": 0,
-        "hint": "Maximum characters of memory context injected per user (0 = unlimited). Truncates by category priority when exceeded"
-    },
-    "inject_categories": {
-        "name": "Auto-injected categories",
-        "type": "list",
-        "default": ["basic"],
-        "hint": "Profile categories pushed into the system prompt every turn. Other categories stay queryable via memory_query(category=...). Use [\"*\"] to inject every category (legacy behaviour). Default: [\"basic\"]"
+        "hint": "Path to the skills directory. Defaults to data/skills/. Each skill is a subfolder containing SKILL.md (recommended) or manifest.json + instruction.md (legacy).",
+        "locales": {
+            "zh": {
+                "name": "技能目录",
+                "hint": "技能根目录，默认 data/skills/。每个技能是一个子文件夹，含 SKILL.md（推荐）或 manifest.json + instruction.md（旧格式）。"
+            }
+        }
     },
     "disabled_skills": {
         "name": "Disabled skills",
         "type": "list",
         "default": [],
-        "hint": "List of skill names to disable (won't be registered as LLM tools). Example: [\"tarot_reading\", \"daily_fortune\"]"
+        "hint": "List of skill names to disable (won't be registered as LLM tools). Example: [\"tarot_reading\"]",
+        "locales": {
+            "zh": {
+                "name": "已禁用的技能",
+                "hint": "不注册为 LLM 工具的技能名列表。例如：[\"tarot_reading\"]"
+            }
+        }
     },
     "enable_slash_commands": {
         "name": "Enable slash commands",
         "type": "switch",
         "default": false,
-        "hint": "Allow users to trigger skills via /command (e.g. /tarot, /fortune). When disabled, skills can only be triggered by LLM."
+        "hint": "Allow users to trigger skills via /command. When disabled, skills can only be triggered by the LLM.",
+        "locales": {
+            "zh": {
+                "name": "启用斜杠命令",
+                "hint": "允许用户通过 /command 触发技能；关闭时只能由 LLM 触发。"
+            }
+        }
     },
     "webui_port": {
         "name": "Memory WebUI port",
@@ -57,45 +197,36 @@
         "default": 0,
         "minimum": 0,
         "maximum": 65535,
-        "hint": "Port for the memory management WebUI (0 = disabled, valid range: 1-65535). Example: 8765"
+        "hint": "Port for the memory management WebUI (0 = disabled, valid range: 1-65535). Example: 8765",
+        "locales": {
+            "zh": {
+                "name": "记忆 WebUI 端口",
+                "hint": "记忆管理 WebUI 的端口（0 = 关闭，有效范围 1-65535）。例：8765"
+            }
+        }
     },
     "webui_host": {
         "name": "Memory WebUI host",
         "type": "string",
         "default": "127.0.0.1",
-        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access"
+        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access.",
+        "locales": {
+            "zh": {
+                "name": "记忆 WebUI 绑定地址",
+                "hint": "WebUI 监听地址。仅本机访问使用 127.0.0.1。"
+            }
+        }
     },
     "webui_token": {
         "name": "Memory WebUI token",
         "type": "string",
         "default": "",
-        "hint": "Access token for the memory WebUI (leave empty for no authentication, only safe for local access)"
-    },
-    "memory_auditor_enabled": {
-        "name": "Memory auditor (active recall)",
-        "type": "switch",
-        "default": false,
-        "hint": "Run a separate fast-LLM call after each turn to extract any facts the main LLM missed. Costs one extra LLM call per user batch. Default off — enable if your main LLM is too conservative about calling memory_update. ⚠️ Privacy: enabling this sends the user's latest message AND up to 50 of their existing profile entries (nicknames, locations, relationships, etc.) to the auditor model — which may be a different vendor than your main LLM if you set memory_auditor_model_uuid. Make sure that vendor's data-handling policy is acceptable before turning this on."
-    },
-    "memory_auditor_model_uuid": {
-        "name": "Memory auditor model",
-        "type": "model_select",
-        "model_type": "llm",
-        "default": "",
-        "hint": "Leave empty (recommended) to use the configured default fast LLM. Pick a specific model only when you want to pin the auditor to it."
-    },
-    "memory_auditor_skip_keywords": {
-        "name": "Memory auditor skip keywords",
-        "type": "list",
-        "default": ["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"],
-        "hint": "If the user's latest message contains any of these, the auditor skips that turn entirely (privacy guard for messages that shouldn't be recorded)."
-    },
-    "memory_auditor_max_inflight": {
-        "name": "Memory auditor max concurrent calls",
-        "type": "integer",
-        "default": 4,
-        "minimum": 1,
-        "maximum": 32,
-        "hint": "Maximum number of concurrent in-flight auditor LLM calls. When this many audits are already running, new turns are dropped (best-effort; auditor is an opt-in bonus layer). Lower = stricter, fewer rate-limit hits; higher = more thorough but more provider load."
+        "hint": "Access token for the memory WebUI (empty = no authentication; only safe for local access).",
+        "locales": {
+            "zh": {
+                "name": "记忆 WebUI 访问令牌",
+                "hint": "WebUI 的 Bearer 鉴权令牌；留空 = 不鉴权（仅本机访问时安全）。"
+            }
+        }
     }
 }

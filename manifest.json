@@ -1,8 +1,14 @@
 {
     "display_name": "KiraOS (Memory + Skills)",
     "plugin_id": "kira_plugin_kiraos",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "author": "LyaQanYi",
-    "description": "OS-level plugin combining SQLite user memory (per-user profiles & events) with a progressive skill router (manifest-based tool discovery, on-demand sub-agent execution). Memory is RAM, skills are programs.",
-    "repo": null
+    "description": "OS-level plugin combining a dual-brain memory subsystem (TOML tree + SQLite/FTS5 index, optional sqlite-vec, async hippocampus extractor, retention-decay GC, multi-entity profiles) with a progressive skill router (manifest-based tool discovery, on-demand sub-agent execution).",
+    "repo": null,
+    "locales": {
+        "zh": {
+            "display_name": "KiraOS（记忆 + 技能）",
+            "description": "OS 级插件：双脑记忆子系统（TOML 文件 + SQLite/FTS5 索引、可选 sqlite-vec、异步海马体提取、衰减 GC、多实体画像）+ 渐进式技能路由（按 manifest 发现工具、按需注入子代理指令）。"
+        }
+    }
 }

@@ -1,0 +1,675 @@
+"""
+TOML Tree Store — 基于文件树 + SQLite 索引的记忆存储引擎
+
+架构分离:
+- TOML 文件：人类可读的内容文件 → 真相源（用户可直接编辑）
+- SQLite（MemoryIndex）：运行时 meta（access_count、last_accessed 等）→ 索引与查询
+
+TOML 文件 Schema（扁平结构）:
+    # 语义注释
+    id = "hates_css"
+    type = "fact"
+    text = "用户讨厌写 CSS，觉得前端很烦"
+    importance = 6
+    tags = ["frontend", "preference"]
+
+    [source]
+    session = "telegram:pm:12345"
+    time = 2026-03-01T14:30:00+08:00
+
+兼容性:
+- Python 3.11+ → 内置 tomllib
+- Python 3.10  → tomli 回退
+- 写入统一使用 tomli_w
+"""
+
+import os
+import time
+import asyncio
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # Python 3.10 fallback
+
+import tomli_w
+
+from core.logging_manager import get_logger
+from .memory_paths import (
+    ENTITIES_DIR,
+    GLOBAL_DIR,
+    get_entity_folder,
+    ensure_entity_dirs,
+)
+from .memory_index import MemoryIndex
+
+logger = get_logger("kiraos_toml_store", "green")
+
+
+# ========== 数据模型 ==========
+
+
+@dataclass
+class Memory:
+    """一条记忆实体
+
+    TOML 文件存储: id, type, text, importance, tags, [source]
+    运行时 meta（access_count、last_accessed 等）由 SQLite 管理。
+    """
+
+    id: str  # 语义化 slug，如 "hates_css"
+    type: str  # fact | reflection
+    text: str = ""
+    importance: int = 5
+    tags: list = field(default_factory=list)
+    source: dict = field(default_factory=dict)
+
+    # 运行时 meta（来自 SQLite，不写入 TOML 文件）
+    meta: dict = field(default_factory=dict)
+
+    # 存储定位信息（不序列化）
+    _entity_id: str = field(default="", repr=False)
+    _entity_type: str = field(default="", repr=False)
+    _folder: str = field(default="", repr=False)
+    _base_dir: str = field(default="", repr=False)
+
+    # === 便捷属性（兼容旧接口） ===
+
+    @property
+    def raw_text(self) -> str:
+        return self.text
+
+    @property
+    def access_count(self) -> int:
+        return self.meta.get("access_count", 0)
+
+    @property
+    def last_accessed(self) -> float:
+        return self.meta.get("last_accessed", self.meta.get("timestamp", 0))
+
+    @property
+    def timestamp(self) -> float:
+        return self.meta.get("timestamp", 0)
+
+    @property
+    def file_path(self) -> str:
+        if self._base_dir:
+            d = self._base_dir
+            if self._folder:
+                d = os.path.join(d, self._folder)
+            return os.path.join(d, f"{self.id}.toml")
+        else:
+            d = get_entity_folder(self._entity_id, self._entity_type, self._folder)
+            return os.path.join(d, f"{self.id}.toml")
+
+    # === 序列化 ===
+
+    def to_toml_dict(self) -> dict:
+        """序列化为 TOML 文件格式（人类可读，无运行时 meta）"""
+        d = {
+            "id": self.id,
+            "type": self.type,
+            "text": self.text,
+            "importance": self.importance,
+            "tags": self.tags,
+        }
+        if self.source:
+            d["source"] = self.source
+        return d
+
+    def to_full_dict(self) -> dict:
+        """序列化为完整格式（含运行时 meta，用于归档/API）"""
+        d = self.to_toml_dict()
+        d["meta"] = self.meta
+        return d
+
+    @classmethod
+    def from_toml_dict(
+        cls, data: dict, runtime_meta: dict = None, **location_kwargs
+    ) -> "Memory":
+        """从 TOML 文件数据 + SQLite 运行时 meta 反序列化"""
+        return cls(
+            id=data.get("id", ""),
+            type=data.get("type", "fact"),
+            text=data.get("text", ""),
+            importance=max(1, min(10, data.get("importance", 5))),
+            tags=data.get("tags", []),
+            source=data.get("source", {}),
+            meta=runtime_meta or {},
+            **location_kwargs,
+        )
+
+    @classmethod
+    def from_legacy_json(cls, data: dict, **location_kwargs) -> "Memory":
+        """兼容旧 JSON 格式（迁移用）"""
+        meta = data.get("meta", {})
+        content = data.get("content", {})
+        return cls(
+            id=data.get("id", ""),
+            type=data.get("type", "fact"),
+            text=content.get("raw_text", ""),
+            importance=meta.get("importance", 5),
+            tags=meta.get("tags", []),
+            source=meta.get("source", {}),
+            meta=meta,
+            **location_kwargs,
+        )
+
+    def touch_access(self):
+        """标记一次访问"""
+        self.meta["access_count"] = self.access_count + 1
+        self.meta["last_accessed"] = time.time()
+
+
+# ========== 存储引擎 ==========
+
+
+class TomlTreeStore:
+    """基于 TOML 文件 + SQLite 索引的记忆管理系统
+
+    TOML 文件: 人类可读的内容（id, type, text, importance, tags, [source]）
+    SQLite: 运行时 meta + FTS5 全文索引 + 可选向量索引
+    """
+
+    def __init__(self, index: MemoryIndex = None):
+        os.makedirs(ENTITIES_DIR, exist_ok=True)
+        os.makedirs(GLOBAL_DIR, exist_ok=True)
+
+        self.index = index or MemoryIndex()
+
+        # 读写锁 per 目录
+        self._locks: Dict[str, asyncio.Lock] = {}
+        logger.info("TomlTreeStore initialized (TOML files + SQLite index)")
+
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+
+    @staticmethod
+    def _resolve_dir(
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> str:
+        if base_dir:
+            d = base_dir
+            if folder:
+                d = os.path.join(d, folder)
+            return d
+        else:
+            return get_entity_folder(entity_id, entity_type, folder)
+
+    @staticmethod
+    def _cache_key(
+        entity_id: str = "", entity_type: str = "", folder: str = "", base_dir: str = ""
+    ) -> str:
+        if base_dir:
+            return f"global:{base_dir}:{folder}"
+        return f"{entity_type}:{entity_id}:{folder}"
+
+    # ==========================================
+    # CRUD 操作
+    # ==========================================
+
+    async def add_memory(
+        self,
+        content_text: str,
+        memory_type: str = "fact",
+        importance: int = 5,
+        tags: list = None,
+        source: dict = None,
+        semantic_id: str = "",
+        entity_id: str = "",
+        entity_type: str = "user",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> Memory:
+        """写入一条新的记忆
+
+        Args:
+            semantic_id: 语义化 ID（如 "hates_css"），空则自动生成
+        """
+        now = time.time()
+        mem_id = semantic_id if semantic_id else self._generate_fallback_id(content_text)
+
+        source_data = source or {}
+        if "time" not in source_data:
+            source_data["time"] = datetime.now(timezone.utc).isoformat()
+
+        memory = Memory(
+            id=mem_id,
+            type=memory_type,
+            text=content_text,
+            importance=max(1, min(10, importance)),
+            tags=tags or [],
+            source=source_data,
+            meta={
+                "importance": max(1, min(10, importance)),
+                "timestamp": now,
+                "access_count": 0,
+                "last_accessed": now,
+                "tags": tags or [],
+                "source": source_data,
+            },
+            _entity_id=entity_id,
+            _entity_type=entity_type,
+            _folder=folder,
+            _base_dir=base_dir,
+        )
+
+        # 确保目录存在
+        if not base_dir and entity_id:
+            ensure_entity_dirs(entity_id, entity_type)
+
+        lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
+        async with self._get_lock(lock_key):
+            # 1. 写 TOML 文件（人类可读内容）
+            await asyncio.to_thread(self._sync_write_toml, memory)
+
+            # 2. 写 SQLite 索引（运行时 meta + 全文）
+            await asyncio.to_thread(
+                self.index.upsert,
+                memory_id=mem_id,
+                raw_text=content_text,
+                memory_type=memory_type,
+                importance=memory.importance,
+                tags=memory.tags,
+                source=source_data,
+                entity_id=entity_id,
+                entity_type=entity_type,
+                folder=folder,
+                base_dir=base_dir,
+                file_path=memory.file_path,
+                timestamp=now,
+                last_accessed=now,
+                access_count=0,
+            )
+
+        logger.debug(
+            f"Memory added: type={memory_type}, id={mem_id}, "
+            f"entity={entity_type}:{entity_id}, folder={folder}"
+        )
+        return memory
+
+    async def update_memory(self, memory: Memory) -> bool:
+        """更新记忆（TOML 文件内容 + 索引 meta）"""
+        lock_key = self._cache_key(
+            memory._entity_id, memory._entity_type, memory._folder, memory._base_dir
+        )
+        async with self._get_lock(lock_key):
+            try:
+                # 1. 更新 TOML 文件
+                await asyncio.to_thread(self._sync_write_toml, memory)
+
+                # 2. 更新索引
+                await asyncio.to_thread(
+                    self.index.upsert,
+                    memory_id=memory.id,
+                    raw_text=memory.text,
+                    memory_type=memory.type,
+                    importance=memory.importance,
+                    tags=memory.tags,
+                    source=memory.source,
+                    entity_id=memory._entity_id,
+                    entity_type=memory._entity_type,
+                    folder=memory._folder,
+                    base_dir=memory._base_dir,
+                    file_path=memory.file_path,
+                    timestamp=memory.timestamp,
+                    last_accessed=memory.last_accessed,
+                    access_count=memory.access_count,
+                )
+                return True
+            except Exception as e:
+                logger.error(f"Failed to update memory {memory.id}: {e}")
+                return False
+
+    async def get_memory(
+        self,
+        memory_id: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> Optional[Memory]:
+        """精确获取一条记忆（TOML 文件内容 + 索引 meta）"""
+        d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
+        fpath = os.path.join(d, f"{memory_id}.toml")
+
+        if not os.path.exists(fpath):
+            return None
+
+        try:
+            # 读 TOML 文件内容
+            file_data = await asyncio.to_thread(self._sync_read_toml, fpath)
+
+            # 读索引 meta
+            idx_meta = await asyncio.to_thread(self.index.get_meta, memory_id)
+            runtime_meta = {}
+            if idx_meta:
+                runtime_meta = {
+                    "importance": idx_meta.get("importance", 5),
+                    "timestamp": idx_meta.get("timestamp", 0),
+                    "access_count": idx_meta.get("access_count", 0),
+                    "last_accessed": idx_meta.get("last_accessed", 0),
+                    "tags": idx_meta.get("tags", []),
+                    "source": idx_meta.get("source", {}),
+                }
+
+            return Memory.from_toml_dict(
+                file_data,
+                runtime_meta=runtime_meta,
+                _entity_id=entity_id,
+                _entity_type=entity_type,
+                _folder=folder,
+                _base_dir=base_dir,
+            )
+        except Exception as e:
+            logger.error(f"Read memory error {memory_id}: {e}")
+            return None
+
+    async def delete_memory(
+        self,
+        memory_id: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> bool:
+        """物理删除一条记忆（文件 + 索引）"""
+        d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
+        fpath = os.path.join(d, f"{memory_id}.toml")
+
+        lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
+        async with self._get_lock(lock_key):
+            try:
+                if os.path.exists(fpath):
+                    await asyncio.to_thread(os.remove, fpath)
+                await asyncio.to_thread(self.index.delete, memory_id)
+                logger.debug(f"Memory deleted: {memory_id}")
+                return True
+            except Exception as e:
+                logger.error(f"Delete memory error {memory_id}: {e}")
+        return False
+
+    async def archive_memory(
+        self,
+        memory_id: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> bool:
+        """将记忆移入归档目录（TOML 格式，含完整 meta 方便恢复）"""
+        from .memory_paths import get_archive_dir
+
+        memory = await self.get_memory(memory_id, entity_id, entity_type, folder, base_dir)
+        if not memory:
+            return False
+
+        archive_dir = get_archive_dir()
+        os.makedirs(archive_dir, exist_ok=True)
+        archive_path = os.path.join(archive_dir, f"{memory_id}.toml")
+
+        try:
+            # 归档时写入完整数据（含 meta，方便恢复）
+            full_data = memory.to_full_dict()
+            await asyncio.to_thread(self._sync_write_toml_to_path, full_data, archive_path)
+            await self.delete_memory(memory_id, entity_id, entity_type, folder, base_dir)
+            logger.debug(f"Memory archived: {memory_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Archive memory error {memory_id}: {e}")
+            return False
+
+    async def get_all_memories(
+        self,
+        entity_id: str = "",
+        entity_type: str = "user",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> List[Memory]:
+        """获取指定目录下所有记忆"""
+        d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
+        if not os.path.exists(d):
+            return []
+
+        def _scan():
+            mems = []
+            for fname in os.listdir(d):
+                if not fname.endswith(".toml"):
+                    continue
+                fpath = os.path.join(d, fname)
+                try:
+                    data = self._sync_read_toml(fpath)
+                    mem_id = data.get("id", fname[:-5])  # strip .toml
+
+                    # 从索引读 runtime meta
+                    idx_meta = self.index.get_meta(mem_id)
+                    runtime_meta = {}
+                    if idx_meta:
+                        runtime_meta = {
+                            "importance": idx_meta.get("importance", 5),
+                            "timestamp": idx_meta.get("timestamp", 0),
+                            "access_count": idx_meta.get("access_count", 0),
+                            "last_accessed": idx_meta.get("last_accessed", 0),
+                            "tags": idx_meta.get("tags", []),
+                            "source": idx_meta.get("source", {}),
+                        }
+
+                    mems.append(
+                        Memory.from_toml_dict(
+                            data,
+                            runtime_meta=runtime_meta,
+                            _entity_id=entity_id,
+                            _entity_type=entity_type,
+                            _folder=folder,
+                            _base_dir=base_dir,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load {fpath}: {e}")
+            return mems
+
+        return await asyncio.to_thread(_scan)
+
+    # ==========================================
+    # 检索（委托给 MemoryIndex）
+    # ==========================================
+
+    async def search(
+        self,
+        query: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        folder: str = "facts",
+        base_dir: str = "",
+        k: int = 5,
+        update_access: bool = False,
+        query_embedding: list = None,
+    ) -> List[Memory]:
+        """混合检索（FTS5 + 可选向量）"""
+        results = await asyncio.to_thread(
+            self.index.hybrid_search,
+            query=query,
+            query_embedding=query_embedding,
+            entity_id=entity_id,
+            entity_type=entity_type,
+            folder=folder,
+            base_dir=base_dir,
+            k=k,
+        )
+
+        if not results:
+            return []
+
+        memories = []
+        for r in results:
+            mem = Memory(
+                id=r["id"],
+                type=r.get("memory_type", "fact"),
+                text=r.get("raw_text", ""),
+                importance=r.get("importance", 5),
+                tags=r.get("tags", []),
+                source=r.get("source", {}),
+                meta={
+                    "importance": r.get("importance", 5),
+                    "timestamp": r.get("timestamp", 0),
+                    "access_count": r.get("access_count", 0),
+                    "last_accessed": r.get("last_accessed", 0),
+                    "tags": r.get("tags", []),
+                    "source": r.get("source", {}),
+                },
+                _entity_id=entity_id or r.get("entity_id", ""),
+                _entity_type=entity_type or r.get("entity_type", ""),
+                _folder=folder or r.get("folder", ""),
+                _base_dir=base_dir or r.get("base_dir", ""),
+            )
+
+            # 尝试从 TOML 文件加载完整内容（可能有用户手动编辑的注释等）
+            fpath = r.get("file_path", "") or mem.file_path
+            if fpath and os.path.exists(fpath):
+                try:
+                    file_data = self._sync_read_toml(fpath)
+                    mem.text = file_data.get("text", mem.text)
+                    mem.tags = file_data.get("tags", mem.tags)
+                    mem.importance = file_data.get("importance", mem.importance)
+                except Exception:
+                    pass
+
+            memories.append(mem)
+
+        if update_access:
+            for mem in memories:
+                mem.touch_access()
+                await asyncio.to_thread(self.index.touch_access, mem.id)
+
+        return memories
+
+    async def search_across_folders(
+        self,
+        query: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        folders: list = None,
+        k: int = 5,
+        query_embedding: list = None,
+    ) -> List[Memory]:
+        """跨多个目录检索，合并排序"""
+        if folders is None:
+            folders = ["facts", "reflections"]
+
+        all_results = []
+        for folder in folders:
+            results = await self.search(
+                query=query,
+                entity_id=entity_id,
+                entity_type=entity_type,
+                folder=folder,
+                k=k,
+                query_embedding=query_embedding,
+            )
+            all_results.extend(results)
+
+        import math
+        now = time.time()
+        all_results.sort(
+            key=lambda m: m.importance * 0.6
+            + math.exp(-(now - m.last_accessed) / 86400 / 30.0) * 0.4,
+            reverse=True,
+        )
+        return all_results[:k]
+
+    # ==========================================
+    # 索引管理
+    # ==========================================
+
+    async def rebuild_index(self):
+        """从文件系统重建 SQLite 索引（灾难恢复）"""
+        from .memory_paths import MEMORY_ROOT
+        await asyncio.to_thread(self.index.rebuild_index_from_files, MEMORY_ROOT)
+        logger.info("Index rebuilt from files")
+
+    async def ensure_indexed(self, memory: Memory):
+        """确保单条记忆在索引中（用于旧文件迁移）"""
+        existing = await asyncio.to_thread(self.index.get_meta, memory.id)
+        if not existing:
+            await asyncio.to_thread(
+                self.index.upsert,
+                memory_id=memory.id,
+                raw_text=memory.text,
+                memory_type=memory.type,
+                importance=memory.importance,
+                tags=memory.tags,
+                source=memory.source,
+                entity_id=memory._entity_id,
+                entity_type=memory._entity_type,
+                folder=memory._folder,
+                base_dir=memory._base_dir,
+                file_path=memory.file_path,
+                timestamp=memory.timestamp,
+                last_accessed=memory.last_accessed,
+                access_count=memory.access_count,
+            )
+
+    # ==========================================
+    # TOML 读写内部方法
+    # ==========================================
+
+    @staticmethod
+    def _sync_write_toml(memory: Memory):
+        """写入 TOML 文件（人类可读内容，无运行时 meta）"""
+        fpath = memory.file_path
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        data = memory.to_toml_dict()
+        with open(fpath, "wb") as f:
+            tomli_w.dump(data, f)
+
+    @staticmethod
+    def _sync_read_toml(fpath: str) -> dict:
+        """读取 TOML 文件"""
+        with open(fpath, "rb") as f:
+            return tomllib.load(f)
+
+    @staticmethod
+    def _sync_write_toml_to_path(data: dict, fpath: str):
+        """写入 TOML 到指定路径"""
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        # 过滤掉 None 值（TOML 不支持）
+        clean = _clean_for_toml(data)
+        with open(fpath, "wb") as f:
+            tomli_w.dump(clean, f)
+
+    @staticmethod
+    def _generate_fallback_id(text: str) -> str:
+        """当 LLM 未生成语义 ID 时的回退策略：从文本中提取关键词"""
+        import hashlib
+        # 取前 8 字符的 hash 作为回退
+        h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+        # 尝试从文本中提取简短关键词
+        cleaned = text.strip()[:20].replace(" ", "_").replace("/", "_")
+        # 只保留安全字符
+        safe = "".join(c for c in cleaned if c.isalnum() or c in ("_", "-"))
+        if safe:
+            return f"{safe}_{h}"
+        return f"mem_{h}"
+
+
+def _clean_for_toml(data: dict) -> dict:
+    """递归清理字典，移除 TOML 不支持的类型（None 等）"""
+    clean = {}
+    for k, v in data.items():
+        if v is None:
+            continue
+        elif isinstance(v, dict):
+            clean[k] = _clean_for_toml(v)
+        elif isinstance(v, (list, tuple)):
+            clean[k] = [_clean_for_toml(i) if isinstance(i, dict) else i for i in v if i is not None]
+        else:
+            clean[k] = v
+    return clean
