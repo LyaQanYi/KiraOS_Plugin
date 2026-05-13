@@ -1,9 +1,17 @@
 """
 KiraOS Plugin — Combines two OS-level capabilities:
 
-  1. **User Memory (SQLite)**: Per-user profile & event persistence with
-     category-aware injection. Tools: memory_update, memory_query, memory_clear.
-     Hook: auto-inject filtered memory context into the system prompt.
+  1. **Dual-Brain Memory (TOML + SQLite)**: Two-tier memory engine. Fast loop
+     (FTS5 retrieval with jieba CJK tokenizer + optional sqlite-vec embeddings)
+     serves the LLM in real time; slow loop (hippocampus) runs as a background
+     asyncio task after every few turns to extract facts, deduplicate, generate
+     reflections, and update profiles. TOML files are the source of truth,
+     SQLite is a rebuildable index.
+
+     Tools: memory_add, memory_search, memory_update_entry, memory_remove,
+            profile_view, profile_update.
+     Hook:  inject distilled profile + recalled memories into the system
+            prompt; feed each user/assistant chunk into the hippocampus buffer.
 
   2. **Skill Router (Progressive Disclosure)**: scans `data/skills/` for skill
      folders, each in either:
@@ -13,14 +21,10 @@ KiraOS Plugin — Combines two OS-level capabilities:
      tool result so the main LLM follows the instructions in the SAME tool-loop
      turn — zero extra LLM API calls. A skill folder may also bundle resource
      files under `references/`, `resources/`, `scripts/`, or `data/`; the LLM
-     pulls these on demand via the `read_skill_resource` tool, giving a third
-     tier of progressive disclosure for long/complex skills.
+     pulls these on demand via the `read_skill_resource` tool.
 """
 
 import asyncio
-import hashlib
-import json
-import re
 from typing import Optional
 
 from core.plugin import BasePlugin, logger, on, Priority, register_tool
@@ -38,48 +42,6 @@ from .embeddings import EmbeddingService
 from .recall import MemoryRecaller, RecallConfig
 from .skill_router import SkillRouter, SkillInfo
 
-# ────────────────────────────────────────────────────────────────────
-#  Auditor (Active Recall) — prompt template
-# ────────────────────────────────────────────────────────────────────
-
-AUDITOR_SYSTEM_PROMPT = """\
-你是一个用户记忆提取助手。从【最新用户消息】中提取所有应当长期记忆的事实信息。
-
-【硬性规则】
-1. 只提取关于"用户自己"的事实信息（身份/地点/职业/关系/偏好/经历）
-2. 跳过：纯客套话、玩笑、抱怨/venting、否定句、用户明确说"别记"/"忘了它"
-3. 跳过：当前已知信息中已有相同 key 且 value 一致的条目（避免重复写）
-4. 输出**严格的 JSON 数组**，无任何额外文本、不要 markdown 代码块包裹
-5. 没有可记的就输出 `[]`
-
-【输出格式】
-[
-  {"key": "<short_chinese_key>", "value": "<concise_value>",
-   "category": "basic|preference|social|other",
-   "confidence": 0.0-1.0}
-]
-
-【字段含义】
-- category: basic(基本身份,如昵称/城市/职业)、preference(喜好)、social(关系)、other(其他)
-- confidence: 0.8+ = 用户明确陈述; 0.5-0.7 = 推断或语境暗示; 不要低于 0.5
-
-只输出 JSON，禁止任何解释、寒暄、markdown。"""
-
-
-def _strip_json_fence(text: str) -> str:
-    """Strip a leading ``` or ```json fence and trailing ``` if present."""
-    if not text:
-        return ""
-    s = text.strip()
-    # Remove leading fence
-    m = re.match(r"^```(?:json)?\s*\n?", s, flags=re.IGNORECASE)
-    if m:
-        s = s[m.end():]
-    # Remove trailing fence
-    if s.endswith("```"):
-        s = s[: -3].rstrip()
-    return s
-
 # ════════════════════════════════════════════════════════════════════
 #  Prompt Fragments
 # ════════════════════════════════════════════════════════════════════
@@ -88,11 +50,47 @@ SKILL_FEW_SHOT_HEADER = "技能工具（调用后按返回的指令执行）: "
 
 
 # ════════════════════════════════════════════════════════════════════
+#  LLM Client Adapter
+# ════════════════════════════════════════════════════════════════════
+#
+# 内部的 MemoryExtractor 用 messages-list 风格调用 LLM：
+#   await client.chat([{"role": "user", "content": ...}]) -> obj.text_response
+# 而 KiraAI 的 LLMModelClient 的实际签名是
+#   await client.chat(LLMRequest) -> LLMResponse (带 .text_response)
+# 这个小 adapter 把两套对接起来。多支持一个 .chat_fast() 让海马体可以用 fast
+# LLM 跑提取（成本更低、延迟更小），不存在则回退到 default。
+
+class _MemoryLLMAdapter:
+    """把 messages-list 风格的 chat 调用适配到 KiraAI 的 chat(LLMRequest)。"""
+
+    def __init__(self, default_client, fast_client=None):
+        self._default = default_client
+        self._fast = fast_client or default_client
+
+    async def chat(self, messages: list):
+        req = LLMRequest(messages=list(messages))
+        return await self._default.chat(req)
+
+    async def chat_fast(self, messages: list):
+        req = LLMRequest(messages=list(messages))
+        return await self._fast.chat(req)
+
+
+MEMORY_ACTIVE_RECALL_HINT = (
+    "📝 本轮检查：如果用户提到任何关于自身的事实信息（姓名/地点/职业/关系/偏好/经历），"
+    "主动调用 memory_add 记录；如果需要回忆过往，调用 memory_search。"
+    "宁记错不漏过——低置信度会被后续高置信度自动合并。"
+)
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Plugin Class
 # ════════════════════════════════════════════════════════════════════
 
 class UserMemoryPlugin(BasePlugin):
-    """KiraOS Plugin — Memory + Skill Router."""
+    """KiraOS Plugin — Dual-Brain Memory + Skill Router."""
+
+    BUILTIN_MEMORY_PLUGIN_ID = "kira_plugin_simple_memory"
 
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
@@ -201,7 +199,7 @@ class UserMemoryPlugin(BasePlugin):
         skills_dir = cfg.get("skills_dir", "") or str(get_data_path() / "skills")
         self.skill_router = SkillRouter(skills_dir)
         self._registered_skill_names: list[str] = []
-        self._disabled_skills: set[str] = set(cfg.get("disabled_skills", []))
+        self._disabled_skills: set = set(cfg.get("disabled_skills", []))
         self._command_map: dict[str, SkillInfo] = {}
         self._enable_slash_commands: bool = bool(cfg.get("enable_slash_commands", False))
         self._resource_tool_registered: bool = False
@@ -212,51 +210,9 @@ class UserMemoryPlugin(BasePlugin):
         self._webui_token = str(cfg.get("webui_token", ""))
         self._webui_server: object | None = None
 
-        # ── Auditor (active recall) config ──────────────────────────
-        # When enabled, an extra fast-LLM pass runs after each turn to extract
-        # facts the main LLM may have missed. Sees the latest user message,
-        # the assistant's just-now reply, and the user's existing profile.
-        self._auditor_enabled: bool = bool(cfg.get("memory_auditor_enabled", False))
-        self._auditor_model_uuid: str = str(cfg.get("memory_auditor_model_uuid", "") or "")
-        raw_skip = cfg.get("memory_auditor_skip_keywords")
-        if raw_skip is None:
-            raw_skip = ["别记", "忘了它", "随便说说", "随便聊", "开玩笑", "假设说", "假如", "假设"]
-        if isinstance(raw_skip, str):
-            raw_skip = [s.strip() for s in raw_skip.split(",") if s.strip()]
-        self._auditor_skip_keywords: list[str] = list(raw_skip) if isinstance(raw_skip, list) else []
-        # Per-event dedup: each batch event is audited at most once even if
-        # @on.step_result fires multiple times for it (multi-step tool loops).
-        self._audited_event_ids: set[int] = set()
-        # Bounded so a long-running session doesn't grow this set without limit;
-        # purely defensive — id() values are reused after GC anyway.
-        self._max_audit_dedup_size = 10_000
-        # Strong references to in-flight auditor tasks. asyncio.create_task
-        # only keeps weak references in the event loop, so a task with no
-        # external reference can be garbage-collected mid-execution and
-        # silently disappear. We park each task here and remove it when done.
-        self._auditor_tasks: set[asyncio.Task] = set()
-        # Cap concurrent in-flight auditor calls so a traffic spike can't
-        # pile up dozens of pending fast-LLM requests, slow down shutdown,
-        # or trigger provider rate limits. Above this threshold new audits
-        # are dropped (best-effort behaviour — auditor is already an opt-in
-        # bonus layer, missing one turn is fine).
-        # Clamp on **both** ends: schema.json declares max=32, but a hand-
-        # edited config file would bypass that. Belt-and-suspenders here so
-        # one misconfigured user can't overload the provider.
-        try:
-            _raw_inflight = int(cfg.get("memory_auditor_max_inflight", 4))
-        except (TypeError, ValueError):
-            _raw_inflight = 4
-        self._auditor_max_inflight: int = max(1, min(32, _raw_inflight))
-        # Belt-and-suspenders: a Semaphore around the actual LLM call so any
-        # future caller of _run_auditor() (not just schedule_audit) is also
-        # bounded.
-        self._auditor_semaphore: Optional[asyncio.Semaphore] = None
-        # Confidence ceiling for auditor writes — keeps the main LLM's
-        # high-confidence judgements authoritative when both sides write
-        # the same key. M6 conflict-detection enforces this naturally:
-        # a 0.9 (main LLM) value won't be overwritten by 0.6 (auditor).
-        self._auditor_confidence_cap: float = 0.7
+        # Tools registered dynamically via ctx.llm_api (not via @register_tool)
+        # so we can pass them the memory_manager handle through closure.
+        self._registered_memory_tool_names: list[str] = []
 
     # ════════════════════════════════════════════════════════════════
     #  Lifecycle
@@ -336,26 +292,21 @@ class UserMemoryPlugin(BasePlugin):
         else:
             logger.info("No skills found (place skill folders in data/skills/)")
 
-        # Only advertise the resource-tier tool when at least one registered
-        # skill ships bundled resources — otherwise it'd be dead weight.
         if any_with_resources:
             self._register_resource_tool()
 
         # ── Start Memory WebUI ──────────────────────────────────────
-        if self._webui_port > 0 and self.db:
+        if self._webui_port > 0 and self.memory_manager:
             from .web_server import WebUIServer
             self._webui_server = WebUIServer(
-                db=self.db,
+                memory_manager=self.memory_manager,
                 host=self._webui_host,
                 port=self._webui_port,
                 token=self._webui_token,
-                max_event_keep=self.max_event_keep,
             )
             await self._webui_server.start()
 
-        logger.info("KiraOS plugin initialized (memory + skill router)")
-
-    BUILTIN_MEMORY_PLUGIN_ID = "kira_plugin_simple_memory"
+        logger.info("KiraOS plugin initialized (dual-brain memory + skill router)")
 
     async def _disable_builtin_memory(self):
         """Auto-detect and disable the builtin Simple Memory plugin to prevent conflicts."""
@@ -432,7 +383,10 @@ class UserMemoryPlugin(BasePlugin):
 
     async def terminate(self):
         if self._webui_server:
-            await self._webui_server.stop()
+            try:
+                await self._webui_server.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop WebUI server: {e}")
             self._webui_server = None
 
         # Stop the auto-promote tick first so it doesn't try to write
@@ -470,34 +424,33 @@ class UserMemoryPlugin(BasePlugin):
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*pending, return_exceptions=True),
-                    timeout=5.0,
+                    timeout=30.0,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[auditor] {len(pending)} background task(s) still pending at shutdown; cancelling"
+                    f"[hippocampus] {len(pending)} background task(s) still pending "
+                    "at shutdown; cancelling"
                 )
                 for t in pending:
                     if not t.done():
                         t.cancel()
-                # ``Task.cancel()`` only *requests* cancellation — the task may
-                # still be running its except/finally blocks (and could touch
-                # the DB) until it actually yields. Wait for them to exit
-                # cleanly before we proceed to ``self.db.close()``, otherwise
-                # an in-flight auditor write can race with database teardown.
-                # ``return_exceptions=True`` so a CancelledError doesn't fail
-                # the gather; another short timeout caps the worst case.
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*pending, return_exceptions=True),
                         timeout=2.0,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[auditor] {sum(1 for t in pending if not t.done())} "
-                        "task(s) did not exit after cancel(); leaking — DB close may race"
-                    )
-            self._auditor_tasks.clear()
+                    logger.warning("[hippocampus] some tasks did not exit after cancel()")
 
+        # Unregister memory tools
+        for name in self._registered_memory_tool_names:
+            try:
+                self.ctx.llm_api.unregister_tool(name)
+            except Exception as e:
+                logger.warning(f"Failed to unregister tool '{name}': {e}")
+        self._registered_memory_tool_names.clear()
+
+        # Unregister skill tools
         for name in self._registered_skill_names:
             try:
                 self.ctx.llm_api.unregister_tool(name)
@@ -512,10 +465,58 @@ class UserMemoryPlugin(BasePlugin):
                 logger.warning(f"Failed to unregister read_skill_resource: {e}")
             self._resource_tool_registered = False
 
-        if self.db:
-            self.db.close()
-        self.db = None
+        self.memory_manager = None
         logger.info("KiraOS plugin terminated")
+
+    # ════════════════════════════════════════════════════════════════
+    #  Memory — Tool registration
+    # ════════════════════════════════════════════════════════════════
+
+    def _register_memory_tools(self):
+        """Register the 6 dual-brain memory tools as LLM tools.
+
+        Each tool's executor closes over ``self`` so it can reach the
+        memory_manager handle bound in ``initialize()``.
+        """
+        plugin = self
+
+        async def _add(event, *_, **kwargs) -> str:
+            return await memory_tools.memory_add(plugin.memory_manager, event, **kwargs)
+
+        async def _search(event, *_, **kwargs) -> str:
+            return await memory_tools.memory_search(plugin.memory_manager, event, **kwargs)
+
+        async def _update(event, *_, **kwargs) -> str:
+            return await memory_tools.memory_update_entry(plugin.memory_manager, event, **kwargs)
+
+        async def _remove(event, *_, **kwargs) -> str:
+            return await memory_tools.memory_remove(plugin.memory_manager, event, **kwargs)
+
+        async def _profile_view(event, *_, **kwargs) -> str:
+            return await memory_tools.profile_view(plugin.memory_manager, event, **kwargs)
+
+        async def _profile_update(event, *_, **kwargs) -> str:
+            return await memory_tools.profile_update(plugin.memory_manager, event, **kwargs)
+
+        bindings = [
+            ("memory_add", _add),
+            ("memory_search", _search),
+            ("memory_update_entry", _update),
+            ("memory_remove", _remove),
+            ("profile_view", _profile_view),
+            ("profile_update", _profile_update),
+        ]
+        for tool_name, executor in bindings:
+            schema = memory_tools.TOOL_SCHEMAS[tool_name]
+            self.ctx.llm_api.register_tool(
+                name=tool_name,
+                description=schema["description"],
+                parameters=schema["params"],
+                func=executor,
+            )
+            self._registered_memory_tool_names.append(tool_name)
+
+        logger.info(f"Registered memory tools: {self._registered_memory_tool_names}")
 
     # ════════════════════════════════════════════════════════════════
     #  Skill Router
@@ -534,12 +535,7 @@ class UserMemoryPlugin(BasePlugin):
         self._registered_skill_names.append(skill.name)
 
     def _execute_skill(self, skill: SkillInfo, event: KiraMessageBatchEvent, **kwargs) -> str:
-        """Load instruction (with substitution + exclude guard) and return as tool_result.
-
-        Mirrors Claude's Skill pattern: the skill body is injected just-in-time
-        as the tool's return value, so the main LLM "learns" the skill on the
-        fly without a separate API call.
-        """
+        """Load instruction (with substitution + exclude guard) and return as tool_result."""
         logger.info(f"Loading skill '{skill.name}' instruction (args: {kwargs})")
 
         instruction = self.skill_router.build_instruction_prompt(skill, kwargs)
@@ -550,7 +546,6 @@ class UserMemoryPlugin(BasePlugin):
         parts.append(f"<skill name=\"{skill.name}\">")
         parts.append(instruction)
 
-        # If the skill bundles resource files, point the LLM at them.
         if skill.has_resources():
             resources = self.skill_router.list_resources(skill)
             if resources:
@@ -561,19 +556,6 @@ class UserMemoryPlugin(BasePlugin):
                     f"read_skill_resource(skill_name=\"{skill.name}\", path=\"...\") 读取：\n"
                     f"{listed}{more}\n</resources>"
                 )
-
-        # Optionally include user memory for context-aware skill execution
-        user_id = self._get_primary_user_id(event)
-        if self.db and user_id != "unknown":
-            mem_ctx = self.db.build_user_context(
-                user_id,
-                max_events=3,
-                max_chars=self.max_context_chars,
-                inject_categories=self.inject_categories,
-                hint_other_categories=False,
-            )
-            if mem_ctx:
-                parts.append(f"\n<context>\n{mem_ctx}\n</context>")
 
         parts.append("</skill>")
         parts.append("请严格按照上述技能指令执行，直接输出执行结果。")
@@ -637,7 +619,6 @@ class UserMemoryPlugin(BasePlugin):
                     any_with_resources = True
         self._command_map = self.skill_router.get_commands(enabled_only=set(self._registered_skill_names))
 
-        # Sync resource tool registration with whether any skill needs it
         if any_with_resources and not self._resource_tool_registered:
             self._register_resource_tool()
         elif not any_with_resources and self._resource_tool_registered:
@@ -681,7 +662,7 @@ class UserMemoryPlugin(BasePlugin):
         logger.info(f"Slash command '{cmd}' matched skill '{skill.name}'")
 
     # ════════════════════════════════════════════════════════════════
-    #  Memory — helpers
+    #  Helpers
     # ════════════════════════════════════════════════════════════════
 
     @staticmethod
@@ -705,219 +686,30 @@ class UserMemoryPlugin(BasePlugin):
         return "unknown"
 
     @staticmethod
-    def _coerce_bool(raw) -> Optional[bool]:
-        """Strict-ish boolean coercion for LLM-supplied values.
+    def _extract_latest_user_text(event: KiraMessageBatchEvent) -> str:
+        """Concatenate the text of the most recent user message."""
+        try:
+            from core.chat.message_elements import Text
+        except ImportError:
+            Text = None
 
-        Returns the parsed bool, or ``None`` for anything we refuse to guess at
-        (so callers can surface the rejection back to the LLM instead of
-        silently picking ``True``).
+        if not event.messages:
+            return ""
+        last = event.messages[-1]
+        parts = []
+        try:
+            chain = last.message.chain
+        except AttributeError:
+            return ""
+        for elem in chain:
+            if Text is not None and isinstance(elem, Text):
+                parts.append(elem.text)
+            elif hasattr(elem, "text"):
+                parts.append(getattr(elem, "text", ""))
+        return " ".join(p for p in parts if p).strip()
 
-        Accepts: ``True``/``False`` (Python bool), strings ``"true"``/``"false"``
-        / ``"1"``/``"0"`` / ``"yes"``/``"no"`` (case-insensitive), and ``None``
-        as ``False``. Anything else (numbers other than 0/1, weird strings,
-        objects) yields ``None``.
-        """
-        if raw is None:
-            return False
-        if isinstance(raw, bool):
-            return raw
-        if isinstance(raw, (int, float)) and raw in (0, 1):
-            return bool(raw)
-        if isinstance(raw, str):
-            s = raw.strip().lower()
-            if s in ("true", "1", "yes"):
-                return True
-            if s in ("false", "0", "no", ""):
-                return False
-        return None
-
-    # ════════════════════════════════════════════════════════════════
-    #  Memory — Tools
-    # ════════════════════════════════════════════════════════════════
-
-    @register_tool(
-        name="memory_update",
-        description=(
-            "用户每次发言后必检：若提到任何关于'用户自己'的事实信息，立即调用本工具记录。"
-            "常见触发词（看到任一就记，宁记错不漏过）："
-            " 身份: 我叫/我是/我姓/年龄/性别/生日/星座; "
-            " 地点: 在/住在/来自/老家/工作地; "
-            " 职业: 工作/学校/专业/职位/行业; "
-            " 关系: 男友/女友/老公/老婆/家人/宠物; "
-            " 偏好: 喜欢/讨厌/爱吃/不吃/口味/兴趣; "
-            " 经历: 刚才/今天/昨天/最近/上周做了 X。"
-            "判断标准: 信息'明天再聊还希望你记得'就记。"
-            "确定信息用 confidence=0.8+, 不确定用 0.3-0.5; 低置信度记错没关系，后续高置信度会覆盖。"
-            "**只有完全无事实信息的纯客套('你好'/'哈哈'/'好的'/'谢谢') 才跳过。**"
-            "示例: 用户说'我叫小明,在北京,今天跑完半马' → "
-            "[{op:'set',key:'昵称',value:'小明',category:'basic',confidence:0.9},"
-            "{op:'set',key:'城市',value:'北京',category:'basic',confidence:0.9},"
-            "{op:'event',value:'完成半马',tag:'milestone'}]。"
-            "字段说明: "
-            " category: basic(基本信息)/preference(偏好)/social(社交)/other; "
-            " confidence: 0-1, set 时必填(不允许默认); "
-            " tag(event 用): milestone(里程碑)/daily(日常)/mood(情绪) 等任意短词; "
-            " ttl: 临时信息可设过期时间如'30d','7d','12h'; "
-            " force: 仅覆盖更高置信度的现有值时设 true; "
-            " user_id: 群聊场景下指定目标发言者(必须是当前对话中的人)。"
-            "同 batch 内同 (op,key) 只保留最后一个。"
-        ),
-        params={
-            "type": "object",
-            "properties": {
-                "operations": {
-                    "type": "array",
-                    "description": "操作列表",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": ["set", "event", "del"],
-                                "description": "set=设置画像, event=记录事件, del=删除画像"
-                            },
-                            "key": {"type": "string", "description": "画像键名(set/del时必填)"},
-                            "value": {"type": "string", "description": "画像值(set时)或事件描述(event时)"},
-                            "category": {
-                                "type": "string",
-                                "enum": ["basic", "preference", "social", "other"],
-                                "description": "画像分类(set时可选, 默认basic)"
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "description": "置信度0-1(set时必填; 不传将被拒绝)"
-                            },
-                            "tag": {
-                                "type": "string",
-                                "description": "事件标签(event时可选, 如milestone/daily/mood)"
-                            },
-                            "ttl": {
-                                "type": "string",
-                                "description": "过期时间(set时可选), 如'30d','7d','12h'"
-                            },
-                            "force": {
-                                "type": "boolean",
-                                "description": "强制覆盖更高置信度的现值(set时可选)"
-                            },
-                            "user_id": {
-                                "type": "string",
-                                "description": "目标用户ID(群聊场景可选; 缺省=最后发言者; 必须是当前对话中的某个发言者)"
-                            }
-                        },
-                        "required": ["op"]
-                    }
-                }
-            },
-            "required": ["operations"]
-        }
-    )
-    async def memory_update(self, event: KiraMessageBatchEvent, operations: list) -> str:
-        if not self.db:
-            return "Error: memory database not initialized"
-
-        primary_uid = self._get_primary_user_id(event)
-        if primary_uid == "unknown":
-            return "Error: cannot determine user_id"
-        # Whitelist of senders: per-op user_id is only honoured if it appears here.
-        # primary_uid is guaranteed != "unknown" past the early return above,
-        # so add it unconditionally.
-        sender_set = set(self._extract_user_ids(event))
-        sender_set.add(primary_uid)
-
-        # ── M1: dedupe within batch by (op, key, target_uid). Last wins.
-        # event ops are NOT deduped (multiple distinct events are legitimate).
-        seen: dict = {}
-        deduped: list = []
-        dropped = 0
-        for raw in operations:
-            if not isinstance(raw, dict):
-                deduped.append(raw)  # let the per-item validator complain
-                continue
-            op = raw.get("op", "")
-            key = raw.get("key", "")
-            # Only fall back to primary when ``user_id`` is missing/null —
-            # ``or primary_uid`` would silently substitute on falsy values
-            # (``""``, ``0``, ``False``) that the LLM might emit, hiding bad
-            # input from the per-item validator below.
-            raw_target = raw.get("user_id")
-            target = primary_uid if raw_target is None else raw_target
-            if op in ("set", "del") and key:
-                dedup_key = (op, key, target)
-                if dedup_key in seen:
-                    deduped[seen[dedup_key]] = raw  # later op wins
-                    dropped += 1
-                    continue
-                seen[dedup_key] = len(deduped)
-            deduped.append(raw)
-
-        results = []
-        touched_users: set = set()  # for the post-summary
-        for item in deduped:
-            if not isinstance(item, dict):
-                results.append("skip: invalid operation (not an object)")
-                continue
-            op = item.get("op", "")
-            key = item.get("key", "")
-            value = item.get("value", "")
-
-            # ── M5: per-op user_id with sender whitelist
-            # Only None/missing falls back; falsy values (""/0/False) flow
-            # through to the validator below so bad LLM input is surfaced
-            # instead of silently routed to the primary speaker.
-            raw_target = item.get("user_id")
-            target_uid = primary_uid if raw_target is None else raw_target
-            if not isinstance(target_uid, str) or not target_uid:
-                results.append("skip: invalid target user_id")
-                continue
-            if target_uid not in sender_set:
-                results.append(
-                    f"skip: user_id '{target_uid}' is not a current speaker "
-                    f"(allowed: {sorted(sender_set)})"
-                )
-                continue
-
-            if op == "set":
-                if not key or not value:
-                    results.append("skip: set requires key+value")
-                    continue
-                category = item.get("category", "basic")
-                if not isinstance(category, str) or category not in VALID_CATEGORIES:
-                    category = "basic"
-
-                # ── M3: confidence is required on set. We accept any number in
-                # [0, 1]; absence (or non-numeric) is rejected so the LLM has to
-                # think about how sure it is rather than defaulting to 0.5.
-                raw_conf = item.get("confidence")
-                if raw_conf is None:
-                    results.append(f"skip: set {key} requires explicit 'confidence' (0-1)")
-                    continue
-                try:
-                    confidence = float(raw_conf)
-                except (TypeError, ValueError):
-                    results.append(f"skip: set {key} confidence must be numeric, got {raw_conf!r}")
-                    continue
-
-                ttl = item.get("ttl")
-                parsed_ttl = _parse_ttl(ttl) if ttl else None
-                # ``bool()`` on a non-empty string is True, so ``bool("false")``
-                # would silently bypass M6's conflict protection. Accept only
-                # real booleans, or strings that are explicitly truthy/falsy.
-                force = self._coerce_bool(item.get("force", False))
-                if force is None:
-                    results.append(
-                        f"skip: set {key} 'force' must be boolean (got {item.get('force')!r})"
-                    )
-                    continue
-
-                status, info = self.db.upsert_with_limit(
-                    target_uid, key, value,
-                    max_profiles=self.max_profiles,
-                    confidence=confidence,
-                    category=category,
-                    expires_at=parsed_ttl,
-                    force=force,
-                )
-                touched_users.add(target_uid)
+    def _build_session_id(self, event: KiraMessageBatchEvent) -> str:
+        """Construct an `adapter:type:id` session string for the hippocampus.
 
                 # Phase 3a — every accepted profile write is also a
                 # rein signal on that profile's evidence row. Limit
@@ -1269,30 +1061,53 @@ class UserMemoryPlugin(BasePlugin):
 
     @on.llm_request()
     async def inject_context(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
-        """Inject filtered per-user memory + skill list before each LLM call.
+        """Inject distilled profile + recalled long-term memory before each LLM call."""
+        if not self.memory_manager:
+            return
 
-        Memory: only categories listed in `inject_categories` (default: basic)
-        are pushed into the system prompt; remaining categories surface as a
-        one-line hint pointing the LLM at `memory_query(category=...)`.
-        """
-        memory_context = ""
-        if self.db:
-            user_ids = self._extract_user_ids(event)
-            if user_ids:
-                memory_blocks = []
-                for uid in user_ids:
-                    ctx_str = self.db.build_user_context(
-                        uid,
-                        max_events=self.max_events,
-                        max_chars=self.max_context_chars,
-                        inject_categories=self.inject_categories,
-                        hint_other_categories=True,
+        memory_blocks = []
+
+        # ── 1. Per-user profile prompts ─────────────────────────────
+        if self._inject_profile:
+            for uid in self._extract_user_ids(event):
+                try:
+                    prompt = await self.memory_manager.get_profile_prompt(
+                        uid, ENTITY_USER
                     )
-                    if ctx_str:
-                        memory_blocks.append(ctx_str)
-                if memory_blocks:
-                    memory_context = "\n".join(memory_blocks)
+                    if prompt and prompt.strip() and prompt.strip() != "暂无画像信息":
+                        memory_blocks.append(f"[用户 {uid} 画像]\n{prompt}")
+                except Exception as e:
+                    logger.warning(f"Failed to load profile for {uid}: {e}")
 
+        # ── 2. Top-K recalled memories for the latest query ─────────
+        if self._inject_facts or self._inject_reflections:
+            query = self._extract_latest_user_text(event)
+            if query:
+                primary_uid = self._get_primary_user_id(event)
+                if primary_uid and primary_uid != "unknown":
+                    try:
+                        memories = await self.memory_manager.recall(
+                            query=query,
+                            entity_id=primary_uid,
+                            entity_type=ENTITY_USER,
+                            k=self._recall_top_k,
+                        )
+                        recalled_lines = []
+                        for mem in memories or []:
+                            if mem.type == "reflection" and not self._inject_reflections:
+                                continue
+                            if mem.type == "fact" and not self._inject_facts:
+                                continue
+                            tags_str = f" [{', '.join(mem.tags)}]" if mem.tags else ""
+                            recalled_lines.append(f"- [{mem.type}]{tags_str} {mem.raw_text}")
+                        if recalled_lines:
+                            memory_blocks.append("[相关记忆]\n" + "\n".join(recalled_lines))
+                    except Exception as e:
+                        logger.warning(f"Recall failed: {e}")
+
+        memory_context = "\n\n".join(memory_blocks)
+
+        # ── 3. Skill manifest one-liner ─────────────────────────────
         skill_line = ""
         if self._registered_skill_names:
             names = []
@@ -1303,6 +1118,7 @@ class UserMemoryPlugin(BasePlugin):
             if names:
                 skill_line = SKILL_FEW_SHOT_HEADER + ", ".join(names) + "\n"
 
+        # ── 4. Splice into existing system prompt ───────────────────
         injected_memory = False
         for p in req.system_prompt:
             if p.name == "memory" and memory_context:
@@ -1311,25 +1127,13 @@ class UserMemoryPlugin(BasePlugin):
             if p.name == "tools" and skill_line:
                 p.content += skill_line
 
-        # If no dedicated "memory" section exists, append a fresh one rather
-        # than piggy-backing on whatever happens to be the last segment
-        # (which is typically "tools" — appending memory there mixes two
-        # unrelated kinds of content and confuses the model).
         if not injected_memory and memory_context:
             req.system_prompt.append(
                 Prompt(memory_context, name="memory", source="kiraos")
             )
 
-        # ── B: per-turn active-recall hint ─────────────────────────
-        # The hint sits next to the memory data so the LLM, while reading
-        # what it already knows about the user, also sees a standing
-        # instruction to record any *new* facts mentioned this turn.
-        # Tool-description rewriting (A) plus this hint reliably nudges
-        # otherwise-conservative models into actually calling memory_update.
         req.system_prompt.append(Prompt(
-            "📝 本轮检查: 用户若提到任何自身事实信息"
-            "(姓名/地点/职业/关系/偏好/经历), 主动调用 memory_update 记录。"
-            "宁记错不漏过——低置信度记下来，后续会被高置信度覆盖。",
+            MEMORY_ACTIVE_RECALL_HINT,
             name="memory_hint",
             source="kiraos",
         ))
@@ -1360,68 +1164,34 @@ class UserMemoryPlugin(BasePlugin):
                     break
 
     # ════════════════════════════════════════════════════════════════
-    #  Auditor (C) — passive scan of every turn for missed facts
+    #  Hippocampus Feed — pass each user/assistant turn into the
+    #  background hippocampus buffer. Threshold-based auto-trigger.
     # ════════════════════════════════════════════════════════════════
 
     @on.step_result()
-    async def schedule_audit(self, event: KiraMessageBatchEvent,
-                             step_result: KiraStepResult):
-        """Schedule a background auditor pass for this batch.
+    async def feed_hippocampus(
+        self,
+        event: KiraMessageBatchEvent,
+        step_result: KiraStepResult,
+    ):
+        """Push the just-completed user/assistant chunk into the hippocampus.
 
-        Runs at most once per ``KiraMessageBatchEvent`` even if step_result
-        fires multiple times (multi-step tool loops). Fully async — does
-        not block the agent loop.
+        Per-event dedup: a single ``KiraMessageBatchEvent`` may produce multiple
+        step_results during multi-step tool loops; we only feed once per batch.
         """
-        if not self._auditor_enabled or not self.db:
+        if not self.memory_manager:
             return
         eid = id(event)
-        if eid in self._audited_event_ids:
+        if eid in self._fed_event_ids:
             return
-        # Skip-keyword pre-filter: cheap text match, avoids paying for an LLM
-        # call when the user explicitly opted out of recording this turn.
+        self._fed_event_ids.add(eid)
+        if len(self._fed_event_ids) > self._max_fed_dedup_size:
+            # Best-effort cap — id() values can repeat after GC anyway.
+            self._fed_event_ids.clear()
+
         user_text = self._extract_latest_user_text(event)
-        if self._auditor_skip_keywords and user_text:
-            for kw in self._auditor_skip_keywords:
-                if kw and kw in user_text:
-                    logger.info(f"[auditor] skip keyword '{kw}' hit, audit skipped")
-                    self._audited_event_ids.add(eid)
-                    return
-        if not user_text or len(user_text.strip()) < 2:
-            # Nothing meaningful to audit
-            self._audited_event_ids.add(eid)
-            return
-
-        # Inflight cap. Each auditor call can take up to 15s (model timeout),
-        # so an unbounded burst would queue tasks faster than they drain,
-        # slow down terminate(), and could trip provider rate-limits. Drop
-        # excess turns at the door — the auditor is best-effort anyway.
-        if len(self._auditor_tasks) >= self._auditor_max_inflight:
-            logger.info(
-                f"[auditor] inflight cap reached "
-                f"({len(self._auditor_tasks)}/{self._auditor_max_inflight}), "
-                "dropping this turn"
-            )
-            self._audited_event_ids.add(eid)
-            return
-
-        self._audited_event_ids.add(eid)
-        # Defensive cap on the dedup set so a long session can't bloat it.
-        if len(self._audited_event_ids) > self._max_audit_dedup_size:
-            # Drop an arbitrary half to keep the set bounded.
-            # NOTE: Python ``set`` is unordered (only ``dict`` gained
-            # insertion-order semantics in 3.7), so the slice below removes
-            # a hash-dependent half — *not* the oldest entries. That's fine
-            # for our purpose: the dedup is best-effort anyway, since
-            # ``id()`` values are recycled after GC. We only need the size
-            # to stay within ``_max_audit_dedup_size``.
-            self._audited_event_ids = set(
-                list(self._audited_event_ids)[self._max_audit_dedup_size // 2:]
-            )
-
-        # Snapshot what we need so the background task is independent of
-        # event mutation later in the loop.
-        user_id = self._get_primary_user_id(event)
-        if user_id == "unknown":
+        assistant_text = getattr(step_result, "raw_output", "") or ""
+        if not user_text and not assistant_text:
             return
         assistant_reply = (step_result.raw_output or "").strip()
 
@@ -1516,36 +1286,34 @@ class UserMemoryPlugin(BasePlugin):
     def _get_auditor_client(self):
         """Pick the LLM client to drive the auditor.
 
-        Priority:
-          1. Explicit ``memory_auditor_model_uuid`` from config
-          2. ctx.get_default_fast_llm_client()
-          3. ctx.get_default_llm_client() as last resort
-        """
-        if self._auditor_model_uuid:
-            try:
-                client = self.ctx.get_llm_client(model_uuid=self._auditor_model_uuid)
-                if client is not None:
-                    return client
-                logger.warning(
-                    f"[auditor] configured model '{self._auditor_model_uuid}' "
-                    "not available, falling back to fast LLM"
-                )
-            except Exception as e:
-                logger.warning(f"[auditor] failed to load configured model: {e}")
+        primary_uid = self._get_primary_user_id(event)
+        sender_name = ""
         try:
-            return self.ctx.get_default_fast_llm_client()
-        except Exception:
-            try:
-                return self.ctx.get_default_llm_client()
-            except Exception:
-                return None
+            if event.messages:
+                last = event.messages[-1]
+                if last.sender:
+                    sender_name = last.sender.nickname or ""
+        except AttributeError:
+            pass
 
-    async def _run_auditor(self, *, user_id: str, user_text: str,
-                           assistant_reply: str) -> None:
-        """Background pass: ask the fast LLM to extract memorable facts and write them.
+        chunk = []
+        if user_text:
+            chunk.append({
+                "role": "user",
+                "content": user_text,
+                "sender_id": primary_uid if primary_uid != "unknown" else "",
+                "sender_name": sender_name,
+            })
+        if assistant_text:
+            chunk.append({
+                "role": "assistant",
+                "content": assistant_text,
+            })
 
-        Failures are logged and swallowed — never propagate to the main loop.
-        """
+        if not chunk:
+            return
+
+        session_id = self._build_session_id(event)
         try:
             client = self._get_auditor_client()
             if client is None:
@@ -1681,47 +1449,4 @@ class UserMemoryPlugin(BasePlugin):
                 f"written {written}, skipped {skipped}"
             )
         except Exception as e:
-            # Don't let a buggy auditor take down the main turn. Log and move on.
-            logger.exception(f"[auditor] error for {_mask_id(user_id)}: {e}")
-
-    @staticmethod
-    def _parse_auditor_output(text: str) -> list[dict]:
-        """Best-effort parse of the auditor's JSON output.
-
-        Tolerates code-fence wrapping and extra leading/trailing prose.
-        Returns ``[]`` on any error.
-        """
-        cleaned = _strip_json_fence(text)
-        # Find the first ``[`` and parse from there with ``raw_decode`` rather
-        # than slicing to ``rfind("]")``. ``rfind`` mis-slices when the prose
-        # *after* the JSON happens to contain another ``]`` (e.g.
-        # ``[{...}] 用户提到了 [姓名] 信息``) — it would grab the bracket from
-        # ``[姓名]`` and concatenate garbage onto the JSON.
-        # ``raw_decode`` parses up to the end of the first valid JSON value
-        # and stops cleanly, ignoring everything after.
-        start = cleaned.find("[")
-        if start == -1:
-            # No array marker at all → nothing to extract
-            return []
-        try:
-            data, _consumed = json.JSONDecoder().raw_decode(cleaned[start:])
-        except (json.JSONDecodeError, ValueError) as e:
-            # The auditor output contains the user facts the model just
-            # extracted (nicknames, addresses, relationships, ...). Logging
-            # the raw text — even truncated — would persist that to the log
-            # file. Record only length + a content hash so we can still
-            # correlate repeated failures across runs without leaking PII.
-            digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
-            logger.warning(
-                f"[auditor] failed to parse JSON: {e} "
-                f"(text_len={len(text)}, sha256_12={digest})"
-            )
-            return []
-        if not isinstance(data, list):
-            logger.warning(f"[auditor] expected JSON array, got {type(data).__name__}")
-            return []
-        out = []
-        for item in data:
-            if isinstance(item, dict):
-                out.append(item)
-        return out
+            logger.warning(f"Hippocampus feed failed for {session_id}: {e}")

@@ -1,43 +1,62 @@
 {
-    "max_events_per_user": {
-        "name": "Max events in context",
+    "hippocampus_threshold": {
+        "name": "Hippocampus trigger threshold",
         "type": "integer",
-        "default": 10,
-        "minimum": 0,
-        "hint": "Maximum number of recent events injected into LLM context per user"
+        "default": 3,
+        "minimum": 1,
+        "maximum": 50,
+        "hint": "Number of accumulated user/assistant chunks per session that trigger a background hippocampus run (fact extraction, deduplication, reflection, profile update). Lower = more responsive memory but more LLM calls."
     },
-    "max_profiles_per_user": {
-        "name": "Max profile entries",
+    "recall_top_k": {
+        "name": "Recall top-K",
         "type": "integer",
-        "default": 50,
-        "minimum": 0,
-        "hint": "Maximum number of profile key-value pairs allowed per user"
+        "default": 5,
+        "minimum": 1,
+        "maximum": 30,
+        "hint": "How many long-term memories to recall and inject into the system prompt each turn."
     },
-    "max_event_keep": {
-        "name": "Max events stored",
+    "max_memory_length": {
+        "name": "Short-term memory window",
         "type": "integer",
-        "default": 100,
-        "minimum": 0,
-        "hint": "Maximum number of event logs kept in database per user (oldest auto-deleted)"
+        "default": 20,
+        "minimum": 1,
+        "hint": "Sliding-window size for short-term chat history (chunks per session)."
+    },
+    "inject_profile": {
+        "name": "Inject user profile",
+        "type": "switch",
+        "default": true,
+        "hint": "Inject the per-user profile (name, traits, preferences, relationships, facts) into the system prompt every turn."
+    },
+    "inject_facts": {
+        "name": "Inject recalled facts",
+        "type": "switch",
+        "default": true,
+        "hint": "Include recalled fact memories in the system prompt every turn."
+    },
+    "inject_reflections": {
+        "name": "Inject recalled reflections",
+        "type": "switch",
+        "default": true,
+        "hint": "Include recalled high-level reflections in the system prompt every turn."
+    },
+    "enable_decay": {
+        "name": "Enable forgetting (decay)",
+        "type": "switch",
+        "default": true,
+        "hint": "Periodically downgrade and archive low-importance, long-unused memories. (Decay runs on demand via run_forgetting_cycle; scheduling will be added in a later release.)"
+    },
+    "auto_migrate_legacy_db": {
+        "name": "Auto-migrate v2 SQLite",
+        "type": "switch",
+        "default": true,
+        "hint": "On first run, automatically migrate any existing v2 kiraos.db (user_profiles + event_logs) into the new TOML structure. The old file is backed up to kiraos.db.bak_<timestamp>."
     },
     "skills_dir": {
         "name": "Skills directory",
         "type": "string",
         "default": null,
-        "hint": "Path to skills directory (defaults to data/skills/). Each skill is a subfolder containing either SKILL.md (recommended, single-file YAML frontmatter) or the legacy manifest.json + instruction.md pair."
-    },
-    "max_context_chars": {
-        "name": "Max context chars per user",
-        "type": "integer",
-        "default": 500,
-        "minimum": 0,
-        "hint": "Maximum characters of memory context injected per user (0 = unlimited). Truncates by category priority when exceeded"
-    },
-    "inject_categories": {
-        "name": "Auto-injected categories",
-        "type": "list",
-        "default": ["basic"],
-        "hint": "Profile categories pushed into the system prompt every turn. Other categories stay queryable via memory_query(category=...). Use [\"*\"] to inject every category (legacy behaviour). Default: [\"basic\"]"
+        "hint": "Path to the skills directory (defaults to data/skills/). Each skill is a subfolder containing either SKILL.md (recommended, single-file YAML frontmatter) or the legacy manifest.json + instruction.md pair."
     },
     "disabled_skills": {
         "name": "Disabled skills",
@@ -49,7 +68,7 @@
         "name": "Enable slash commands",
         "type": "switch",
         "default": false,
-        "hint": "Allow users to trigger skills via /command (e.g. /tarot, /fortune). When disabled, skills can only be triggered by LLM."
+        "hint": "Allow users to trigger skills via /command (e.g. /tarot). When disabled, skills can only be triggered by LLM."
     },
     "webui_port": {
         "name": "Memory WebUI port",
@@ -63,7 +82,7 @@
         "name": "Memory WebUI host",
         "type": "string",
         "default": "127.0.0.1",
-        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access"
+        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access."
     },
     "webui_token": {
         "name": "Memory WebUI token",

@@ -1,46 +1,27 @@
 """
-SQLite-based user memory storage for KiraAI.
+KiraOS_Plugin — 通用工具函数（v3.0 精简版）
 
-Tables:
-  - user_profiles: Long-term key-value user profile entries
-                   with confidence, category, and optional expiration
-  - event_logs:    Recent event logs per user
+v2.x 的 UserMemoryDB / user_profiles / event_logs 已被 memory/ 子包中的
+双脑记忆系统完全取代（详见 memory/memory_manager.py）。
 
-Concurrency model:
-  - One SQLite connection **per thread** (thread-local), all opened against the
-    same WAL-mode database file. WAL allows concurrent readers + a single writer.
-  - Reads are lock-free (SQLite handles MVCC under WAL).
-  - Writes serialize on a lightweight asyncio-friendly Lock.
-  - Connections are tracked in a registry so close() can shut them all down.
-
-Expiration:
-  - `expires_at` is stored as INTEGER (unix epoch seconds) so comparisons can
-    use a btree-friendly `?` parameter rather than the SQLite `datetime()`
-    function which forces a full scan.
+本模块仅保留若干跨模块共用的工具函数：
+- `_mask_id`     — 把 user_id / key 脱敏后用于日志
+- `_parse_ttl`   — 解析 '30d' / '12h' 风格的过期时间字符串
 """
 
 import hashlib
 import json
 import os
 import re
-import sqlite3
-import threading
-import time
 from datetime import datetime, timedelta
-from threading import Lock
-from typing import Dict, List, Optional, Tuple
-
-from core.logging_manager import get_logger
-
-logger = get_logger("kiraos_db", "green")
+from typing import Optional
 
 
 def _mask_id(value: object) -> str:
     """Return a masked identifier safe for log files.
 
-    Mirrors the helper in ``web_server.py`` so user_ids and memory keys never
-    leak into rotating log files (which may be retained, shared, or pasted
-    into bug reports). Format: ``<3-char prefix>***(<8-char sha256>)``.
+    user_id 与 memory key 不应该原样落进日志（日志可能被归档、共享或贴进 bug
+    报告）。这里统一成 `<3-char prefix>***(<8-char sha256>)` 的形式。
     """
     s = "" if value is None else str(value)
     if not s:
@@ -49,37 +30,20 @@ def _mask_id(value: object) -> str:
     prefix = s[:3] if len(s) >= 3 else s
     return f"{prefix}***({digest})"
 
-# Category priority for context injection (lower = higher priority)
-CATEGORY_PRIORITY = {"basic": 0, "preference": 1, "social": 2, "other": 3}
-VALID_CATEGORIES = set(CATEGORY_PRIORITY.keys())
-
-# Hard caps to keep a single LLM-driven write from polluting the database.
-# Profile values must be short enough that the LLM cannot stash a whole
-# conversation summary as one entry; events get a more generous budget since
-# they're already capped by max_event_keep.
-MAX_PROFILE_VALUE_LEN = 500
-MAX_EVENT_LEN = 1000
-
-# Pre-flight conflict semantics:
-# A new value differs from the existing one. Reject (return "conflict") iff
-# the existing entry is at least this much more confident than the proposed
-# one — that protects high-confidence facts from being silently overwritten
-# by a low-confidence guess. The LLM may retry with force=True or supply a
-# higher confidence to override.
-CONFLICT_CONFIDENCE_GAP = 0.2
-
 
 def _parse_ttl(ttl: str) -> Optional[datetime]:
-    """Parse a TTL string like '30d', '7d', '12h', '30m' into an expiration datetime."""
+    """Parse a TTL string like '30d', '7d', '12h', '30m' into a datetime."""
+    if not ttl:
+        return None
     m = re.fullmatch(r"(\d+)\s*([dhm])", ttl.strip().lower())
     if not m:
         return None
     amount, unit = int(m.group(1)), m.group(2)
     if unit == "d":
         return datetime.now() + timedelta(days=amount)
-    elif unit == "h":
+    if unit == "h":
         return datetime.now() + timedelta(hours=amount)
-    elif unit == "m":
+    if unit == "m":
         return datetime.now() + timedelta(minutes=amount)
     return None
 

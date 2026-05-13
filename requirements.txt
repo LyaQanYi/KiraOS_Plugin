@@ -1,0 +1,18 @@
+# KiraOS Plugin runtime dependencies
+#
+# Installed automatically by KiraAI's plugin installer when the plugin is
+# fetched via WebUI (Install from GitHub / upload ZIP). For existing installs
+# you can run manually:
+#
+#     python -m pip install -r data/plugins/KiraOS_Plugin/requirements.txt
+
+# TOML writer — hard dependency (no stdlib alternative for writing TOML)
+tomli_w>=1.0.0
+
+# TOML reader — only needed on Python 3.10; 3.11+ uses the stdlib `tomllib`
+tomli>=1.2.0; python_version < "3.11"
+
+# Chinese tokenizer driving FTS5 — soft dependency (memory_index falls back
+# to a character-level tokenizer if missing), but Chinese recall quality
+# drops noticeably without it.
+jieba>=0.42.1
