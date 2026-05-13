@@ -37,6 +37,12 @@ _LLM_CHAT_TIMEOUT = 30.0
 class MemoryExtractor:
     """海马体：事实提取 → 去重 → 合并 → 升维"""
 
+    # 单次提取 prompt 里 conversation_text 的字符上限。8000 chars ≈ 4–6k
+    # tokens，留出足够空间给系统 prompt + JSON 输出格式 + 个人 profile
+    # 上下文。超出部分按"最近优先"截断——海马体只关心新对话，旧上下文
+    # 已经走过前几轮提取，再塞一次只会膨胀 cost/timeout 而无新增信号。
+    MAX_CONVERSATION_CHARS = 8000
+
     def __init__(self, tree_store: TomlTreeStore, llm_client=None):
         self.tree_store = tree_store
         self.index: MemoryIndex = tree_store.index
@@ -48,6 +54,17 @@ class MemoryExtractor:
         # 升维输入上限：单条 LLM 调用最多塞这么多 fact 进 prompt。
         # 不设上限会让 prompt 按实体规模线性膨胀，成本/超时率失控。
         self.reflection_input_cap = 50
+
+    @classmethod
+    def _truncate_conversation(cls, text: str) -> str:
+        """把 conversation_text 截到 MAX_CONVERSATION_CHARS（保留尾部）。"""
+        if not text:
+            return ""
+        if len(text) <= cls.MAX_CONVERSATION_CHARS:
+            return text
+        # 取末尾部分（最近内容），并在前面加一个明显的截断标记给 LLM 看，
+        # 避免模型把开头不完整的句子当成完整事实。
+        return "[…earlier conversation truncated…]\n" + text[-cls.MAX_CONVERSATION_CHARS:]
 
     def set_llm_client(self, llm_client):
         self._llm_client = llm_client
@@ -77,6 +94,7 @@ class MemoryExtractor:
         """
         if not self._llm_client:
             return []
+        conversation_text = self._truncate_conversation(conversation_text)
 
         prompt = f"""分析以下对话片段，提取每位用户的**个人事实**。忽略寒暄和无意义内容。
 对话中每位用户的格式为 "昵称(ID): 内容"，请注意区分不同用户。
@@ -123,6 +141,7 @@ class MemoryExtractor:
         """
         if not self._llm_client:
             return []
+        conversation_text = self._truncate_conversation(conversation_text)
 
         prompt = f"""分析以下群聊对话片段，提取**群组级别**的信息。忽略寒暄和无意义内容。
 对话中每位用户的格式为 "昵称(ID): 内容"。
@@ -165,6 +184,7 @@ class MemoryExtractor:
         """
         if not self._llm_client:
             return []
+        conversation_text = self._truncate_conversation(conversation_text)
 
         prompt = f"""分析以下对话片段，提取关键事实。忽略寒暄和无意义内容。
 对话中用户的格式为 "昵称(ID): 内容"。
@@ -214,6 +234,7 @@ class MemoryExtractor:
         """
         if not self._llm_client:
             return []
+        conversation_text = self._truncate_conversation(conversation_text)
 
         response_section = ""
         if ai_response_text:

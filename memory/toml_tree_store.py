@@ -207,14 +207,32 @@ class TomlTreeStore:
 
         self.index = index or MemoryIndex()
 
-        # 读写锁 per 目录
+        # 读写锁 per (entity_type, entity_id, folder, base_dir)。无上限增长在
+        # 长跑会变成内存泄漏（每个出现过的 entity/folder 都留一把锁），所以
+        # 加 `_LOCK_CAP` 上限 + 懒回收 unlocked 锁——同 key 同锁的语义只在
+        # 调用方持有该锁期间保证，释放后即可被驱逐，下次再 `_get_lock` 同 key
+        # 会拿到新锁但因为没有 in-flight 操作所以行为等价。
         self._locks: Dict[str, asyncio.Lock] = {}
         logger.info("TomlTreeStore initialized (TOML files + SQLite index)")
 
+    _LOCK_CAP = 256
+
     def _get_lock(self, key: str) -> asyncio.Lock:
-        if key not in self._locks:
-            self._locks[key] = asyncio.Lock()
-        return self._locks[key]
+        lock = self._locks.get(key)
+        if lock is not None:
+            return lock
+        # 创建新锁前，超 cap 时先扫一遍把所有未被持有的旧锁清掉。`asyncio.Lock`
+        # 是单 event loop 内的协作锁；这个方法本身是 sync 的，asyncio 协作式
+        # 调度保证遍历期间不会有别的协程修改 `_locks`。
+        if len(self._locks) >= self._LOCK_CAP:
+            stale = [k for k, lk in self._locks.items() if not lk.locked()]
+            for k in stale:
+                del self._locks[k]
+                if len(self._locks) < self._LOCK_CAP:
+                    break
+        lock = asyncio.Lock()
+        self._locks[key] = lock
+        return lock
 
     @staticmethod
     def _resolve_dir(
