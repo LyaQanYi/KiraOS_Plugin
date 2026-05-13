@@ -236,14 +236,26 @@ def _apply_legacy_row_to_profile(profile: EntityProfile, row) -> None:
 
 
 def _sync_save_profile(profile: EntityProfile, data_root: Path) -> None:
-    """直接同步写 profile.json（不走 EntityProfileStore 异步路径）"""
+    """直接同步写 profile.json（不走 EntityProfileStore 异步路径）；原子替换。"""
     import json
 
     target_dir = data_root / "entities" / f"{profile.entity_type}_{_id_to_path_segment(profile.entity_id)}"
     target_dir.mkdir(parents=True, exist_ok=True)
     fpath = target_dir / "profile.json"
-    with open(fpath, "w", encoding="utf-8") as f:
-        json.dump(profile.to_dict(), f, ensure_ascii=False, indent=2)
+    tmp = fpath.with_suffix(fpath.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(profile.to_dict(), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, fpath)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _write_fact_toml(
@@ -256,16 +268,36 @@ def _write_fact_toml(
     tags: list,
     source: dict,
 ) -> None:
-    """同步写一条 fact 到 entities/{type}_{id}/facts/{mem_id}.toml"""
+    """同步写一条 fact 到 entities/{type}_{id}/facts/{mem_id}.toml。
+
+    安全语义：
+    - 重跑保护：现有文件存在 *并且* 能成功解析时，视为前一次迁移已完成，跳过。
+      若现有文件存在但损坏（如上次迁移写到一半崩溃留下的半文件），不再无条件
+      跳过——直接重写即可，原子替换语义会接管。
+    - 原子替换：先写 `.tmp`、fsync、`os.replace` 落位，避免再次留下半文件。
+    """
     import tomli_w
+
+    try:
+        import tomllib  # Python 3.11+
+    except ImportError:
+        import tomli as tomllib  # Python 3.10 fallback
 
     facts_dir = data_root / "entities" / f"{entity_type}_{_id_to_path_segment(entity_id)}" / "facts"
     facts_dir.mkdir(parents=True, exist_ok=True)
 
     fpath = facts_dir / f"{mem_id}.toml"
     if fpath.exists():
-        # 已存在同名文件（重跑场景）：跳过，避免覆盖用户后续手动改动
-        return
+        try:
+            with open(fpath, "rb") as f:
+                tomllib.load(f)
+            # 文件可读，认为上次迁移成功，跳过保留用户后续手动改动
+            return
+        except Exception:
+            # 文件存在但坏掉 —— 半文件，重写覆盖
+            logger.warning(
+                f"Existing migration file is unreadable, rewriting: {fpath}"
+            )
 
     doc = {
         "id": mem_id,
@@ -275,8 +307,21 @@ def _write_fact_toml(
         "tags": tags,
         "source": source,
     }
-    with open(fpath, "wb") as f:
-        tomli_w.dump(doc, f)
+    # 原子写：同目录 tmp + fsync + os.replace
+    tmp = fpath.with_suffix(fpath.suffix + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            tomli_w.dump(doc, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, fpath)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _iso_from_legacy_created_at(value) -> str:

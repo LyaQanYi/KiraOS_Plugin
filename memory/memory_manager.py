@@ -638,7 +638,7 @@ class MemoryManager:
     # ==========================================
 
     async def _build_sender_profiles_context(
-        self, adapter: str, unique_senders: set
+        self, adapter: str, unique_senders: list[str]
     ) -> str:
         """为海马体提取构建 sender profile 摘要
 

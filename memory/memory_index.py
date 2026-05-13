@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,6 +87,12 @@ class MemoryIndex:
         self._conn: Optional[sqlite3.Connection] = None
         self._vec_available = False
         self._embedder = None  # 延迟初始化
+        # Python sqlite3 + threadsafety=1 模式下，多线程共享同一个 Connection
+        # 是 *不安全* 的（官方文档明确要求由调用方串行化）。本类的所有 SQL
+        # 操作都会经 `asyncio.to_thread(self.index.*)` 跑到不同 worker
+        # 线程，所以这里用一把可重入锁包住所有访问。RLock 而非 Lock 是因为
+        # `_try_init_vec` 在 `_init_db` 持锁期间还会再调一次 conn.execute。
+        self._conn_lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -177,16 +184,31 @@ class MemoryIndex:
 
     @contextmanager
     def _transaction(self):
-        """事务上下文管理器"""
-        cur = self._conn.cursor()
-        try:
-            yield cur
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-        finally:
-            cur.close()
+        """写事务上下文管理器；持 `_conn_lock` 全程串行化。"""
+        with self._conn_lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                cur.close()
+
+    @contextmanager
+    def _read(self):
+        """只读路径的上下文：持 `_conn_lock` 但不开事务。
+
+        所有直接调 `self._conn.execute(...).fetchall()` / `.fetchone()` 的
+        读路径都要换成：
+            with self._read() as conn:
+                rows = conn.execute(sql, params).fetchall()
+        以确保 connection 同一时刻只被一个线程使用（Python sqlite3
+        threadsafety=1 限制）。
+        """
+        with self._conn_lock:
+            yield self._conn
 
     # ==========================================
     # 内容哈希
@@ -283,9 +305,10 @@ class MemoryIndex:
 
     def get_meta(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """获取单条记忆的 meta"""
-        row = self._conn.execute(
-            "SELECT * FROM memories WHERE id = ?", (memory_id,)
-        ).fetchone()
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
         if row:
             return self._row_to_dict(row)
         return None
@@ -412,7 +435,8 @@ class MemoryIndex:
         if limit > 0:
             sql += f" LIMIT {limit}"
 
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._read() as conn:
+            rows = conn.execute(sql, params).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def count_memories(
@@ -445,9 +469,10 @@ class MemoryIndex:
             conditions.append("base_dir = ''")
 
         where = " AND ".join(conditions) if conditions else "1=1"
-        row = self._conn.execute(
-            f"SELECT COUNT(*) FROM memories WHERE {where}", params
-        ).fetchone()
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM memories WHERE {where}", params
+            ).fetchone()
         return row[0] if row else 0
 
     # ==========================================
@@ -507,7 +532,8 @@ class MemoryIndex:
             fts_sql += " ORDER BY fts_score LIMIT ?"
             params.append(k * 3)  # 多取一些用于重排序
 
-            rows = self._conn.execute(fts_sql, params).fetchall()
+            with self._read() as conn:
+                rows = conn.execute(fts_sql, params).fetchall()
         except sqlite3.OperationalError as e:
             logger.warning(f"FTS5 search error: {e}, query={fts_query}")
             return []
@@ -608,13 +634,14 @@ class MemoryIndex:
             prefetch_k = max(k * 10, 50)
             if prefetch_k > 200:
                 prefetch_k = 200
-            rows = self._conn.execute("""
-                SELECT v.id, v.distance, m.*
-                FROM memories_vec v
-                JOIN memories m ON v.id = m.id
-                WHERE v.embedding MATCH ?
-                AND k = ?
-            """, (emb_json, prefetch_k)).fetchall()
+            with self._read() as conn:
+                rows = conn.execute("""
+                    SELECT v.id, v.distance, m.*
+                    FROM memories_vec v
+                    JOIN memories m ON v.id = m.id
+                    WHERE v.embedding MATCH ?
+                    AND k = ?
+                """, (emb_json, prefetch_k)).fetchall()
 
             results = []
             for row in rows:
@@ -662,22 +689,23 @@ class MemoryIndex:
         if not self._vec_available:
             return False
 
-        # 检查是否已有嵌入
-        row = self._conn.execute(
-            "SELECT content_hash FROM memories WHERE id = ?", (memory_id,)
-        ).fetchone()
+        with self._read() as conn:
+            # 检查是否已有嵌入
+            row = conn.execute(
+                "SELECT content_hash FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
 
-        if not row:
-            return True
+            if not row:
+                return True
 
-        # 检查 hash 是否变化
-        if row["content_hash"] != content_hash:
-            return True
+            # 检查 hash 是否变化
+            if row["content_hash"] != content_hash:
+                return True
 
-        # 检查向量表中是否有此 id
-        vec_row = self._conn.execute(
-            "SELECT id FROM memories_vec WHERE id = ?", (memory_id,)
-        ).fetchone()
+            # 检查向量表中是否有此 id
+            vec_row = conn.execute(
+                "SELECT id FROM memories_vec WHERE id = ?", (memory_id,)
+            ).fetchone()
 
         return vec_row is None
 
@@ -707,9 +735,10 @@ class MemoryIndex:
             params.append(folder)
 
         where = " AND ".join(conditions)
-        row = self._conn.execute(
-            f"SELECT * FROM memories WHERE {where} LIMIT 1", params
-        ).fetchone()
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT * FROM memories WHERE {where} LIMIT 1", params
+            ).fetchone()
 
         if row:
             return self._row_to_dict(row)
@@ -774,7 +803,16 @@ class MemoryIndex:
     def rebuild_index_from_files(self, scan_dir: str):
         """从文件系统重建索引（灾难恢复）
 
-        扫描 scan_dir 下所有 TOML 文件（优先）和 JSON 文件（旧格式兼容）。
+        扫描 `scan_dir` 下所有 TOML（优先）和 JSON 文件（旧格式兼容），重新
+        喂给 SQLite 索引。
+
+        **`archive/` 目录被显式排除**——里面的记忆是「已归档/已删除」，
+        rebuild 不应该把它们复活到主索引里。
+
+        **重建前先清空 `memories` / `memories_fts`**——`bulk_upsert` 只能
+        覆盖同 id 的旧行，不会清理那些真相源文件已经删除、但索引里还残留
+        的「僵尸行」。先 TRUNCATE 再灌入扫到的记录，才是真正的 rebuild
+        语义。
         """
         import glob
 
@@ -783,10 +821,24 @@ class MemoryIndex:
         except ImportError:
             import tomli as tomllib  # Python 3.10 fallback
 
+        scan_dir_norm = os.path.normpath(scan_dir)
+        archive_root = os.path.normpath(os.path.join(scan_dir_norm, "archive"))
+        archive_prefix = archive_root + os.sep
+
+        def _is_archived(fpath: str) -> bool:
+            """判断文件是否落在 scan_dir/archive/ 下。"""
+            try:
+                p = os.path.normpath(fpath)
+            except Exception:
+                return False
+            return p == archive_root or p.startswith(archive_prefix)
+
         records = []
 
         # 优先扫描 TOML 文件
         for fpath in glob.glob(os.path.join(scan_dir, "**", "*.toml"), recursive=True):
+            if _is_archived(fpath):
+                continue
             try:
                 with open(fpath, "rb") as f:
                     data = tomllib.load(f)
@@ -823,6 +875,8 @@ class MemoryIndex:
         for fpath in glob.glob(os.path.join(scan_dir, "**", "*.json"), recursive=True):
             if "profile.json" in fpath or "chat_memory" in fpath:
                 continue
+            if _is_archived(fpath):
+                continue
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -854,9 +908,24 @@ class MemoryIndex:
             except Exception as e:
                 logger.warning(f"Failed to parse JSON {fpath}: {e}")
 
+        # 先 TRUNCATE 主表和 FTS 影子表，避免「真相源已删但索引残留」的僵尸行。
+        with self._transaction() as cur:
+            cur.execute("DELETE FROM memories")
+            cur.execute("DELETE FROM memories_fts")
+            # 注意：memories_vec 由 ANN 索引维护，重建索引时一并清掉，让
+            # 后续访问按需重新 embed。如果 sqlite-vec 未加载会抛错，安全忽略。
+            try:
+                cur.execute("DELETE FROM memories_vec")
+            except sqlite3.OperationalError:
+                pass
+
         if records:
             self.bulk_upsert(records)
-            logger.info(f"Rebuilt index from {len(records)} files")
+            logger.info(
+                f"Rebuilt index from {len(records)} files (archive/ excluded)"
+            )
+        else:
+            logger.info("Rebuilt index — 0 records (archive/ excluded)")
 
     @staticmethod
     def _parse_path(
@@ -1007,10 +1076,11 @@ class MemoryIndex:
     # ==========================================
 
     def close(self):
-        """关闭数据库连接"""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        """关闭数据库连接（持锁等所有 in-flight SQL 跑完再 close）。"""
+        with self._conn_lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
 
     def __del__(self):
         self.close()

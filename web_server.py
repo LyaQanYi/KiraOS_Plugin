@@ -46,8 +46,10 @@ from .memory.memory_paths import (
     get_entity_dir,
     list_all_entities,
     _id_to_path_segment,
+    _SAFE_ID_RE,
     ENTITY_USER,
     VALID_ENTITY_TYPES,
+    MEMORY_FOLDERS,
 )
 
 logger = get_logger("kiraos_webui", "cyan")
@@ -100,6 +102,56 @@ def _validate_entity_type(entity_type: str) -> Optional[str]:
     if entity_type not in VALID_ENTITY_TYPES:
         return None
     return entity_type
+
+
+def _validate_entity_id(entity_id: str) -> bool:
+    """Return True iff `entity_id` matches the same safe-ID regex used by
+    `memory_paths._validate_id`. Lets handlers reject bad path params as 400
+    instead of letting the deeper `get_entity_dir`/`get_memory` blow up as
+    500.
+    """
+    return bool(entity_id) and bool(_SAFE_ID_RE.match(entity_id))
+
+
+def _validate_folder(folder: str) -> bool:
+    """Return True iff `folder` is one of MEMORY_FOLDERS."""
+    return folder in MEMORY_FOLDERS
+
+
+def _resolve_path_params(
+    request: Request,
+    *,
+    require_folder: bool = False,
+) -> tuple[Optional[JSONResponse], Optional[str], Optional[str], Optional[str]]:
+    """Unified path-param validator for handlers that take
+    `/entity/{entity_type}/{entity_id}/...` (optionally `/{folder}`).
+
+    Returns `(error_response, entity_type, entity_id, folder)`:
+    - On success, `error_response` is None and the other three are normalized.
+    - On any validation failure, `error_response` is a 400 JSONResponse with
+      a short, deterministic error string suitable for the SPA, and the
+      other three are None.
+
+    This collapses the previous pattern of `_validate_entity_type` (collapse
+    to ENTITY_USER) + `get_entity_dir(...)` raising deep ValueError into a
+    single front-door check, so handlers don't return 500 for bad params.
+    """
+    entity_type = _validate_entity_type(request.path_params.get("entity_type", ""))
+    if entity_type is None:
+        return JSONResponse({"error": "invalid entity_type"}, status_code=400), None, None, None
+
+    entity_id = request.path_params.get("entity_id", "")
+    if not _validate_entity_id(entity_id):
+        return JSONResponse({"error": "invalid entity_id"}, status_code=400), None, None, None
+
+    folder = request.path_params.get("folder")
+    if require_folder:
+        if not folder or not _validate_folder(folder):
+            return JSONResponse({"error": "invalid folder"}, status_code=400), None, None, None
+    elif folder is not None and not _validate_folder(folder):
+        return JSONResponse({"error": "invalid folder"}, status_code=400), None, None, None
+
+    return None, entity_type, entity_id, folder
 
 
 def _memory_to_dict(mem) -> dict:
@@ -189,16 +241,12 @@ async def api_get_entity(request: Request) -> JSONResponse:
     if not manager:
         return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    entity_type = _validate_entity_type(request.path_params["entity_type"])
-    if entity_type is None:
-        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
-    entity_id = request.path_params["entity_id"]
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
 
     try:
         profile = await manager.profile_store.get_profile(entity_id, entity_type)
-    except ValueError:
-        # _validate_id 之类的预期错误：把错误码定准，body 不暴露底层异常文本
-        return JSONResponse({"error": "invalid entity_id"}, status_code=400)
     except Exception:
         logger.exception("get_entity profile load failed for %s/%s", entity_type, _mask_id(entity_id))
         return JSONResponse({"error": "internal error"}, status_code=500)
@@ -224,10 +272,9 @@ async def api_update_profile(request: Request) -> JSONResponse:
     if not manager:
         return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    entity_type = _validate_entity_type(request.path_params["entity_type"])
-    if entity_type is None:
-        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
-    entity_id = request.path_params["entity_id"]
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
 
     try:
         payload = await request.json()
@@ -253,10 +300,9 @@ async def api_add_fact(request: Request) -> JSONResponse:
     if not manager:
         return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    entity_type = _validate_entity_type(request.path_params["entity_type"])
-    if entity_type is None:
-        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
-    entity_id = request.path_params["entity_id"]
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
 
     try:
         payload = await request.json()
@@ -298,10 +344,9 @@ async def api_delete_entity(request: Request) -> JSONResponse:
     if not manager:
         return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    entity_type = _validate_entity_type(request.path_params["entity_type"])
-    if entity_type is None:
-        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
-    entity_id = request.path_params["entity_id"]
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
 
     base_dir = get_entity_dir(entity_id, entity_type)
     if not os.path.isdir(base_dir):
@@ -338,11 +383,9 @@ async def api_update_memory(request: Request) -> JSONResponse:
     if not manager:
         return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    entity_type = _validate_entity_type(request.path_params["entity_type"])
-    if entity_type is None:
-        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
-    entity_id = request.path_params["entity_id"]
-    folder = request.path_params["folder"]
+    err, entity_type, entity_id, folder = _resolve_path_params(request, require_folder=True)
+    if err is not None:
+        return err
     memory_id = request.path_params["memory_id"]
 
     try:
@@ -380,11 +423,9 @@ async def api_delete_memory(request: Request) -> JSONResponse:
     if not manager:
         return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    entity_type = _validate_entity_type(request.path_params["entity_type"])
-    if entity_type is None:
-        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
-    entity_id = request.path_params["entity_id"]
-    folder = request.path_params["folder"]
+    err, entity_type, entity_id, folder = _resolve_path_params(request, require_folder=True)
+    if err is not None:
+        return err
     memory_id = request.path_params["memory_id"]
 
     ok = await manager.tree_store.archive_memory(
