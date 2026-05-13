@@ -303,12 +303,25 @@ class TomlTreeStore:
             new_hash = MemoryIndex.content_hash(content_text)
             target_path = memory.file_path
             if os.path.exists(target_path):
+                # `existing_hash is None` 用来区分"读失败"和"读成功但 hash 匹配"
+                # —— 之前把读失败也置成空字符串后继续 fall-through 写入路径，结果
+                # 一个暂时不可读（权限抖动 / 半文件 / 磁盘错误）的真相源文件
+                # 会被新 memory 直接覆盖，原内容彻底蒸发。读失败时也强制走
+                # 后缀路径，绝不覆盖未确认的现有文件。
                 try:
                     existing = await asyncio.to_thread(self._sync_read_toml, target_path)
                     existing_hash = MemoryIndex.content_hash(existing.get("text", ""))
-                except Exception:
-                    existing_hash = ""
-                if existing_hash and existing_hash != new_hash:
+                except Exception as e:
+                    logger.warning(
+                        "Unreadable existing memory at %s, avoiding overwrite: %s",
+                        target_path, e,
+                    )
+                    existing_hash = None
+                # 三种情况都加后缀：
+                # 1) 读成功且 hash 不同 → 冲突，正常加后缀
+                # 2) 读失败（existing_hash is None）→ 保守加后缀避免覆盖
+                # 只有 hash 完全相同时（同一条 memory 重写）才允许 upsert 同名
+                if existing_hash is None or existing_hash != new_hash:
                     suffix = new_hash[:8]
                     memory.id = f"{mem_id}_{suffix}"
                     mem_id = memory.id
@@ -396,6 +409,19 @@ class TomlTreeStore:
         try:
             # 读 TOML 文件内容
             file_data = await asyncio.to_thread(self._sync_read_toml, fpath)
+
+            # 文件名（或调用方传的 `memory_id`）才是 canonical storage key。
+            # 用户手改 TOML 把 `id` 改成别的值后，如果原样回填到 Memory.id，
+            # WebUI / update_memory 会按新 id 写出第二个文件，原文件 +
+            # 索引行变成孤儿，后续 get/archive 还会 404。只警告不信任。
+            file_id = file_data.get("id")
+            if file_id and file_id != memory_id:
+                logger.warning(
+                    "TOML id mismatch at %s: file says %r, path key is %r — "
+                    "using the path key (canonical)",
+                    fpath, file_id, memory_id,
+                )
+            file_data["id"] = memory_id
 
             # 读索引 meta（按命名空间复合主键）
             idx_meta = await asyncio.to_thread(
@@ -550,7 +576,19 @@ class TomlTreeStore:
                 fpath = os.path.join(d, fname)
                 try:
                     data = self._sync_read_toml(fpath)
-                    mem_id = data.get("id", fname[:-5])  # strip .toml
+                    # 文件名（去掉 .toml）才是 canonical storage key——
+                    # 不能信任 TOML 文件内部的 `id` 字段（参考 get_memory
+                    # 的同款处理）。用户手改后再回填会让上层用错 id 去更新
+                    # / 归档，产生孤儿文件 + 索引残骸。
+                    mem_id = fname[:-5]
+                    file_id = data.get("id")
+                    if file_id and file_id != mem_id:
+                        logger.warning(
+                            "TOML id mismatch at %s: file says %r, path key is %r"
+                            " — using the path key (canonical)",
+                            fpath, file_id, mem_id,
+                        )
+                    data["id"] = mem_id
 
                     # 从索引读 runtime meta（按命名空间复合主键定位）
                     idx_meta = self.index.get_meta(

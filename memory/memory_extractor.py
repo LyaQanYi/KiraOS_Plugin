@@ -664,9 +664,24 @@ def _clean_facts(facts: list) -> list[dict]:
                 f["importance"] = max(1, min(10, int(float(raw_imp))))
             except (ValueError, TypeError):
                 f["importance"] = 5
-        # 确保 tags 是 list
-        if not isinstance(f.get("tags"), list):
+        # 确保 tags 是 list[str]，并清掉空白 / 不可哈希值。下游 dedup 路径
+        # 会跑 `set(matched.tags).update(tags)`——一个 dict 或 list 元素就
+        # 直接 `TypeError: unhashable type` 把整条流水线打断。
+        raw_tags = f.get("tags")
+        if not isinstance(raw_tags, list):
             f["tags"] = []
+        else:
+            cleaned_tags: list[str] = []
+            seen: set[str] = set()
+            for tag in raw_tags:
+                if not isinstance(tag, (str, int, float, bool)):
+                    continue
+                s = str(tag).strip()
+                if not s or s in seen:
+                    continue
+                cleaned_tags.append(s)
+                seen.add(s)
+            f["tags"] = cleaned_tags
         # 清理 semantic_id
         sem_id = f.get("semantic_id", "")
         if sem_id:

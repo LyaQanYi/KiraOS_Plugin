@@ -449,7 +449,11 @@ async def api_update_memory(request: Request) -> JSONResponse:
     if not memory:
         return JSONResponse({"error": "memory not found"}, status_code=404)
 
-    if "text" in payload and isinstance(payload["text"], str):
+    # 编辑接口里凡是显式提供了字段但类型不对，都直接报 400 而不是静默忽略。
+    # 之前的 silent-drop 会让前端误以为修改已落地，实际磁盘没动。
+    if "text" in payload:
+        if not isinstance(payload["text"], str):
+            return JSONResponse({"error": "text must be a string"}, status_code=400)
         if len(payload["text"]) > MAX_TEXT_LEN:
             return JSONResponse({"error": f"text too long (>{MAX_TEXT_LEN})"}, status_code=400)
         memory.text = payload["text"]
@@ -457,8 +461,12 @@ async def api_update_memory(request: Request) -> JSONResponse:
         try:
             memory.importance = max(1, min(10, int(payload["importance"])))
         except (TypeError, ValueError):
-            pass
-    if "tags" in payload and isinstance(payload["tags"], list):
+            return JSONResponse(
+                {"error": "importance must be an integer 1-10"}, status_code=400
+            )
+    if "tags" in payload:
+        if not isinstance(payload["tags"], list):
+            return JSONResponse({"error": "tags must be a list"}, status_code=400)
         memory.tags = [str(t) for t in payload["tags"]]
 
     ok = await manager.tree_store.update_memory(memory)
