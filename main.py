@@ -102,12 +102,18 @@ class UserMemoryPlugin(BasePlugin):
         self._recall_top_k = int(cfg.get("recall_top_k", 5))
         self._max_memory_length = int(cfg.get("max_memory_length", 20))
         # 海马体每条 LLM 调用的超时（秒）；卡慢的 provider 调大、本地快模型可以调小。
-        # schema 里声明的是 integer——这里也走 int() 保持类型一致（"多少秒"的
-        # 语义本就是整数，避免 WebUI 输入小数后跟 schema 校验对不上）。
+        # schema 里声明的是 integer，min=5 / max=300——这里也走 int() 保持类型
+        # 一致（"多少秒"的语义本就是整数）。
+        #
+        # **Clamp 到 schema 的 [5, 300] 区间**：WebUI 会做校验，但用户手编
+        # config 文件或直接调 API 写入仍可注入 0 / 负数 / 极大值。0 或负数会
+        # 让 `asyncio.wait_for` 立即超时把海马体饿死；过大值（小时级）会让一
+        # 次卡死的 LLM 请求长时间占住背景 task。代码层 clamp 是最后一道闸。
         try:
-            self._llm_chat_timeout = int(cfg.get("llm_chat_timeout", 30))
+            raw = int(cfg.get("llm_chat_timeout", 30))
         except (TypeError, ValueError):
-            self._llm_chat_timeout = 30
+            raw = 30
+        self._llm_chat_timeout = max(5, min(300, raw))
         self._auto_migrate = bool(cfg.get("auto_migrate_legacy_db", True))
         self._enable_decay = bool(cfg.get("enable_decay", True))
 
