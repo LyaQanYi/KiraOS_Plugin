@@ -131,7 +131,10 @@ class MemoryExtractor:
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
-            logger.error(f"Personal fact extraction error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Personal fact extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+            else:
+                logger.error("Personal fact extraction error: %s: %s", type(e).__name__, e)
         return []
 
     async def extract_group_facts(self, conversation_text: str) -> list[dict]:
@@ -179,7 +182,10 @@ class MemoryExtractor:
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
-            logger.error(f"Group fact extraction error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Group fact extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+            else:
+                logger.error("Group fact extraction error: %s: %s", type(e).__name__, e)
         return []
 
     async def extract_facts(self, conversation_text: str) -> list[dict]:
@@ -214,7 +220,10 @@ class MemoryExtractor:
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
-            logger.error(f"Fact extraction error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Fact extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+            else:
+                logger.error("Fact extraction error: %s: %s", type(e).__name__, e)
         return []
 
     # ==========================================
@@ -290,7 +299,10 @@ class MemoryExtractor:
                 ]
                 return insights[:2]  # 最多 2 条
         except Exception as e:
-            logger.error(f"Self-awareness extraction error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Self-awareness extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+            else:
+                logger.error("Self-awareness extraction error: %s: %s", type(e).__name__, e)
         return []
 
     # ==========================================
