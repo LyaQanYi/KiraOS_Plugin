@@ -4,5 +4,11 @@
     "version": "3.0.0",
     "author": "LyaQanYi",
     "description": "OS-level plugin combining a dual-brain memory engine (fast SQLite+FTS5 retrieval and a slow background hippocampus that extracts facts, reflects, and updates per-entity profiles; TOML files are the source of truth, SQLite is a rebuildable index) with a progressive skill router (manifest-based tool discovery, on-demand sub-agent execution). Memory is the brain, skills are programs.",
-    "repo": null
+    "repo": null,
+    "locales": {
+        "zh": {
+            "display_name": "KiraOS（双脑记忆 + 技能路由）",
+            "description": "OS 级插件，整合两套核心能力：双脑记忆系统（SQLite + FTS5 实时检索 + 后台海马体异步提取事实/反思/画像，TOML 文件作真相源、SQLite 作可重建索引）与渐进式技能路由（manifest 驱动的工具发现、按需注入子 agent）。记忆是大脑，技能是程序。"
+        }
+    }
 }

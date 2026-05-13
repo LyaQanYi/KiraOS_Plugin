@@ -5,7 +5,13 @@
         "default": 3,
         "minimum": 1,
         "maximum": 50,
-        "hint": "Number of accumulated user/assistant chunks per session that trigger a background hippocampus run (fact extraction, deduplication, reflection, profile update). Lower = more responsive memory but more LLM calls."
+        "hint": "Number of accumulated user/assistant chunks per session that trigger a background hippocampus run (fact extraction, deduplication, reflection, profile update). Lower = more responsive memory but more LLM calls.",
+        "locales": {
+            "zh": {
+                "name": "海马体触发阈值",
+                "hint": "每个会话累计多少条 user/assistant 对话块时触发一次后台海马体运行（提取事实、去重、反思、更新画像）。值越低记忆越实时但 LLM 调用越多。"
+            }
+        }
     },
     "recall_top_k": {
         "name": "Recall top-K",
@@ -13,62 +19,122 @@
         "default": 5,
         "minimum": 1,
         "maximum": 30,
-        "hint": "How many long-term memories to recall and inject into the system prompt each turn."
+        "hint": "How many long-term memories to recall and inject into the system prompt each turn.",
+        "locales": {
+            "zh": {
+                "name": "召回条数 K",
+                "hint": "每轮对话从长期记忆里召回多少条注入到 system prompt。"
+            }
+        }
     },
     "max_memory_length": {
         "name": "Short-term memory window",
         "type": "integer",
         "default": 20,
         "minimum": 1,
-        "hint": "Sliding-window size for short-term chat history (chunks per session)."
+        "hint": "Sliding-window size for short-term chat history (chunks per session).",
+        "locales": {
+            "zh": {
+                "name": "短期记忆窗口",
+                "hint": "短期对话历史的滑动窗口大小（每会话保留多少对话块）。"
+            }
+        }
     },
     "inject_profile": {
         "name": "Inject user profile",
         "type": "switch",
         "default": true,
-        "hint": "Inject the per-user profile (name, traits, preferences, relationships, facts) into the system prompt every turn."
+        "hint": "Inject the per-user profile (name, traits, preferences, relationships, facts) into the system prompt every turn.",
+        "locales": {
+            "zh": {
+                "name": "注入用户画像",
+                "hint": "每轮对话把当前用户的画像（名字、特征、偏好、关系、事实）注入到 system prompt。"
+            }
+        }
     },
     "inject_facts": {
         "name": "Inject recalled facts",
         "type": "switch",
         "default": true,
-        "hint": "Include recalled fact memories in the system prompt every turn."
+        "hint": "Include recalled fact memories in the system prompt every turn.",
+        "locales": {
+            "zh": {
+                "name": "注入召回的事实",
+                "hint": "每轮对话把召回的事实类记忆注入到 system prompt。"
+            }
+        }
     },
     "inject_reflections": {
         "name": "Inject recalled reflections",
         "type": "switch",
         "default": true,
-        "hint": "Include recalled high-level reflections in the system prompt every turn."
+        "hint": "Include recalled high-level reflections in the system prompt every turn.",
+        "locales": {
+            "zh": {
+                "name": "注入召回的洞察",
+                "hint": "每轮对话把召回的高层洞察（reflection）注入到 system prompt。"
+            }
+        }
     },
     "enable_decay": {
         "name": "Enable forgetting (decay)",
         "type": "switch",
         "default": true,
-        "hint": "Periodically downgrade and archive low-importance, long-unused memories. (Decay runs on demand via run_forgetting_cycle; scheduling will be added in a later release.)"
+        "hint": "Periodically downgrade and archive low-importance, long-unused memories. (Decay runs on demand via run_forgetting_cycle; scheduling will be added in a later release.)",
+        "locales": {
+            "zh": {
+                "name": "启用遗忘（衰减）",
+                "hint": "周期性降级并归档低重要度、长期未访问的记忆。（当前需手动调用 run_forgetting_cycle 触发，后续版本会加自动调度。）"
+            }
+        }
     },
     "auto_migrate_legacy_db": {
         "name": "Auto-migrate v2 SQLite",
         "type": "switch",
         "default": true,
-        "hint": "On first run, automatically migrate any existing v2 kiraos.db (user_profiles + event_logs) into the new TOML structure. The old file is backed up to kiraos.db.bak_<timestamp>."
+        "hint": "On first run, automatically migrate any existing v2 kiraos.db (user_profiles + event_logs) into the new TOML structure. The old file is backed up to kiraos.db.bak_<timestamp>.",
+        "locales": {
+            "zh": {
+                "name": "自动迁移 v2 SQLite",
+                "hint": "首次启动时自动把已存在的 v2 kiraos.db（user_profiles + event_logs 两张表）迁移到新的 TOML 结构。旧文件会备份为 kiraos.db.bak_<时间戳>。"
+            }
+        }
     },
     "skills_dir": {
         "name": "Skills directory",
         "type": "string",
         "default": null,
-        "hint": "Path to the skills directory (defaults to data/skills/). Each skill is a subfolder containing either SKILL.md (recommended, single-file YAML frontmatter) or the legacy manifest.json + instruction.md pair."
+        "hint": "Path to the skills directory (defaults to data/skills/). Each skill is a subfolder containing either SKILL.md (recommended, single-file YAML frontmatter) or the legacy manifest.json + instruction.md pair.",
+        "locales": {
+            "zh": {
+                "name": "技能目录",
+                "hint": "技能目录的路径（默认 data/skills/）。每个技能是一个子目录，可以用 SKILL.md（推荐，YAML frontmatter 单文件）或者老格式的 manifest.json + instruction.md 两文件。"
+            }
+        }
     },
     "disabled_skills": {
         "name": "Disabled skills",
         "type": "list",
         "default": [],
-        "hint": "List of skill names to disable (won't be registered as LLM tools). Example: [\"tarot_reading\", \"daily_fortune\"]"
+        "hint": "List of skill names to disable (won't be registered as LLM tools). Example: [\"tarot_reading\", \"daily_fortune\"]",
+        "locales": {
+            "zh": {
+                "name": "禁用的技能",
+                "hint": "要禁用的技能名列表（不会注册为 LLM 工具）。例如：[\"tarot_reading\", \"daily_fortune\"]"
+            }
+        }
     },
     "enable_slash_commands": {
         "name": "Enable slash commands",
         "type": "switch",
         "default": false,
-        "hint": "Allow users to trigger skills via /command (e.g. /tarot). When disabled, skills can only be triggered by LLM."
+        "hint": "Allow users to trigger skills via /command (e.g. /tarot). When disabled, skills can only be triggered by LLM.",
+        "locales": {
+            "zh": {
+                "name": "启用斜杠命令",
+                "hint": "允许用户用 /命令 直接触发技能（如 /tarot）。关闭时技能只能由 LLM 调用。"
+            }
+        }
     },
     "webui_port": {
         "name": "Memory WebUI port",
@@ -76,18 +142,36 @@
         "default": 0,
         "minimum": 0,
         "maximum": 65535,
-        "hint": "Port for the memory management WebUI (0 = disabled, valid range: 1-65535). Example: 8765"
+        "hint": "Port for the memory management WebUI (0 = disabled, valid range: 1-65535). Example: 8765",
+        "locales": {
+            "zh": {
+                "name": "记忆 WebUI 端口",
+                "hint": "记忆管理 WebUI 的监听端口（0 = 禁用，有效范围 1-65535）。例如：8765"
+            }
+        }
     },
     "webui_host": {
         "name": "Memory WebUI host",
         "type": "string",
         "default": "127.0.0.1",
-        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access."
+        "hint": "Bind address for the memory WebUI. Use 127.0.0.1 for local-only access.",
+        "locales": {
+            "zh": {
+                "name": "记忆 WebUI 绑定地址",
+                "hint": "记忆 WebUI 的监听地址。127.0.0.1 表示仅本机可访问。"
+            }
+        }
     },
     "webui_token": {
         "name": "Memory WebUI token",
         "type": "string",
         "default": "",
-        "hint": "Access token for the memory WebUI (leave empty for no authentication, only safe for local access)."
+        "hint": "Access token for the memory WebUI (leave empty for no authentication, only safe for local access).",
+        "locales": {
+            "zh": {
+                "name": "记忆 WebUI 访问令牌",
+                "hint": "记忆 WebUI 的访问令牌（留空表示不鉴权，仅在仅本机访问时安全）。"
+            }
+        }
     }
 }
