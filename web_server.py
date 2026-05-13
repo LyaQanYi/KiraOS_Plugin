@@ -415,7 +415,19 @@ async def api_update_memory(request: Request) -> JSONResponse:
         memory.tags = [str(t) for t in payload["tags"]]
 
     ok = await manager.tree_store.update_memory(memory)
-    return JSONResponse({"ok": bool(ok)})
+    if not ok:
+        # 把持久化失败映射成 5xx，避免前端 / SDK 以 2xx 判定成功而误以为
+        # 修改已落地。日志里有具体异常上下文（tree_store.update_memory 会
+        # logger.error）；body 不暴露底层细节。
+        logger.warning(
+            "update_memory returned False for %s/%s/%s/%s",
+            entity_type,
+            _mask_id(entity_id),
+            folder,
+            memory_id,
+        )
+        return JSONResponse({"error": "update failed"}, status_code=500)
+    return JSONResponse({"ok": True})
 
 
 async def api_delete_memory(request: Request) -> JSONResponse:
@@ -434,7 +446,13 @@ async def api_delete_memory(request: Request) -> JSONResponse:
         entity_type=entity_type,
         folder=folder,
     )
-    return JSONResponse({"ok": bool(ok)})
+    if not ok:
+        # archive_memory 返回 False 多半是源文件已不存在或写归档失败。
+        # 用 404 表示"目标不存在"，让 SDK / 前端能区分参数错误和真实失败。
+        return JSONResponse(
+            {"error": "memory not found or archive failed"}, status_code=404
+        )
+    return JSONResponse({"ok": True})
 
 
 async def api_search(request: Request) -> JSONResponse:

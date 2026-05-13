@@ -369,8 +369,16 @@ class TomlTreeStore:
             # 读 TOML 文件内容
             file_data = await asyncio.to_thread(self._sync_read_toml, fpath)
 
-            # 读索引 meta
-            idx_meta = await asyncio.to_thread(self.index.get_meta, memory_id)
+            # 读索引 meta（按命名空间复合主键）
+            idx_meta = await asyncio.to_thread(
+                lambda: self.index.get_meta(
+                    memory_id,
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                    folder=folder,
+                    base_dir=base_dir,
+                )
+            )
             runtime_meta = {}
             if idx_meta:
                 runtime_meta = {
@@ -411,7 +419,16 @@ class TomlTreeStore:
             try:
                 if os.path.exists(fpath):
                     await asyncio.to_thread(os.remove, fpath)
-                await asyncio.to_thread(self.index.delete, memory_id)
+                # 按命名空间复合主键删除，避免跨实体撞 ID 时连带删错记忆
+                await asyncio.to_thread(
+                    lambda: self.index.delete(
+                        memory_id,
+                        entity_id=entity_id,
+                        entity_type=entity_type,
+                        folder=folder,
+                        base_dir=base_dir,
+                    )
+                )
                 logger.debug(f"Memory deleted: {memory_id}")
                 return True
             except Exception as e:
@@ -469,7 +486,16 @@ class TomlTreeStore:
                 fpath = os.path.join(d, f"{memory_id}.toml")
                 if os.path.exists(fpath):
                     await asyncio.to_thread(os.remove, fpath)
-                await asyncio.to_thread(self.index.delete, memory_id)
+                # 按命名空间复合主键删除索引行
+                await asyncio.to_thread(
+                    lambda: self.index.delete(
+                        memory_id,
+                        entity_id=entity_id,
+                        entity_type=entity_type,
+                        folder=folder,
+                        base_dir=base_dir,
+                    )
+                )
                 logger.debug(f"Memory archived: {memory_id}")
                 return True
             except Exception as e:
@@ -498,8 +524,14 @@ class TomlTreeStore:
                     data = self._sync_read_toml(fpath)
                     mem_id = data.get("id", fname[:-5])  # strip .toml
 
-                    # 从索引读 runtime meta
-                    idx_meta = self.index.get_meta(mem_id)
+                    # 从索引读 runtime meta（按命名空间复合主键定位）
+                    idx_meta = self.index.get_meta(
+                        mem_id,
+                        entity_id=entity_id,
+                        entity_type=entity_type,
+                        folder=folder,
+                        base_dir=base_dir,
+                    )
                     runtime_meta = {}
                     if idx_meta:
                         runtime_meta = {
@@ -601,7 +633,15 @@ class TomlTreeStore:
         if update_access:
             for mem in memories:
                 mem.touch_access()
-                await asyncio.to_thread(self.index.touch_access, mem.id)
+                await asyncio.to_thread(
+                    lambda m=mem: self.index.touch_access(
+                        m.id,
+                        entity_id=m._entity_id,
+                        entity_type=m._entity_type,
+                        folder=m._folder,
+                        base_dir=m._base_dir,
+                    )
+                )
 
         return memories
 
@@ -632,9 +672,16 @@ class TomlTreeStore:
 
         import math
         now = time.time()
+        # 先按 search() 留在 mem.meta["_score"] 的混合检索分排，再用
+        # importance + 时间衰减作为 tie-breaker。原来只看 importance / recency
+        # 会把弱命中的高 importance 条目压过真正相关的结果——上层
+        # `MemoryManager.recall()` 整条链路的搜索质量都会被这条排序拖累。
         all_results.sort(
-            key=lambda m: m.importance * 0.6
-            + math.exp(-(now - m.last_accessed) / 86400 / 30.0) * 0.4,
+            key=lambda m: (
+                float((m.meta or {}).get("_score", 0.0)),
+                m.importance * 0.6
+                + math.exp(-(now - m.last_accessed) / 86400 / 30.0) * 0.4,
+            ),
             reverse=True,
         )
         return all_results[:k]
@@ -650,7 +697,15 @@ class TomlTreeStore:
 
     async def ensure_indexed(self, memory: Memory):
         """确保单条记忆在索引中（用于旧文件迁移）"""
-        existing = await asyncio.to_thread(self.index.get_meta, memory.id)
+        existing = await asyncio.to_thread(
+            lambda: self.index.get_meta(
+                memory.id,
+                entity_id=memory._entity_id,
+                entity_type=memory._entity_type,
+                folder=memory._folder,
+                base_dir=memory._base_dir,
+            )
+        )
         if not existing:
             await asyncio.to_thread(
                 self.index.upsert,

@@ -120,11 +120,41 @@ class MemoryManager:
         logger.info("Memory index rebuilt from TOML files (startup sync)")
 
     def set_llm_client(self, llm_client):
-        """延迟设置 LLM 客户端"""
+        """延迟设置 LLM 客户端。
+
+        启动窗口期（"插件起来 → LLM 还没注入 → 用户消息已攒到阈值"）里，
+        `_hippocampus_process` 会把 chunks 还回 `_pending_conversations`
+        队列。LLM 一就绪就要主动把这些已经超过阈值的会话拉起，否则它们
+        会卡到下一次新消息到达才重新触发。
+        """
         self._llm_client = llm_client
         self.extractor.set_llm_client(llm_client)
         # 同时将 llm_client 作为 fast_llm 的后端（通过 chat_fast 方法自动选模型）
         self.extractor.set_fast_llm_client(llm_client)
+
+        # 主动 drain pending：扫一遍所有 session，已达阈值的立刻调度。
+        # 在 hippocampus_lock 内取出 + 清空 pending，跟 _buffer_for_hippocampus
+        # 同样的语义，避免和并发的新 chunk 入队竞争。
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # 没有运行中的 loop（同步初始化路径），跳过
+        to_dispatch: list[tuple[str, list]] = []
+        with self._hippocampus_lock:
+            for session, chunks in list(self._pending_conversations.items()):
+                if len(chunks) >= self._hippocampus_threshold:
+                    to_dispatch.append((session, list(chunks)))
+                    self._pending_conversations[session] = []
+        for session, chunks in to_dispatch:
+            task = loop.create_task(self._hippocampus_process(session, chunks))
+            with self._background_tasks_lock:
+                self._background_tasks.add(task)
+            task.add_done_callback(self._on_background_task_done)
+        if to_dispatch:
+            logger.info(
+                "LLM client wired; dispatched %d pending hippocampus batches",
+                len(to_dispatch),
+            )
 
     # ==========================================
     # 短期记忆（对话历史 — 滑动窗口）
@@ -162,11 +192,23 @@ class MemoryManager:
             memory = self.chat_memory
         if not path:
             path = self.chat_memory_path
+        # 原子写：和 profile.json / TOML 一样走同目录 .tmp + fsync + os.replace。
+        # 直接覆写文件时进程在 json.dump 中途崩掉会留下坏 JSON，下次
+        # `_load_memory()` 会按异常处理成空 dict，整份短期会话历史直接清零。
+        tmp = f"{path}.tmp"
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(memory, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
         except Exception as e:
             logger.error(f"Error saving memory to {path}: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     async def _save_memory(self, memory: Dict[str, dict] = None, path: str = None):
         if not memory:
@@ -307,29 +349,52 @@ class MemoryManager:
             parts.append(f"[{label}]{tags_str} {mem.raw_text}")
         return "\n".join(parts)
 
-    async def confirm_memory_usage(self, memory_ids: list[str]):
+    async def confirm_memory_usage(self, memories):
         """确认记忆被实质使用，执行严格的 access_count +1
 
         宪章 §7.4：只有在记忆被实质引用时才 +1。
         由消息处理器在生成回复后调用。
 
-        实现：依赖 `MemoryIndex.touch_access`，按 memory_id 直接定位行
-        （索引以 id 为主键，无需额外的 entity 信息）。`touch_access` 是
-        同步 SQLite 操作，整体 dispatch 到线程池避免阻塞 event loop。
+        Args:
+            memories: 一个 `list[Memory]`（推荐——Memory 自带 entity 上下文）。
+                索引现在用 (entity_type, entity_id, folder, base_dir, id) 复合
+                主键定位单行，所以裸 memory_id 不再能唯一确定一条记录，必须
+                带完整命名空间信息。
         """
-        if not memory_ids:
+        if not memories:
             return
 
-        def _bulk_touch(ids: list[str]):
-            for mid in ids:
-                if not mid:
-                    continue
+        # 把 Memory 对象拆成可 pickle 的 plain tuple，再丢到线程池跑同步 SQL。
+        targets = []
+        for m in memories:
+            mid = getattr(m, "id", None)
+            if not mid:
+                continue
+            targets.append((
+                mid,
+                getattr(m, "_entity_id", "") or "",
+                getattr(m, "_entity_type", "") or "",
+                getattr(m, "_folder", "") or "facts",
+                getattr(m, "_base_dir", "") or "",
+            ))
+
+        if not targets:
+            return
+
+        def _bulk_touch(items):
+            for mid, eid, etype, folder, base_dir in items:
                 try:
-                    self.memory_index.touch_access(mid)
+                    self.memory_index.touch_access(
+                        mid,
+                        entity_id=eid,
+                        entity_type=etype,
+                        folder=folder,
+                        base_dir=base_dir,
+                    )
                 except Exception as e:
                     logger.warning(f"touch_access failed for {mid}: {e}")
 
-        await asyncio.to_thread(_bulk_touch, list(memory_ids))
+        await asyncio.to_thread(_bulk_touch, targets)
 
     # ==========================================
     # 实体画像
@@ -602,7 +667,18 @@ class MemoryManager:
             await self._collect_self_awareness(conversation_text)
 
         except Exception as e:
-            logger.error(f"Hippocampus processing error: {e}", exc_info=True)
+            # pending 在 _buffer_for_hippocampus 入队时已经清空给本任务，这里
+            # 任何异常如果只 log 就走人，整批 chunks 永远不会再被处理喵——
+            # 把它们放回队首等下一次新消息触发重试，和 LLM-not-set 分支同款
+            # 保守策略。
+            with self._hippocampus_lock:
+                pending = self._pending_conversations.setdefault(session, [])
+                self._pending_conversations[session] = list(chunks) + pending
+            logger.error(
+                f"Hippocampus processing error: {e}; "
+                f"re-buffered {len(chunks)} chunks for retry",
+                exc_info=True,
+            )
 
     async def _collect_self_awareness(self, conversation_text: str):
         """Phase 1: 从对话中提取 AI 的自我觉察，写入 global/self/facts/

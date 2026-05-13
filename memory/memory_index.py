@@ -102,11 +102,38 @@ class MemoryIndex:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
 
+        # 兼容旧 schema：v3 之前 `memories.id` 是全局 PRIMARY KEY，会让两个
+        # 不同 entity 用同一语义 ID（如 likes_python）撞主键。新 schema 用
+        # (entity_type, entity_id, folder, base_dir, id) 复合主键做命名空间
+        # 隔离。检测到旧表就 DROP 重建——内容索引会在下一次 rebuild_index_
+        # from_files() 调用时从 TOML 真相源完全恢复。
+        try:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row and row[0] and "primary key (entity_type" not in row[0].lower():
+            logger.warning(
+                "Detected legacy memories schema (id PRIMARY KEY) — dropping for "
+                "rebuild with composite namespace key. Run rebuild_index_from_files() "
+                "afterwards to repopulate from TOML."
+            )
+            with self._transaction() as cur:
+                cur.execute("DROP TABLE IF EXISTS memories_fts")
+                cur.execute("DROP TABLE IF EXISTS memories")
+
         with self._transaction() as cur:
-            # 主表：记忆元数据
+            # 主表：记忆元数据。复合主键防止 likes_python 这类语义 ID 在不同
+            # entity 下撞车——撞了后写入会覆盖前者的索引，跨实体搜索丢条目、
+            # touch_access 串线、meta 互污染都是这条主键的直接后果。
+            #
+            # `storage_key` 是个 STORED 生成列：拼接 entity 命名空间 + id 形成
+            # 全局唯一 token，给 FTS5 / vec0 这些不能用复合主键的虚拟表做单
+            # 字段 JOIN 用。需要 SQLite 3.31+（Python 3.10+ 默认满足）。
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
-                    id TEXT PRIMARY KEY,
+                    id TEXT NOT NULL,
                     entity_id TEXT NOT NULL DEFAULT '',
                     entity_type TEXT NOT NULL DEFAULT '',
                     folder TEXT NOT NULL DEFAULT 'facts',
@@ -120,8 +147,17 @@ class MemoryIndex:
                     content_hash TEXT NOT NULL DEFAULT '',
                     file_path TEXT NOT NULL DEFAULT '',
                     base_dir TEXT NOT NULL DEFAULT '',
-                    raw_text TEXT NOT NULL DEFAULT ''
+                    raw_text TEXT NOT NULL DEFAULT '',
+                    storage_key TEXT GENERATED ALWAYS AS (
+                        entity_type || char(1) || entity_id || char(1) ||
+                        folder || char(1) || base_dir || char(1) || id
+                    ) STORED,
+                    PRIMARY KEY (entity_type, entity_id, folder, base_dir, id)
                 )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mem_storage_key
+                ON memories(storage_key)
             """)
 
             # FTS5 全文索引（独立表，手动同步）
@@ -220,6 +256,25 @@ class MemoryIndex:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
+    def _storage_key(
+        memory_id: str,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> str:
+        """Compose the namespaced storage key.
+
+        FTS5 表无法对 (entity, folder, id) 复合主键直接做 WHERE，所以
+        `memories_fts.memory_id` 列改为存这个拼接后的复合 key——和 main
+        表的 PK 一一对应，DELETE/INSERT/JOIN 都按它走。分隔符用 `\x01`
+        是为了避免和真实 ID 里的 `:` / `/` 之类字符撞。
+        """
+        return (
+            f"{entity_type}\x01{entity_id}\x01{folder}\x01{base_dir}\x01{memory_id}"
+        )
+
+    @staticmethod
     def _segment_for_fts(text: str) -> str:
         """用 jieba（可选）分词后用空格连接，使 FTS5 unicode61 能正确检索中文"""
         if not text:
@@ -273,11 +328,7 @@ class MemoryIndex:
                      importance, timestamp, last_accessed, access_count,
                      tags, source, content_hash, file_path, base_dir, raw_text)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    entity_id = excluded.entity_id,
-                    entity_type = excluded.entity_type,
-                    folder = excluded.folder,
-                    base_dir = excluded.base_dir,
+                ON CONFLICT(entity_type, entity_id, folder, base_dir, id) DO UPDATE SET
                     memory_type = excluded.memory_type,
                     timestamp = excluded.timestamp,
                     importance = excluded.importance,
@@ -294,42 +345,93 @@ class MemoryIndex:
                 tags_json, source_json, chash, file_path, base_dir, raw_text,
             ))
 
-            # 同步 FTS 索引（用分词后的文本）
+            # 同步 FTS 索引（用分词后的文本）。FTS5 行的 memory_id 列存复合
+            # storage_key 而非裸语义 ID，跨 entity 重名时彼此不会互删/互查。
+            storage_key = self._storage_key(
+                memory_id, entity_id, entity_type, folder, base_dir
+            )
             cur.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,)
+                "DELETE FROM memories_fts WHERE memory_id = ?", (storage_key,)
             )
             cur.execute(
                 "INSERT INTO memories_fts(memory_id, raw_text, tags_text) VALUES (?, ?, ?)",
-                (memory_id, segmented_text, tags_flat),
+                (storage_key, segmented_text, tags_flat),
             )
 
-    def get_meta(self, memory_id: str) -> Optional[Dict[str, Any]]:
-        """获取单条记忆的 meta"""
+    def get_meta(
+        self,
+        memory_id: str,
+        *,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """获取单条记忆的 meta（按命名空间复合主键查询）。
+
+        Schema 现在用 (entity_type, entity_id, folder, base_dir, id) 做
+        PRIMARY KEY，所以必须传完整的 entity 上下文才能精确定位单行；只传
+        裸 memory_id 会在跨实体重名时返回错记忆。
+        """
         with self._read() as conn:
             row = conn.execute(
-                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+                "SELECT * FROM memories WHERE id = ? AND entity_id = ? AND "
+                "entity_type = ? AND folder = ? AND base_dir = ?",
+                (memory_id, entity_id, entity_type, folder, base_dir),
             ).fetchone()
         if row:
             return self._row_to_dict(row)
         return None
 
-    def delete(self, memory_id: str):
-        """删除记忆索引"""
+    def delete(
+        self,
+        memory_id: str,
+        *,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ):
+        """删除记忆索引（按复合主键定位单行）。
+
+        必须传完整 entity 上下文，否则跨实体重名时会一次删多条。FTS5 表用
+        storage_key（复合 key 字符串）做单行定位。
+        """
+        storage_key = self._storage_key(
+            memory_id, entity_id, entity_type, folder, base_dir
+        )
         with self._transaction() as cur:
-            cur.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             cur.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,)
+                "DELETE FROM memories WHERE id = ? AND entity_id = ? AND "
+                "entity_type = ? AND folder = ? AND base_dir = ?",
+                (memory_id, entity_id, entity_type, folder, base_dir),
+            )
+            cur.execute(
+                "DELETE FROM memories_fts WHERE memory_id = ?", (storage_key,)
             )
             if self._vec_available:
+                # memories_vec 主键还是单字段 id（vec0 限制）；如果将来要扩展
+                # 跨实体向量搜索，可以把 vec0 的 id 也改成 storage_key。当前
+                # 不会受撞名影响，因为向量是用 storage_key 作为 vec0 主键写入
+                # 的（见 store_embedding 下方修改）。
                 try:
                     cur.execute(
-                        "DELETE FROM memories_vec WHERE id = ?", (memory_id,)
+                        "DELETE FROM memories_vec WHERE id = ?", (storage_key,)
                     )
                 except Exception:
                     pass
 
-    def update_meta(self, memory_id: str, **kwargs):
-        """部分更新 meta 字段"""
+    def update_meta(
+        self,
+        memory_id: str,
+        *,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+        **kwargs,
+    ):
+        """部分更新 meta 字段（按复合主键单行）。"""
         allowed = {
             "importance", "last_accessed", "access_count",
             "tags", "source", "raw_text", "content_hash", "file_path",
@@ -349,19 +451,25 @@ class MemoryIndex:
         if not updates:
             return
 
-        values.append(memory_id)
+        # WHERE 复合主键：避免一次更新多行（撞 ID 的跨实体记忆）
+        values.extend([memory_id, entity_id, entity_type, folder, base_dir])
         needs_fts_sync = "raw_text" in kwargs or "tags" in kwargs
 
+        storage_key = self._storage_key(
+            memory_id, entity_id, entity_type, folder, base_dir
+        )
         with self._transaction() as cur:
             cur.execute(
-                f"UPDATE memories SET {', '.join(updates)} WHERE id = ?",
+                f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND "
+                "entity_id = ? AND entity_type = ? AND folder = ? AND base_dir = ?",
                 values,
             )
             # 如果 raw_text 或 tags 变化，同步 FTS
             if needs_fts_sync:
                 row = cur.execute(
-                    "SELECT raw_text, tags FROM memories WHERE id = ?",
-                    (memory_id,),
+                    "SELECT raw_text, tags FROM memories WHERE id = ? AND "
+                    "entity_id = ? AND entity_type = ? AND folder = ? AND base_dir = ?",
+                    (memory_id, entity_id, entity_type, folder, base_dir),
                 ).fetchone()
                 if row:
                     raw_text = row[0]
@@ -370,24 +478,33 @@ class MemoryIndex:
                     tags_flat = " ".join(tags_list)
                     cur.execute(
                         "DELETE FROM memories_fts WHERE memory_id = ?",
-                        (memory_id,),
+                        (storage_key,),
                     )
                     cur.execute(
                         "INSERT INTO memories_fts(memory_id, raw_text, tags_text) "
                         "VALUES (?, ?, ?)",
-                        (memory_id, segmented, tags_flat),
+                        (storage_key, segmented, tags_flat),
                     )
 
-    def touch_access(self, memory_id: str):
-        """标记一次访问: access_count +1, last_accessed = now"""
+    def touch_access(
+        self,
+        memory_id: str,
+        *,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ):
+        """标记一次访问: access_count +1, last_accessed = now（按复合主键）。"""
         now = time.time()
         with self._transaction() as cur:
             cur.execute(
                 """UPDATE memories
                    SET access_count = access_count + 1,
                        last_accessed = ?
-                   WHERE id = ?""",
-                (now, memory_id),
+                   WHERE id = ? AND entity_id = ? AND entity_type = ?
+                     AND folder = ? AND base_dir = ?""",
+                (now, memory_id, entity_id, entity_type, folder, base_dir),
             )
 
     # ==========================================
@@ -502,7 +619,7 @@ class MemoryIndex:
             fts_sql = """
                 SELECT m.*, bm25(memories_fts) as fts_score
                 FROM memories_fts fts
-                JOIN memories m ON fts.memory_id = m.id
+                JOIN memories m ON fts.memory_id = m.storage_key
                 WHERE memories_fts MATCH ?
             """
             conditions = []
@@ -638,7 +755,7 @@ class MemoryIndex:
                 rows = conn.execute("""
                     SELECT v.id, v.distance, m.*
                     FROM memories_vec v
-                    JOIN memories m ON v.id = m.id
+                    JOIN memories m ON v.id = m.storage_key
                     WHERE v.embedding MATCH ?
                     AND k = ?
                 """, (emb_json, prefetch_k)).fetchall()
@@ -666,22 +783,43 @@ class MemoryIndex:
             logger.warning(f"Vector search error: {e}")
             return []
 
-    def store_embedding(self, memory_id: str, embedding: list):
-        """存储向量嵌入（如果 vec 可用）"""
+    def store_embedding(
+        self,
+        memory_id: str,
+        embedding: list,
+        *,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ):
+        """存储向量嵌入（如果 vec 可用）；vec0 表用 storage_key 做主键。"""
         if not self._vec_available:
             return
 
         try:
             emb_json = json.dumps(embedding)
+            storage_key = self._storage_key(
+                memory_id, entity_id, entity_type, folder, base_dir
+            )
             with self._transaction() as cur:
                 cur.execute(
                     "INSERT OR REPLACE INTO memories_vec(id, embedding) VALUES (?, ?)",
-                    (memory_id, emb_json),
+                    (storage_key, emb_json),
                 )
         except Exception as e:
             logger.warning(f"Store embedding error: {e}")
 
-    def needs_embedding(self, memory_id: str, content_hash: str) -> bool:
+    def needs_embedding(
+        self,
+        memory_id: str,
+        content_hash: str,
+        *,
+        entity_id: str = "",
+        entity_type: str = "",
+        folder: str = "facts",
+        base_dir: str = "",
+    ) -> bool:
         """检查是否需要（重新）生成嵌入
 
         OpenClaw 策略: 通过 content_hash 判断内容是否变化
@@ -689,10 +827,15 @@ class MemoryIndex:
         if not self._vec_available:
             return False
 
+        storage_key = self._storage_key(
+            memory_id, entity_id, entity_type, folder, base_dir
+        )
         with self._read() as conn:
             # 检查是否已有嵌入
             row = conn.execute(
-                "SELECT content_hash FROM memories WHERE id = ?", (memory_id,)
+                "SELECT content_hash FROM memories WHERE id = ? AND entity_id = ? "
+                "AND entity_type = ? AND folder = ? AND base_dir = ?",
+                (memory_id, entity_id, entity_type, folder, base_dir),
             ).fetchone()
 
             if not row:
@@ -704,7 +847,7 @@ class MemoryIndex:
 
             # 检查向量表中是否有此 id
             vec_row = conn.execute(
-                "SELECT id FROM memories_vec WHERE id = ?", (memory_id,)
+                "SELECT id FROM memories_vec WHERE id = ?", (storage_key,)
             ).fetchone()
 
         return vec_row is None
@@ -753,6 +896,10 @@ class MemoryIndex:
         with self._transaction() as cur:
             for rec in records:
                 mem_id = rec.get("id", "")
+                entity_id = rec.get("entity_id", "")
+                entity_type = rec.get("entity_type", "")
+                folder = rec.get("folder", "facts")
+                base_dir = rec.get("base_dir", "")
                 tags = rec.get("tags", [])
                 tags_json = json.dumps(tags, ensure_ascii=False)
                 source_json = json.dumps(rec.get("source", {}), ensure_ascii=False)
@@ -766,7 +913,7 @@ class MemoryIndex:
                          importance, timestamp, last_accessed, access_count,
                          tags, source, content_hash, file_path, base_dir, raw_text)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
+                    ON CONFLICT(entity_type, entity_id, folder, base_dir, id) DO UPDATE SET
                         importance = excluded.importance,
                         last_accessed = excluded.last_accessed,
                         access_count = excluded.access_count,
@@ -775,9 +922,9 @@ class MemoryIndex:
                         raw_text = excluded.raw_text
                 """, (
                     mem_id,
-                    rec.get("entity_id", ""),
-                    rec.get("entity_type", ""),
-                    rec.get("folder", "facts"),
+                    entity_id,
+                    entity_type,
+                    folder,
                     rec.get("memory_type", "fact"),
                     rec.get("importance", 5),
                     rec.get("timestamp", time.time()),
@@ -785,19 +932,22 @@ class MemoryIndex:
                     rec.get("access_count", 0),
                     tags_json, source_json, chash,
                     rec.get("file_path", ""),
-                    rec.get("base_dir", ""),
+                    base_dir,
                     raw_text,
                 ))
 
-                # 同步 FTS（用分词后的文本）
+                # 同步 FTS（用分词后的文本）；用复合 storage_key 做 FTS row 键
+                storage_key = self._storage_key(
+                    mem_id, entity_id, entity_type, folder, base_dir
+                )
                 segmented = self._segment_for_fts(raw_text)
                 cur.execute(
-                    "DELETE FROM memories_fts WHERE memory_id = ?", (mem_id,)
+                    "DELETE FROM memories_fts WHERE memory_id = ?", (storage_key,)
                 )
                 cur.execute(
                     "INSERT INTO memories_fts(memory_id, raw_text, tags_text) "
                     "VALUES (?, ?, ?)",
-                    (mem_id, segmented, tags_flat),
+                    (storage_key, segmented, tags_flat),
                 )
 
     def rebuild_index_from_files(self, scan_dir: str):
