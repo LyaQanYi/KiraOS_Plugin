@@ -343,7 +343,7 @@ function renderMemoryList(containerId, items, folder) {
         ${ts ? `<span>${escapeHtml(ts)}</span>` : ""}
         ${tagsHtml}
       </div>
-      <div class="text">${escapeHtml(m.raw_text || "")}</div>
+      <div class="text">${escapeHtml(m.text || "")}</div>
       <div class="row" style="margin-top:6px;">
         <button class="ghost" data-action="edit">编辑</button>
         <button class="ghost danger" data-action="delete">归档</button>
@@ -406,7 +406,7 @@ async function addFact() {
 }
 
 async function editMemory(m, folder) {
-  const newText = prompt("编辑记忆文本:", m.raw_text);
+  const newText = prompt("编辑记忆文本:", m.text);
   if (newText == null) return;
   try {
     await api(
@@ -420,7 +420,7 @@ async function editMemory(m, folder) {
 }
 
 async function deleteMemory(m, folder) {
-  if (!confirm(`归档此记忆？\n${m.raw_text}`)) return;
+  if (!confirm(`归档此记忆？\n${m.text}`)) return;
   try {
     await api(
       `/api/memory/${selected.entity_type}/${encodeURIComponent(selected.entity_id)}/${folder}/${encodeURIComponent(m.id)}`,

@@ -98,7 +98,10 @@ class Memory:
     @property
     def file_path(self) -> str:
         if self._base_dir:
-            d = self._base_dir
+            # `_base_dir` 是逻辑命名空间（"global"、"global/self"），不是真实
+            # 磁盘路径。必须挂到 `get_memory_root()` 才能落到配置的数据根
+            # 目录；直接拼会让全局记忆落到进程 cwd 下，跨命名空间整条串掉。
+            d = os.path.join(get_memory_root(), self._base_dir)
             if self._folder:
                 d = os.path.join(d, self._folder)
             return os.path.join(d, f"{self.id}.toml")
@@ -198,7 +201,9 @@ class TomlTreeStore:
         base_dir: str = "",
     ) -> str:
         if base_dir:
-            d = base_dir
+            # 同 `Memory.file_path` 的逻辑——`base_dir` 是 data_root 下的逻辑
+            # 命名空间，不是 cwd 相对路径，必须先挂到 data_root 上再拼 folder。
+            d = os.path.join(get_memory_root(), base_dir)
             if folder:
                 d = os.path.join(d, folder)
             return d

@@ -45,6 +45,9 @@ class MemoryExtractor:
 
         # 升维阈值：facts 积累达到此数量时触发反思
         self.reflection_threshold = 5
+        # 升维输入上限：单条 LLM 调用最多塞这么多 fact 进 prompt。
+        # 不设上限会让 prompt 按实体规模线性膨胀，成本/超时率失控。
+        self.reflection_input_cap = 50
 
     def set_llm_client(self, llm_client):
         self._llm_client = llm_client
@@ -497,6 +500,15 @@ class MemoryExtractor:
         if len(facts) < self.reflection_threshold:
             return []
 
+        # 限制升维输入窗口：按 importance + last_accessed 降序取 Top-50。
+        # 不设上限的话整批事实会按实体规模线性膨胀进 prompt——成本、超时
+        # 率和失败率都会跟着涨，最后海马体只会频繁走空结果降级。
+        facts = sorted(
+            facts,
+            key=lambda f: (f.importance, f.last_accessed),
+            reverse=True,
+        )[: self.reflection_input_cap]
+
         facts_text = "\n".join(
             f"{i + 1}. {f.text}" for i, f in enumerate(facts)
         )
@@ -563,17 +575,20 @@ class MemoryExtractor:
                 generated.append(insight)
                 logger.info(f"Reflection stored for {entity_type}:{entity_id}")
 
-            # 归档被吸收的低重要性 facts
+            # 不再自动批量归档低 importance facts。原逻辑只要 reflection
+            # 非空就把所有 importance <= 4 的 fact 全归档，但代码并没有证明
+            # 这些 fact 真的被当前 reflection 吸收——无关但仍有价值的原始
+            # 细节会被一起删走，召回路径只剩抽象结论。要真做吸收追踪，需要
+            # 在 prompt 输出里显式列出"被吸收 fact 的 id 集合"，再按 id
+            # 精确归档；现版本里没有这条信息，保守的选择是停掉自动归档，
+            # 让 `memory_decay` 的衰减机制按 importance + last_accessed
+            # 自然清理低价值条目。
             if generated:
-                for fact in facts:
-                    if fact.importance <= 4:
-                        await self.tree_store.archive_memory(
-                            memory_id=fact.id,
-                            entity_id=entity_id,
-                            entity_type=entity_type,
-                            folder="facts",
-                        )
-                        logger.debug(f"Absorbed fact archived: {fact.id}")
+                logger.debug(
+                    f"Generated {len(generated)} reflection(s) for "
+                    f"{entity_type}:{entity_id}; skipping auto-archive of "
+                    "low-importance facts (no absorption tracking yet)"
+                )
 
         except Exception as e:
             logger.error(f"Reflection generation error: {e}")

@@ -155,7 +155,13 @@ def _resolve_path_params(
 
 
 def _memory_to_dict(mem) -> dict:
-    """Serialize a Memory object to JSON-safe dict."""
+    """Serialize a Memory object to a JSON-safe dict for the SPA.
+
+    Intentionally omits `file_path` — exposing the on-disk layout to the
+    frontend is a stable information-leak surface (data-root, namespace
+    structure) the SPA doesn't need. Server-side debugging can read it
+    from logs instead.
+    """
     return {
         "id": mem.id,
         "type": mem.type,
@@ -169,7 +175,6 @@ def _memory_to_dict(mem) -> dict:
         "access_count": mem.access_count,
         "last_accessed": mem.last_accessed,
         "timestamp": mem.timestamp,
-        "file_path": mem.file_path,
     }
 
 
@@ -251,12 +256,21 @@ async def api_get_entity(request: Request) -> JSONResponse:
         logger.exception("get_entity profile load failed for %s/%s", entity_type, _mask_id(entity_id))
         return JSONResponse({"error": "internal error"}, status_code=500)
 
-    facts = manager.memory_index.list_memories(
-        entity_id=entity_id, entity_type=entity_type, folder="facts"
-    )
-    reflections = manager.memory_index.list_memories(
-        entity_id=entity_id, entity_type=entity_type, folder="reflections"
-    )
+    # 走 `tree_store.get_all_memories` 而不是直接读 SQLite 索引——TOML 才是
+    # 真相源，索引行可能有用户手动编辑后没同步的旧值。`_memory_to_dict` 做受
+    # 控序列化，把 `file_path` 之类的内部字段过滤掉。
+    facts = [
+        _memory_to_dict(m)
+        for m in await manager.tree_store.get_all_memories(
+            entity_id=entity_id, entity_type=entity_type, folder="facts"
+        )
+    ]
+    reflections = [
+        _memory_to_dict(m)
+        for m in await manager.tree_store.get_all_memories(
+            entity_id=entity_id, entity_type=entity_type, folder="reflections"
+        )
+    ]
 
     return JSONResponse({
         "entity_id": entity_id,
