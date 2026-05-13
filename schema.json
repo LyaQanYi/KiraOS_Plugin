@@ -13,6 +13,20 @@
             }
         }
     },
+    "llm_chat_timeout": {
+        "name": "Hippocampus LLM call timeout (seconds)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 300,
+        "hint": "Per-call timeout for every LLM request made by the hippocampus pipeline (fact extraction, dedup conflict check, merge, reflection, etc.). On timeout the call is treated as failure and the batch is re-buffered for the next attempt — no data loss, just a retry. Raise this if your LLM provider is slow or you see frequent 'extraction timed out' warnings; lower it if you run a local fast model and want quicker failover.",
+        "locales": {
+            "zh": {
+                "name": "海马体 LLM 调用超时（秒）",
+                "hint": "海马体流水线每条 LLM 请求的超时时间（提取事实、去重冲突判定、合并、反思等都受这个限制）。超时算作失败，该批次会被重新放回 pending 队列等下一次触发——不会丢数据，只是重试。LLM provider 慢或日志里频繁出现 'extraction timed out' 时调大；本地快模型可以调小做快速失败。"
+            }
+        }
+    },
     "recall_top_k": {
         "name": "Recall top-K",
         "type": "integer",

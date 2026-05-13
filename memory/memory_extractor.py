@@ -26,12 +26,14 @@ from .memory_index import MemoryIndex
 
 logger = get_logger("memory_extractor", "green")
 
-# Upper bound on every external LLM call from the hippocampus pipeline. If a
-# call exceeds this, `asyncio.wait_for` raises TimeoutError which the
+# Default upper bound on every external LLM call from the hippocampus pipeline.
+# If a call exceeds this, `asyncio.wait_for` raises TimeoutError which the
 # surrounding `except Exception` handlers translate into a safe fallback
 # (empty extraction / conservative dedup decision). Tuned for the slowest
-# tested provider; bump via the config story once exposed.
-_LLM_CHAT_TIMEOUT = 30.0
+# tested provider; overridable per-instance via `MemoryExtractor(llm_chat_
+# timeout=...)`, which the plugin wires up to the WebUI `llm_chat_timeout`
+# config field.
+_DEFAULT_LLM_CHAT_TIMEOUT = 30.0
 
 # self-awareness 输出的常见列表 / markdown 前缀。LLM 喜欢把 1-2 条洞察自动
 # 加上 `- 我...` / `1. 我...` / `* **我...**` 这种装饰，纯 `startswith("我")`
@@ -48,9 +50,18 @@ class MemoryExtractor:
     # 已经走过前几轮提取，再塞一次只会膨胀 cost/timeout 而无新增信号。
     MAX_CONVERSATION_CHARS = 8000
 
-    def __init__(self, tree_store: TomlTreeStore, llm_client=None):
+    def __init__(
+        self,
+        tree_store: TomlTreeStore,
+        llm_client=None,
+        *,
+        llm_chat_timeout: float = _DEFAULT_LLM_CHAT_TIMEOUT,
+    ):
         self.tree_store = tree_store
         self.index: MemoryIndex = tree_store.index
+        # 每条 LLM 调用的超时；超过即被当成失败、走空提取兜底（不会丢 chunks，
+        # 上游的 hippocampus_process 会 re-buffer 回 pending 等下次触发）。
+        self.llm_chat_timeout: float = float(llm_chat_timeout)
         self._llm_client = llm_client
         self._fast_llm_client = None  # 轻量模型，用于去重/合并等低复杂度任务
 
@@ -127,12 +138,12 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的个人事实，输出空数组 []。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
-                logger.warning("Personal fact extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+                logger.warning("Personal fact extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
             else:
                 logger.error("Personal fact extraction error: %s: %s", type(e).__name__, e)
         return []
@@ -178,12 +189,12 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的群组事实，输出空数组 []。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
-                logger.warning("Group fact extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+                logger.warning("Group fact extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
             else:
                 logger.error("Group fact extraction error: %s: %s", type(e).__name__, e)
         return []
@@ -216,12 +227,12 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的事实，输出空数组 []。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
-                logger.warning("Fact extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+                logger.warning("Fact extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
             else:
                 logger.error("Fact extraction error: %s: %s", type(e).__name__, e)
         return []
@@ -275,7 +286,7 @@ class MemoryExtractor:
 直接输出觉察内容或 NONE，不要有其他内容。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 text = resp.text_response.strip()
                 if text.upper() == "NONE" or not text:
@@ -300,7 +311,7 @@ class MemoryExtractor:
                 return insights[:2]  # 最多 2 条
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
-                logger.warning("Self-awareness extraction timed out after %ds; LLM provider may be slow or rate-limited", _LLM_CHAT_TIMEOUT)
+                logger.warning("Self-awareness extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
             else:
                 logger.error("Self-awareness extraction error: %s: %s", type(e).__name__, e)
         return []
@@ -325,7 +336,7 @@ class MemoryExtractor:
 只输出标识符，不要有其他内容。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 slug = resp.text_response.strip().lower()
                 # 清理非法字符
@@ -358,7 +369,7 @@ class MemoryExtractor:
         """
         # === 第一级：SHA-256 精确去重（零 LLM 调用） ===
         # 每条 fact 都会进这条路径——一次同步 SQLite 调用就把整条 async 海马体
-        # 流水线卡住，跟前面统一用 `to_thread` / `_LLM_CHAT_TIMEOUT` 控边界的
+        # 流水线卡住，跟前面统一用 `to_thread` / `_DEFAULT_LLM_CHAT_TIMEOUT` 控边界的
         # 思路相违。offload 到线程池保持一致。
         content_hash = MemoryIndex.content_hash(new_content)
         exact_match = await asyncio.to_thread(
@@ -410,9 +421,9 @@ class MemoryExtractor:
 
         try:
             if hasattr(client, "chat_fast"):
-                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             else:
-                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 result = resp.text_response.strip().strip('"').lower()
                 if result in ("duplicate", "update", "new"):
@@ -440,9 +451,9 @@ class MemoryExtractor:
 
         try:
             if hasattr(client, "chat_fast"):
-                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             else:
-                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if resp and resp.text_response:
                 return resp.text_response.strip()
         except Exception as e:
@@ -581,7 +592,7 @@ class MemoryExtractor:
 
         generated = []
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
             if not (resp and resp.text_response):
                 return []
 

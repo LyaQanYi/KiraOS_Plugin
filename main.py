@@ -101,6 +101,11 @@ class UserMemoryPlugin(BasePlugin):
         self._hippocampus_threshold = int(cfg.get("hippocampus_threshold", 3))
         self._recall_top_k = int(cfg.get("recall_top_k", 5))
         self._max_memory_length = int(cfg.get("max_memory_length", 20))
+        # 海马体每条 LLM 调用的超时（秒）；卡慢的 provider 调大、本地快模型可以调小
+        try:
+            self._llm_chat_timeout = float(cfg.get("llm_chat_timeout", 30.0))
+        except (TypeError, ValueError):
+            self._llm_chat_timeout = 30.0
         self._auto_migrate = bool(cfg.get("auto_migrate_legacy_db", True))
         self._enable_decay = bool(cfg.get("enable_decay", True))
 
@@ -160,6 +165,7 @@ class UserMemoryPlugin(BasePlugin):
         self.memory_manager = MemoryManager(
             max_memory_length=self._max_memory_length,
             hippocampus_threshold=self._hippocampus_threshold,
+            llm_chat_timeout=self._llm_chat_timeout,
         )
         await self.memory_manager.async_init()
 
