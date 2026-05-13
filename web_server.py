@@ -294,6 +294,10 @@ async def api_update_profile(request: Request) -> JSONResponse:
         payload = await request.json()
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"error": "JSON body must be an object"}, status_code=400
+        )
 
     allowed = {"name", "nickname", "description", "platform"}
     updates = {k: v for k, v in payload.items() if k in allowed and isinstance(v, str)}
@@ -322,6 +326,10 @@ async def api_add_fact(request: Request) -> JSONResponse:
         payload = await request.json()
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"error": "JSON body must be an object"}, status_code=400
+        )
 
     text = (payload.get("text") or "").strip()
     if not text:
@@ -371,11 +379,16 @@ async def api_delete_entity(request: Request) -> JSONResponse:
     # leaves at worst orphan archived files (recoverable) rather than stale
     # index rows pointing into a moved-away directory (would surface as ghost
     # search results that then fail to open).
-    try:
-        # 1. Drop index rows for this entity so search/recall stop surfacing them.
-        # `MemoryIndex.delete` 现在按复合主键 (entity_type, entity_id, folder,
-        # base_dir, id) 删单行——只传裸 id 会一行都删不掉。`row` 自身就携带
-        # 完整 entity 维度，照搬即可。
+    #
+    # The whole thing is offloaded to `asyncio.to_thread` so the sync SQLite
+    # work + (potentially cross-filesystem) `shutil.move` doesn't stall the
+    # event loop. With many entities or large dirs this used to make every
+    # other API jitter for the duration of the delete.
+    def _do_delete_entity_sync():
+        # 1. Drop index rows for this entity so search/recall stop surfacing
+        #    them. `MemoryIndex.delete` 按复合主键 (entity_type, entity_id,
+        #    folder, base_dir, id) 删单行；row 自身就携带完整 entity 维度，
+        #    直接转发。
         for folder in ("facts", "reflections"):
             for row in manager.memory_index.list_memories(
                 entity_id=entity_id, entity_type=entity_type, folder=folder
@@ -387,13 +400,15 @@ async def api_delete_entity(request: Request) -> JSONResponse:
                     folder=row.get("folder", folder),
                     base_dir=row.get("base_dir", ""),
                 )
-        # 2. Move the on-disk entity dir into archive. Use wall-clock time.time()
-        #    — `asyncio.get_event_loop().time()` returns a monotonic clock that
-        #    resets across restarts and can produce colliding archive names.
+        # 2. Move the on-disk entity dir into archive. Wall-clock `time.time()`
+        #    intentionally, not `asyncio.get_event_loop().time()` (monotonic).
         archive_root = Path(get_entities_dir()).parent / "archive" / "_full_entities"
         archive_root.mkdir(parents=True, exist_ok=True)
         target = archive_root / f"{entity_type}_{_id_to_path_segment(entity_id)}_{int(time.time())}"
         shutil.move(base_dir, target)
+
+    try:
+        await asyncio.to_thread(_do_delete_entity_sync)
     except Exception:
         logger.exception("delete_entity failed for %s/%s", entity_type, _mask_id(entity_id))
         return JSONResponse({"error": "internal error"}, status_code=500)
@@ -420,6 +435,10 @@ async def api_update_memory(request: Request) -> JSONResponse:
         payload = await request.json()
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"error": "JSON body must be an object"}, status_code=400
+        )
 
     memory = await manager.tree_store.get_memory(
         memory_id=memory_id,
@@ -471,6 +490,18 @@ async def api_delete_memory(request: Request) -> JSONResponse:
     if not _validate_entity_id(memory_id):
         return JSONResponse({"error": "invalid memory_id"}, status_code=400)
 
+    # 先用 get_memory 探一下记录是否真的存在——`archive_memory` 的 False
+    # 同时表示"目标不存在"和"写归档/删索引失败"，把两者都报 404 会让真实
+    # 的 5xx 故障被前端 / SDK 误当成 not found。
+    existing = await manager.tree_store.get_memory(
+        memory_id=memory_id,
+        entity_id=entity_id,
+        entity_type=entity_type,
+        folder=folder,
+    )
+    if not existing:
+        return JSONResponse({"error": "memory not found"}, status_code=404)
+
     ok = await manager.tree_store.archive_memory(
         memory_id=memory_id,
         entity_id=entity_id,
@@ -478,11 +509,15 @@ async def api_delete_memory(request: Request) -> JSONResponse:
         folder=folder,
     )
     if not ok:
-        # archive_memory 返回 False 多半是源文件已不存在或写归档失败。
-        # 用 404 表示"目标不存在"，让 SDK / 前端能区分参数错误和真实失败。
-        return JSONResponse(
-            {"error": "memory not found or archive failed"}, status_code=404
+        # 文件刚才还在但 archive 失败——是真实的写归档 / 删索引错误。
+        logger.warning(
+            "archive_memory returned False after get_memory hit for %s/%s/%s/%s",
+            entity_type,
+            _mask_id(entity_id),
+            folder,
+            memory_id,
         )
+        return JSONResponse({"error": "archive failed"}, status_code=500)
     return JSONResponse({"ok": True})
 
 

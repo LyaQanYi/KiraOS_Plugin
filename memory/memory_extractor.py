@@ -540,7 +540,8 @@ class MemoryExtractor:
                 line.strip()
                 for line in resp.text_response.strip().split("\n")
                 if line.strip()
-            ]
+            ][:3]  # prompt 已经要求 1-3 条，超出的多余行会触发额外 search/merge/add
+            # 的成本和噪声——硬截到 3 条与 prompt 契约对齐。
 
             for insight in insights:
                 # 去重检查：是否已有相似 reflection
@@ -644,6 +645,16 @@ def _clean_facts(facts: list) -> list[dict]:
     for f in facts:
         if not isinstance(f, dict) or "content" not in f:
             continue
+        # content 必须是非空字符串。模型偶尔会输出 `{"content": {}}`、数字、
+        # 纯空白这种垃圾值——后面 content_hash / 去重 / 写盘任何一环都会炸，
+        # 在源头收口跳过更安全。
+        raw_content = f.get("content")
+        if not isinstance(raw_content, str):
+            continue
+        content = raw_content.strip()
+        if not content:
+            continue
+        f["content"] = content
         # 标准化 importance
         raw_imp = f.get("importance")
         if raw_imp is None or raw_imp == "":

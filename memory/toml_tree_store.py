@@ -134,14 +134,37 @@ class Memory:
     def from_toml_dict(
         cls, data: dict, runtime_meta: dict = None, **location_kwargs
     ) -> "Memory":
-        """从 TOML 文件数据 + SQLite 运行时 meta 反序列化"""
+        """从 TOML 文件数据 + SQLite 运行时 meta 反序列化。
+
+        显式做字段容错——TOML 是「用户可手工编辑」的真相源，他们写错
+        类型（importance 写成字符串、tags 写成 dict 等等）时整条 memory
+        不应该读失败或被跳过；类型不符就回退到安全默认值，让记忆仍可
+        被加载。
+        """
+        # importance: int 或可转 int 的字符串，否则 5；夹到 [1,10]
+        raw_importance = data.get("importance", 5)
+        try:
+            importance = max(1, min(10, int(raw_importance)))
+        except (TypeError, ValueError):
+            importance = 5
+
+        # tags 必须是 list；不是就丢回空列表
+        tags = data.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+
+        # source 必须是 dict；不是就丢回空字典
+        source = data.get("source", {})
+        if not isinstance(source, dict):
+            source = {}
+
         return cls(
             id=data.get("id", ""),
             type=data.get("type", "fact"),
             text=data.get("text", ""),
-            importance=max(1, min(10, data.get("importance", 5))),
-            tags=data.get("tags", []),
-            source=data.get("source", {}),
+            importance=importance,
+            tags=tags,
+            source=source,
             meta=runtime_meta or {},
             **location_kwargs,
         )
