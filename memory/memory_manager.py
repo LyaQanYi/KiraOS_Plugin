@@ -65,6 +65,7 @@ class MemoryManager:
         max_memory_length: int = 20,
         llm_client=None,
         hippocampus_threshold: int = 3,
+        llm_chat_timeout: float = 30.0,
     ):
         self.max_memory_length = int(max_memory_length)
         self.chat_memory_path = get_chat_memory_path()
@@ -89,7 +90,11 @@ class MemoryManager:
 
         # === 海马体 ===
         self._llm_client = llm_client
-        self.extractor = MemoryExtractor(self.tree_store, llm_client)
+        self.extractor = MemoryExtractor(
+            self.tree_store,
+            llm_client,
+            llm_chat_timeout=llm_chat_timeout,
+        )
         self.router = MemoryRouter()
 
         # === 后台任务管理 ===
