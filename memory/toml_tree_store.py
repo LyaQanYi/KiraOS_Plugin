@@ -709,9 +709,19 @@ class TomlTreeStore:
             if fpath and os.path.exists(fpath):
                 try:
                     file_data = await asyncio.to_thread(self._sync_read_toml, fpath)
-                    mem.text = file_data.get("text", mem.text)
-                    mem.tags = file_data.get("tags", mem.tags)
-                    mem.importance = file_data.get("importance", mem.importance)
+                    # 复用 `Memory.from_toml_dict` 的字段容错 —— 它会把
+                    # importance/tags/source 都 coerce 到安全类型。直接信任
+                    # `file_data.get(...)` 会让用户手改 TOML 写错类型（如
+                    # importance="high"、tags={}）一路传到 `search_across_
+                    # folders` 排序里的 `m.importance * 0.6 + ...` 算式，
+                    # 直接 TypeError 把整批跨目录召回打死。
+                    sanitized = Memory.from_toml_dict(file_data)
+                    if sanitized.text:
+                        mem.text = sanitized.text
+                    if sanitized.tags:
+                        mem.tags = sanitized.tags
+                    # importance 永远写回（from_toml_dict 已保证是 [1,10] 内的 int）
+                    mem.importance = sanitized.importance
                 except Exception as e:
                     logger.debug(
                         "search: failed to load file %s for %s: %s",

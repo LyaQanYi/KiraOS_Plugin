@@ -33,6 +33,11 @@ logger = get_logger("memory_extractor", "green")
 # tested provider; bump via the config story once exposed.
 _LLM_CHAT_TIMEOUT = 30.0
 
+# self-awareness 输出的常见列表 / markdown 前缀。LLM 喜欢把 1-2 条洞察自动
+# 加上 `- 我...` / `1. 我...` / `* **我...**` 这种装饰，纯 `startswith("我")`
+# 会把它们全杀掉。先剥掉这些前缀再做"以'我'开头"的语义检查。
+_LIST_PREFIX_RE = re.compile(r"^[\s\-\*\+\d\.\)、•>#]+\s*")
+
 
 class MemoryExtractor:
     """海马体：事实提取 → 去重 → 合并 → 升维"""
@@ -266,14 +271,21 @@ class MemoryExtractor:
                 text = resp.text_response.strip()
                 if text.upper() == "NONE" or not text:
                     return []
+                # 先去掉项目符号 / markdown 前缀和 emphasis 字符，再做"我"开头的语义判断。
+                # 多数 LLM 会输出 `- 我...`、`1. 我...`、`* **我...**` 这种装饰；
+                # 直接 startswith("我") 会把它们一刀切，self-awareness 链路常年空手。
+                stripped_lines = []
+                for line in text.split("\n"):
+                    s = line.strip()
+                    if not s or s.upper() == "NONE":
+                        continue
+                    s = _LIST_PREFIX_RE.sub("", s)
+                    # 再剥两侧 markdown emphasis（**、_、`）
+                    s = s.strip("*_`").strip()
+                    if s:
+                        stripped_lines.append(s)
                 insights = [
-                    line.strip()
-                    for line in text.split("\n")
-                    if line.strip() and line.strip().upper() != "NONE"
-                ]
-                # 过滤：必须以"我"开头，且长度合理
-                insights = [
-                    s for s in insights
+                    s for s in stripped_lines
                     if s.startswith("我") and 5 < len(s) < 200
                 ]
                 return insights[:2]  # 最多 2 条
