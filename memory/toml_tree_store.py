@@ -573,6 +573,11 @@ class TomlTreeStore:
                     "last_accessed": r.get("last_accessed", 0),
                     "tags": r.get("tags", []),
                     "source": r.get("source", {}),
+                    # 保留混合检索 score（FTS5 BM25 + 向量相似度 + importance
+                    # + 时间衰减综合），让跨 entity 全局搜索能据此重排，而不
+                    # 是只能在 Memory 顶层字段里用 importance/last_accessed。
+                    "_score": r.get("_score", 0.0),
+                    "_vec_score": r.get("_vec_score", 0.0),
                 },
                 _entity_id=entity_id or r.get("entity_id", ""),
                 _entity_type=entity_type or r.get("entity_type", ""),

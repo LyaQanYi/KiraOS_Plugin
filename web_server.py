@@ -458,24 +458,47 @@ async def api_search(request: Request) -> JSONResponse:
         k = 10
 
     # When neither entity_id nor entity_type is pinned, fan out across every
-    # known entity so the user can do a true global recall. The per-entity
-    # recall keeps doing its own scoring; we merge by descending importance
-    # (a cheap heuristic that matches the single-entity ordering well enough).
+    # known entity so the user can do a true global recall.
+    # - **Concurrent**: `asyncio.gather` the per-entity `recall` calls instead
+    #   of running them sequentially — that turns O(N) latency back into the
+    #   slowest single call.
+    # - **Score-preserving sort**: each Memory's `meta["_score"]` carries the
+    #   hybrid BM25 + vector + importance + decay score from `MemoryIndex.
+    #   hybrid_search`. Merging by `_score` keeps cross-entity relevance
+    #   ordering intact; falling back to `(importance, last_accessed)` only
+    #   when the score is missing (e.g. a memory that never went through the
+    #   FTS path).
     if not entity_id and not entity_type:
-        results = []
-        for eid, etype in list_all_entities():
+        entities = list_all_entities()
+
+        async def _recall_one(eid: str, etype: str):
             try:
-                hits = await manager.recall(
+                return await manager.recall(
                     query=query, entity_id=eid, entity_type=etype, k=k
                 )
-                results.extend(hits)
             except Exception as e:
                 logger.warning(
-                    f"global recall failed for {etype}:{_mask_id(eid)}: {e}"
+                    "global recall failed for %s:%s: %s",
+                    etype,
+                    _mask_id(eid),
+                    e,
                 )
-        results.sort(
-            key=lambda m: (m.importance, m.last_accessed), reverse=True
+                return []
+
+        per_entity = await asyncio.gather(
+            *(_recall_one(eid, etype) for eid, etype in entities)
         )
+        results = [m for hits in per_entity for m in hits]
+
+        def _sort_key(m):
+            meta = getattr(m, "meta", None) or {}
+            return (
+                float(meta.get("_score") or 0.0),
+                int(m.importance or 0),
+                float(m.last_accessed or 0),
+            )
+
+        results.sort(key=_sort_key, reverse=True)
         memories = results[:k]
     else:
         memories = await manager.recall(

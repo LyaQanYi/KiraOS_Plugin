@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -32,6 +33,21 @@ from .memory_paths import (
 )
 
 logger = get_logger("kiraos_memory_manager", "green")
+
+
+def _mask_id(value) -> str:
+    """Mask a sender / user / group ID for safe logging.
+
+    Mirrors `web_server._mask_id` / `db._mask_id`: 3-char prefix + sha256[:8]
+    so even if logs leak (rotation, sharing, bug reports) the platform-side
+    identifier isn't exposed verbatim.
+    """
+    s = "" if value is None else str(value)
+    if not s:
+        return "<empty>"
+    digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:8]
+    prefix = s[:3] if len(s) >= 3 else s
+    return f"{prefix}***({digest})"
 
 
 class MemoryManager:
@@ -478,14 +494,26 @@ class MemoryManager:
         群聊走双路径（个人 + 群组分别提取），私聊走单路径。
         """
         if not self._llm_client:
-            logger.debug("LLM client not set, skipping hippocampus processing")
+            # LLM client 是延迟注入接口（set_llm_client）—— "插件刚启动 → 用户
+            # 已发足够消息攒满阈值 → LLM 客户端还没注入" 是真实存在的窗口期。
+            # 此时不能 silently return 把 chunks 吞掉，要把它们还回 pending
+            # 队列，等下次触发或 LLM 注入后由后续 chunk 触发的任务一起消费。
+            logger.debug("LLM client not set, re-buffering %d chunks", len(chunks))
+            with self._hippocampus_lock:
+                pending = self._pending_conversations.setdefault(session, [])
+                # 把这次的 chunks 放到队首，保持原始时间顺序。
+                self._pending_conversations[session] = list(chunks) + pending
             return
 
         try:
             # 1. 程序化提取 sender 映射（不依赖 LLM）
             sender_map = self._extract_sender_map(chunks)
             unique_senders = self._get_unique_senders(chunks)
-            logger.debug(f"Hippocampus sender_map: {sender_map}, unique_senders: {unique_senders}")
+            logger.debug(
+                "Hippocampus sender_map_size=%d, unique_senders=%s",
+                len(sender_map),
+                [_mask_id(s) for s in unique_senders],
+            )
 
             # 2. 解析 session 级别的 entity
             session_entity_id, session_entity_type = self._parse_entity_from_session(session)
@@ -563,10 +591,11 @@ class MemoryManager:
                     await self._update_profile_from_facts(entity_id, entity_type, [fact])
 
             total = len(personal_facts) + len(group_facts)
+            masked_senders = [_mask_id(s) for s in unique_senders]
             logger.info(
                 f"Hippocampus completed for session {session}: "
                 f"{total} facts ({len(personal_facts)} personal + {len(group_facts)} group), "
-                f"senders={unique_senders}"
+                f"senders={masked_senders}"
             )
 
             # 7. Phase 1: 自我觉察采集（只存不读）

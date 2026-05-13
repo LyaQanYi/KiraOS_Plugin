@@ -57,6 +57,9 @@ async def migrate_legacy_db_if_needed(
     """
     legacy_db_path = Path(legacy_db_path)
     data_root = Path(data_root)
+    # 首次启动且没有旧库的场景下 data_root 可能还不存在，后面的 marker.touch()
+    # 会直接 FileNotFoundError。在迁移逻辑入口就把目录的存在性收口。
+    data_root.mkdir(parents=True, exist_ok=True)
     marker = data_root / ".migrated_v3"
 
     if marker.exists():
