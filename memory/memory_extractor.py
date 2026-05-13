@@ -345,9 +345,13 @@ class MemoryExtractor:
             matched_memory: 匹配到的旧记忆（仅 duplicate/update 时非 None）
         """
         # === 第一级：SHA-256 精确去重（零 LLM 调用） ===
+        # 每条 fact 都会进这条路径——一次同步 SQLite 调用就把整条 async 海马体
+        # 流水线卡住，跟前面统一用 `to_thread` / `_LLM_CHAT_TIMEOUT` 控边界的
+        # 思路相违。offload 到线程池保持一致。
         content_hash = MemoryIndex.content_hash(new_content)
-        exact_match = self.index.find_by_hash(
-            content_hash, entity_id, entity_type, folder, base_dir
+        exact_match = await asyncio.to_thread(
+            self.index.find_by_hash,
+            content_hash, entity_id, entity_type, folder, base_dir,
         )
         if exact_match:
             logger.debug(f"Exact hash match: {new_content[:50]}...")

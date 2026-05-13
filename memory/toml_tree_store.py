@@ -50,6 +50,51 @@ from .memory_index import MemoryIndex
 logger = get_logger("kiraos_toml_tree_store", "green")
 
 
+# ========== 锁包装器 ==========
+
+
+class _RefCountedLock:
+    """asyncio.Lock 的引用计数包装器，用于安全的 lock-table 回收。
+
+    背景：用 `asyncio.Lock.locked()` 判断"可回收"是错的——它只反映"有
+    没有持有者"，不反映"有没有 waiter"。一个刚 `release()` 但 `_waiters`
+    队列里仍有等待协程的锁，`locked()` 已经返回 False；这时若被驱逐，
+    下一次同 key 进来会新建一把锁，老 waiter 和新协程分别卡在不同锁
+    上，并发写 TOML / 改索引就回来了。
+
+    这里维护 `_users` 计数器，acquire 之前 +1、release 之后 -1，覆盖
+    "持有中"和"排队中"两种状态。`in_use` 为 False 时才真正空闲，可
+    安全回收。
+
+    Context-manager API 与 `asyncio.Lock` 兼容，所以 `async with
+    self._get_lock(key):` 调用方代码不需要改。
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._users = 0
+
+    @property
+    def in_use(self) -> bool:
+        return self._users > 0
+
+    async def __aenter__(self):
+        self._users += 1
+        try:
+            await self._lock.acquire()
+        except BaseException:
+            # acquire 被取消时（asyncio.CancelledError）也要把计数还回去
+            self._users -= 1
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            self._lock.release()
+        finally:
+            self._users -= 1
+
+
 # ========== 数据模型 ==========
 
 
@@ -97,6 +142,10 @@ class Memory:
 
     @property
     def file_path(self) -> str:
+        # 防路径穿越：`self.id` 会被拼成 `f"{self.id}.toml"` 写到磁盘，
+        # 任何包含 `/`、`\`、绝对路径或 `..` 段的值都能越出 memory root。
+        # `_validate_memory_id` 是 TomlTreeStore 的静态方法。
+        safe_id = TomlTreeStore._validate_memory_id(self.id)
         if self._base_dir:
             # `_base_dir` 是逻辑命名空间（"global"、"global/self"），不是真实
             # 磁盘路径。必须挂到 `get_memory_root()` 才能落到配置的数据根
@@ -104,10 +153,10 @@ class Memory:
             d = os.path.join(get_memory_root(), self._base_dir)
             if self._folder:
                 d = os.path.join(d, self._folder)
-            return os.path.join(d, f"{self.id}.toml")
+            return os.path.join(d, f"{safe_id}.toml")
         else:
             d = get_entity_folder(self._entity_id, self._entity_type, self._folder)
-            return os.path.join(d, f"{self.id}.toml")
+            return os.path.join(d, f"{safe_id}.toml")
 
     # === 序列化 ===
 
@@ -209,28 +258,46 @@ class TomlTreeStore:
 
         # 读写锁 per (entity_type, entity_id, folder, base_dir)。无上限增长在
         # 长跑会变成内存泄漏（每个出现过的 entity/folder 都留一把锁），所以
-        # 加 `_LOCK_CAP` 上限 + 懒回收 unlocked 锁——同 key 同锁的语义只在
-        # 调用方持有该锁期间保证，释放后即可被驱逐，下次再 `_get_lock` 同 key
-        # 会拿到新锁但因为没有 in-flight 操作所以行为等价。
-        self._locks: Dict[str, asyncio.Lock] = {}
+        # 加 `_LOCK_CAP` 上限 + 懒回收。
+        # 用 `_RefCountedLock`（含 "held + waiting" 引用计数）替代裸
+        # `asyncio.Lock`——前者的 `locked()` 在 release 后 / waiter 还没恢复
+        # 之前会返回 False，按 `locked()` 回收会导致同 key 拆成两把锁，并发
+        # 写就回来了。
+        self._locks: Dict[str, _RefCountedLock] = {}
         logger.info("TomlTreeStore initialized (TOML files + SQLite index)")
 
     _LOCK_CAP = 256
 
-    def _get_lock(self, key: str) -> asyncio.Lock:
+    # memory_id 会被拼成 `f"{memory_id}.toml"` 写入磁盘，必须先拒绝任何包含
+    # 路径分隔符、`..` 段、或绝对路径的值。否则一个 `../../secrets` 的请求
+    # 就能越出 memory root 去读/写/删任意 .toml。WebUI / API 已经在 handler
+    # 入口做了 entity_id 白名单，这里给 storage 层多加一道闸防御性内聚。
+    @staticmethod
+    def _validate_memory_id(memory_id: str) -> str:
+        if not memory_id or not isinstance(memory_id, str):
+            raise ValueError("memory_id is required and must be a string")
+        if os.path.isabs(memory_id):
+            raise ValueError(f"memory_id must not be absolute: {memory_id!r}")
+        if "/" in memory_id or "\\" in memory_id:
+            raise ValueError(f"memory_id must not contain path separators: {memory_id!r}")
+        if ".." in memory_id.split("."):
+            raise ValueError(f"memory_id must not contain '..' segments: {memory_id!r}")
+        return memory_id
+
+    def _get_lock(self, key: str) -> "_RefCountedLock":
         lock = self._locks.get(key)
         if lock is not None:
             return lock
-        # 创建新锁前，超 cap 时先扫一遍把所有未被持有的旧锁清掉。`asyncio.Lock`
-        # 是单 event loop 内的协作锁；这个方法本身是 sync 的，asyncio 协作式
-        # 调度保证遍历期间不会有别的协程修改 `_locks`。
+        # 创建新锁前，超 cap 时按 `in_use` 字段回收 —— 引用计数为 0 才安全。
+        # 这个方法是 sync 的，asyncio 协作式调度保证遍历期间不会有别的协程
+        # 改 `_locks`。
         if len(self._locks) >= self._LOCK_CAP:
-            stale = [k for k, lk in self._locks.items() if not lk.locked()]
+            stale = [k for k, lk in self._locks.items() if not lk.in_use]
             for k in stale:
                 del self._locks[k]
                 if len(self._locks) < self._LOCK_CAP:
                     break
-        lock = asyncio.Lock()
+        lock = _RefCountedLock()
         self._locks[key] = lock
         return lock
 
@@ -283,6 +350,9 @@ class TomlTreeStore:
         """
         now = time.time()
         mem_id = semantic_id if semantic_id else self._generate_fallback_id(content_text)
+        # semantic_id 来自外部（LLM 输出 / API caller），下游会拼成
+        # `f"{mem_id}.toml"` 写盘——同样要走路径校验抵抗穿越。
+        mem_id = self._validate_memory_id(mem_id)
 
         source_data = source or {}
         if "time" not in source_data:
@@ -418,6 +488,7 @@ class TomlTreeStore:
         base_dir: str = "",
     ) -> Optional[Memory]:
         """精确获取一条记忆（TOML 文件内容 + 索引 meta）"""
+        memory_id = self._validate_memory_id(memory_id)
         d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
         fpath = os.path.join(d, f"{memory_id}.toml")
 
@@ -483,6 +554,7 @@ class TomlTreeStore:
         base_dir: str = "",
     ) -> bool:
         """物理删除一条记忆（文件 + 索引）"""
+        memory_id = self._validate_memory_id(memory_id)
         d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
         fpath = os.path.join(d, f"{memory_id}.toml")
 
@@ -523,6 +595,7 @@ class TomlTreeStore:
         """
         from .memory_paths import get_archive_dir, _id_to_path_segment
 
+        memory_id = self._validate_memory_id(memory_id)
         lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
         async with self._get_lock(lock_key):
             memory = await self.get_memory(
