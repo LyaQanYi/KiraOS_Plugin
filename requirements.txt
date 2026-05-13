@@ -5,8 +5,6 @@
 # you can run manually:
 #
 #     python -m pip install -r data/plugins/KiraOS_Plugin/requirements.txt
-#
-# Versions match KiraAI-lightning's tested combo.
 
 # TOML writer — hard dependency (no stdlib alternative for writing TOML)
 tomli_w>=1.0.0

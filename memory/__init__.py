@@ -1,7 +1,7 @@
 """
 KiraOS_Plugin 记忆子系统
 
-双脑双存储记忆系统，从 KiraAI-lightning 移植：
+双脑双存储记忆系统：
 - 快系统：SQLite + FTS5 全文检索（jieba 中文分词）
 - 慢系统：海马体后台异步（提取/反思/画像）
 - 真相源：TOML 文件

@@ -1,12 +1,12 @@
 """
 KiraOS Plugin — Combines two OS-level capabilities:
 
-  1. **Dual-Brain Memory (TOML + SQLite)**: Two-tier memory engine ported from
-     KiraAI-lightning. Fast loop (FTS5 retrieval with jieba CJK tokenizer +
-     optional sqlite-vec embeddings) serves the LLM in real time; slow loop
-     (hippocampus) runs as a background asyncio task after every few turns
-     to extract facts, deduplicate, generate reflections, and update profiles.
-     TOML files are the source of truth, SQLite is a rebuildable index.
+  1. **Dual-Brain Memory (TOML + SQLite)**: Two-tier memory engine. Fast loop
+     (FTS5 retrieval with jieba CJK tokenizer + optional sqlite-vec embeddings)
+     serves the LLM in real time; slow loop (hippocampus) runs as a background
+     asyncio task after every few turns to extract facts, deduplicate, generate
+     reflections, and update profiles. TOML files are the source of truth,
+     SQLite is a rebuildable index.
 
      Tools: memory_add, memory_search, memory_update_entry, memory_remove,
             profile_view, profile_update.
@@ -54,7 +54,7 @@ SKILL_FEW_SHOT_HEADER = "技能工具（调用后按返回的指令执行）: "
 #  LLM Client Adapter
 # ════════════════════════════════════════════════════════════════════
 #
-# 移植自 lightning 的 MemoryExtractor 假设 LLM client 是
+# 内部的 MemoryExtractor 用 messages-list 风格调用 LLM：
 #   await client.chat([{"role": "user", "content": ...}]) -> obj.text_response
 # 而 KiraAI 的 LLMModelClient 的实际签名是
 #   await client.chat(LLMRequest) -> LLMResponse (带 .text_response)
@@ -62,7 +62,7 @@ SKILL_FEW_SHOT_HEADER = "技能工具（调用后按返回的指令执行）: "
 # LLM 跑提取（成本更低、延迟更小），不存在则回退到 default。
 
 class _MemoryLLMAdapter:
-    """把 lightning 的 chat(messages_list) 适配到 KiraAI 的 chat(LLMRequest)。"""
+    """把 messages-list 风格的 chat 调用适配到 KiraAI 的 chat(LLMRequest)。"""
 
     def __init__(self, default_client, fast_client=None):
         self._default = default_client
@@ -545,7 +545,7 @@ class UserMemoryPlugin(BasePlugin):
         return " ".join(p for p in parts if p).strip()
 
     def _build_session_id(self, event: KiraMessageBatchEvent) -> str:
-        """Construct lightning-style `adapter:type:id` session string.
+        """Construct an `adapter:type:id` session string for the hippocampus.
 
         Falls back to `unknown:dm:<uid>` if event lacks the needed fields.
         """

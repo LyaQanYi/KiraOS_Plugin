@@ -4,8 +4,8 @@ KiraOS_Plugin 记忆系统路径管理中枢
 统一管理记忆数据根目录下所有目录结构的创建与路径解析。
 支持四种实体域：user, group, channel, global
 
-与 lightning 原版的差别：数据根目录由插件运行时通过 `set_data_root()` 注入，
-不再硬编码为 `data/memory`。
+数据根目录由插件运行时通过 `set_data_root()` 注入（默认占位值仅用于本模块
+独立导入时保持可用），不硬编码任何具体路径。
 """
 
 import os
@@ -17,10 +17,10 @@ from core.logging_manager import get_logger
 
 logger = get_logger("kiraos_memory_paths", "green")
 
-# Windows 文件系统禁止文件/目录名出现 < > : " | ? * \ /。lightning 用
-# `{adapter}:{user_id}` 作为 entity_id（含冒号），在 Linux/macOS 没问题但到
-# Windows 会炸。这里在「路径层」做 URL-encoding：内存与 SQLite 里仍是原始的
-# 含冒号 ID，只有写到文件系统时才 quote，扫目录反推回 ID 时再 unquote。
+# Windows 文件系统禁止文件/目录名出现 < > : " | ? * \ /。本插件的 entity_id
+# 用 `{adapter}:{user_id}` 形式（含冒号），在 Linux/macOS 没问题但到 Windows
+# 会炸。这里在「路径层」做 URL-encoding：内存与 SQLite 里仍是原始的含冒号
+# ID，只有写到文件系统时才 quote，扫目录反推回 ID 时再 unquote。
 # `urllib.parse.quote` 默认不转义 `-._~`，对我们足够：所有 Windows-不安全
 # 字符都会被编码成 `%XX`（`%` 在 Windows 上是合法路径字符）。
 _PATH_SAFE_CHARS = "-._~"

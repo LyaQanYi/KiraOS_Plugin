@@ -1,7 +1,7 @@
 """
 KiraOS_Plugin 记忆系统 LLM 工具实现
 
-工具清单（采用 lightning 新接口）：
+工具清单：
 - memory_add      — 写入新记忆（含两级去重）
 - memory_search   — 语义检索
 - memory_update_entry — 更新已有记忆
@@ -25,7 +25,7 @@ from .memory.memory_paths import ENTITY_USER, ENTITY_GROUP
 
 logger = get_logger("kiraos_memory_tools", "green")
 
-# 工具描述文案（沿用 lightning 调优过的中文 prompt）
+# 工具描述文案（调优过的中文 prompt，影响 LLM 主动调用工具的频率）
 TOOL_SCHEMAS: dict = {
     "memory_add": {
         "description": (

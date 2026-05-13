@@ -12,7 +12,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 | **双脑记忆 (Dual-Brain Memory)** | 大脑 | 快/慢两套循环：FTS5 实时检索 + 后台海马体异步提取、反思、画像更新；TOML 文件作真相源，SQLite 作可重建索引 |
 | **技能路由 (Skill Router)** | 程序加载器 | 渐进式工具发现——启动时加载轻量 manifest，运行时按需注入完整指令 |
 
-> v3 相对 v2.x 的核心变化：把简陋的"两张 SQLite 表 + 单用户画像"换成了从 KiraAI-lightning 移植的完整双脑系统。详见 [从 v2 迁移](#从-v2-迁移)。
+> v3 相对 v2.x 的核心变化：把简陋的"两张 SQLite 表 + 单用户画像"换成了完整的双脑记忆系统（TOML 真相源 + SQLite 索引 + 后台海马体）。详见 [从 v2 迁移](#从-v2-迁移)。
 
 ---
 
@@ -20,7 +20,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 - [安装](#安装)
 - [快速开始](#快速开始)
-- [与内置记忆插件的关系](#与内置记忆插件的关系)
+- [与内置 Simple Memory 插件的关系](#与内置-simple-memory-插件的关系)
 - [双脑记忆系统](#双脑记忆系统)
   - [架构概览](#架构概览)
   - [LLM 工具清单](#llm-工具清单)
@@ -38,13 +38,54 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 
 ## 安装
 
-KiraOS 是 KiraAI 的**内置插件**，随主程序一起分发，无需单独安装。启用方式：
+KiraOS 是一个 **外部插件**——**不**随 KiraAI 主程序一起分发，需要单独安装到主程序的 `data/plugins/` 目录下。
 
-1. 在 KiraAI WebUI 的"插件管理"页面找到 KiraOS (Dual-Brain Memory + Skills)
-2. 启用该插件
-3. 重启 KiraAI
+> ⚠️ 装到对地方：插件目录最终必须落在 `<KiraAI 仓库根>/data/plugins/KiraOS_Plugin/`，而**不是** `core/plugin/builtin_plugins/`。后者是 KiraAI 自带插件的位置，不在那里部署。
 
-启用时如检测到旧的"Simple Memory"内置插件正在运行，会自动将其禁用以避免冲突。
+### 方式 A：WebUI 一键装（推荐）
+
+适合大多数用户。**依赖会自动安装**——`requirements.txt` 由 KiraAI 的 plugin installer 在装入时自动 `pip install`。
+
+1. 打开 KiraAI WebUI → 插件管理页
+2. 点 "Install from GitHub"（粘 repo URL）或 "Install from ZIP"（上传发布包）
+3. 装入成功后，在插件列表里启用 KiraOS
+4. 重启 KiraAI
+
+### 方式 B：本地手动放置
+
+适合想从源码部署、或不希望走网络下载的人。**依赖需要自己装**。
+
+```bash
+# 1. 把插件目录复制到 data/plugins/（目录名必须是 KiraOS_Plugin）
+cp -r /path/to/KiraOS_Plugin <KiraAI 仓库根>/data/plugins/KiraOS_Plugin
+
+# 2. 在主程序 venv 里装依赖
+#    Windows:
+<KiraAI 仓库根>\venv\Scripts\activate.bat
+python -m pip install -r data\plugins\KiraOS_Plugin\requirements.txt
+
+#    Linux / macOS:
+source <KiraAI 仓库根>/venv/bin/activate
+python -m pip install -r data/plugins/KiraOS_Plugin/requirements.txt
+
+# 3. 在 WebUI 启用插件并重启 KiraAI
+```
+
+### 方式 C：开发者软链（仅本地改代码时用）
+
+```bash
+# Linux/macOS
+ln -s /path/to/KiraOS_Plugin/source <KiraAI 仓库根>/data/plugins/KiraOS_Plugin
+
+# Windows (管理员 cmd)
+mklink /D <KiraAI 仓库根>\data\plugins\KiraOS_Plugin C:\path\to\KiraOS_Plugin\source
+```
+
+依赖按方式 B 第 2 步装。改代码后重启 KiraAI 即可生效。
+
+### 启用后的自动行为
+
+KiraAI 主程序自带一个轻量的内置"Simple Memory"插件（`kira_plugin_simple_memory`）。KiraOS 启用时会**自动**把它禁用——两套记忆系统同时往 system prompt 里写会打架。详见 [与内置 Simple Memory 插件的关系](#与内置-simple-memory-插件的关系)。
 
 ### 依赖
 
@@ -82,9 +123,19 @@ python -m pip install -r data/plugins/KiraOS_Plugin/requirements.txt
 
 ---
 
-## 与内置记忆插件的关系
+## 与内置 Simple Memory 插件的关系
 
-KiraAI 自带一个简单的"Simple Memory"插件。KiraOS 启用时会自动禁用它，避免两套记忆系统同时往 system prompt 注入造成冲突。如果想切换回 Simple Memory，请先在 WebUI 禁用 KiraOS，再启用 Simple Memory。
+KiraAI 主程序自带一个轻量的"Simple Memory"内置插件（`kira_plugin_simple_memory`）。KiraOS 提供的是它的**完整替代品**：
+
+| 维度 | Simple Memory（内置） | KiraOS（本插件，外部） |
+|------|---------------------|--------------------|
+| 存储 | 单一 SQLite，key-value 画像 + 事件日志 | TOML 真相源 + SQLite 索引 |
+| 实体维度 | 只有 user | user / group / channel / global |
+| 检索 | 全部按分类塞 system prompt | FTS5 中文分词 + 时间衰减 + top-K 召回 |
+| 写入 | LLM 显式调工具 | LLM 工具 + 后台海马体自动提取 |
+| 反思 / 升维 | 无 | 海马体定期把零散 facts 升维成 reflection |
+
+KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时注入 system prompt）。如果想切换回 Simple Memory，先在 WebUI 禁用 KiraOS，再启用 Simple Memory。
 
 ---
 
@@ -138,7 +189,7 @@ KiraAI 自带一个简单的"Simple Memory"插件。KiraOS 启用时会自动禁
 
 在指定实体的长期记忆中搜索。`entity_id` 可以是逗号分隔的多个 ID，工具会**并行检索**并把结果拼起来。
 
-打分维度（来自 lightning）：
+打分维度：
 - FTS5 匹配分（jieba 中文分词）
 - importance 加成
 - 时间衰减（越久远权重越低）
