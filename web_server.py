@@ -1,17 +1,32 @@
 """
-KiraOS Memory WebUI — Self-contained Starlette mini-app.
+KiraOS Memory WebUI — Self-contained Starlette mini-app (v3.0)
 
-Provides a REST API for managing user memories (profiles & events)
-and serves a single-file SPA for visual management.
+Provides a REST API + single-file SPA over the dual-brain memory system.
+Backed by `MemoryManager` (not the v2 SQLite schema).
 
-Uses only uvicorn + starlette (shipped with FastAPI, zero extra deps).
+Uses only uvicorn + starlette, zero extra deps.
+
+Endpoints:
+    GET    /                                     — SPA shell
+    GET    /api/stats                            — counts (entities, facts, reflections)
+    GET    /api/entities[?type=user|group|...]   — list entities
+    GET    /api/entity/{type}/{id}               — profile + facts + reflections
+    PUT    /api/entity/{type}/{id}/profile       — update profile fields
+    POST   /api/entity/{type}/{id}/facts         — add a fact memory
+    DELETE /api/entity/{type}/{id}               — delete entity dir (recursive archive)
+    PUT    /api/memory/{type}/{id}/{folder}/{memory_id}   — edit one memory's text/importance
+    DELETE /api/memory/{type}/{id}/{folder}/{memory_id}   — archive one memory
+    GET    /api/search?q=...&entity_id=...&k=10  — recall search
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
+import shutil
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -25,18 +40,29 @@ from starlette.routing import Route
 
 from core.logging_manager import get_logger
 
+from .memory import MemoryManager
+from .memory.memory_paths import (
+    get_entities_dir,
+    get_entity_dir,
+    list_all_entities,
+    _id_to_path_segment,
+    _SAFE_ID_RE,
+    ENTITY_USER,
+    VALID_ENTITY_TYPES,
+    MEMORY_FOLDERS,
+)
+
 logger = get_logger("kiraos_webui", "cyan")
 
 _WEB_DIR = Path(__file__).parent / "web"
-MAX_EVENT_SUMMARY_LEN = 1000
+MAX_TEXT_LEN = 4000
 
 
 def _mask_id(value: str) -> str:
-    """Return a masked identifier safe for logging (prefix + short hash)."""
     if not value:
         return "<empty>"
-    h = hashlib.sha256(value.encode()).hexdigest()[:8]
-    prefix = value[:3] if len(value) >= 3 else value
+    h = hashlib.sha256(str(value).encode()).hexdigest()[:8]
+    prefix = str(value)[:3] if len(str(value)) >= 3 else str(value)
     return f"{prefix}***({h})"
 
 
@@ -45,53 +71,118 @@ def _mask_id(value: str) -> str:
 # ════════════════════════════════════════════════════════════════════
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
-    """Optional Bearer-token authentication.
-
-    Compared against the configured token using ``secrets.compare_digest`` so
-    request-time differences cannot leak the token via a timing side-channel.
-
-    Only the ``Authorization: Bearer <token>`` header is honoured for API
-    requests. The previous ``?token=<token>`` query-param fallback was removed
-    because tokens in URLs leak into server access logs, browser history, and
-    HTTP ``Referer`` headers. The SPA bootstraps from ``?token=`` on its own
-    (it reads it from the URL on first paint, stashes it in sessionStorage,
-    rewrites the URL, then sends the Bearer header from then on).
-    """
+    """Optional Bearer-token authentication via Authorization header."""
 
     def __init__(self, app, token: str = ""):
         super().__init__(app)
         self.token = token
-        # Prebuild the expected header value once for compare_digest
         self._expected_header = f"Bearer {token}".encode("utf-8") if token else b""
 
     async def dispatch(self, request: Request, call_next):
-        # Skip auth if no token configured or if requesting the SPA shell.
-        # The SPA shell is static markup with no embedded data; the token in
-        # ?token= is read by JS on the client side, never validated here.
         if not self.token or request.url.path == "/":
             return await call_next(request)
-
         auth = request.headers.get("authorization", "").encode("utf-8")
         if auth and secrets.compare_digest(auth, self._expected_header):
             return await call_next(request)
-
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Helpers
+# ════════════════════════════════════════════════════════════════════
+
+def _get_manager(request: Request) -> Optional[MemoryManager]:
+    return getattr(request.app.state, "memory_manager", None)
+
+
+def _validate_entity_type(entity_type: str) -> Optional[str]:
+    """Reject unknown types; default empty to 'user'."""
+    if not entity_type:
+        return ENTITY_USER
+    if entity_type not in VALID_ENTITY_TYPES:
+        return None
+    return entity_type
+
+
+def _validate_entity_id(entity_id: str) -> bool:
+    """Return True iff `entity_id` matches the same safe-ID regex used by
+    `memory_paths._validate_id`. Lets handlers reject bad path params as 400
+    instead of letting the deeper `get_entity_dir`/`get_memory` blow up as
+    500.
+    """
+    return bool(entity_id) and bool(_SAFE_ID_RE.match(entity_id))
+
+
+def _validate_folder(folder: str) -> bool:
+    """Return True iff `folder` is one of MEMORY_FOLDERS."""
+    return folder in MEMORY_FOLDERS
+
+
+def _resolve_path_params(
+    request: Request,
+    *,
+    require_folder: bool = False,
+) -> tuple[Optional[JSONResponse], Optional[str], Optional[str], Optional[str]]:
+    """Unified path-param validator for handlers that take
+    `/entity/{entity_type}/{entity_id}/...` (optionally `/{folder}`).
+
+    Returns `(error_response, entity_type, entity_id, folder)`:
+    - On success, `error_response` is None and the other three are normalized.
+    - On any validation failure, `error_response` is a 400 JSONResponse with
+      a short, deterministic error string suitable for the SPA, and the
+      other three are None.
+
+    This collapses the previous pattern of `_validate_entity_type` (collapse
+    to ENTITY_USER) + `get_entity_dir(...)` raising deep ValueError into a
+    single front-door check, so handlers don't return 500 for bad params.
+    """
+    entity_type = _validate_entity_type(request.path_params.get("entity_type", ""))
+    if entity_type is None:
+        return JSONResponse({"error": "invalid entity_type"}, status_code=400), None, None, None
+
+    entity_id = request.path_params.get("entity_id", "")
+    if not _validate_entity_id(entity_id):
+        return JSONResponse({"error": "invalid entity_id"}, status_code=400), None, None, None
+
+    folder = request.path_params.get("folder")
+    if require_folder:
+        if not folder or not _validate_folder(folder):
+            return JSONResponse({"error": "invalid folder"}, status_code=400), None, None, None
+    elif folder is not None and not _validate_folder(folder):
+        return JSONResponse({"error": "invalid folder"}, status_code=400), None, None, None
+
+    return None, entity_type, entity_id, folder
+
+
+def _memory_to_dict(mem) -> dict:
+    """Serialize a Memory object to a JSON-safe dict for the SPA.
+
+    Intentionally omits `file_path` — exposing the on-disk layout to the
+    frontend is a stable information-leak surface (data-root, namespace
+    structure) the SPA doesn't need. Server-side debugging can read it
+    from logs instead.
+    """
+    return {
+        "id": mem.id,
+        "type": mem.type,
+        "text": mem.raw_text,
+        "importance": mem.importance,
+        "tags": list(mem.tags or []),
+        "source": dict(mem.source or {}),
+        "entity_id": getattr(mem, "_entity_id", ""),
+        "entity_type": getattr(mem, "_entity_type", ""),
+        "folder": getattr(mem, "_folder", ""),
+        "access_count": mem.access_count,
+        "last_accessed": mem.last_accessed,
+        "timestamp": mem.timestamp,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════
 #  API Handlers
 # ════════════════════════════════════════════════════════════════════
 
-def _get_db(request: Request):
-    """Get the UserMemoryDB instance from app state."""
-    db = request.app.state.db
-    if db is None:
-        return None
-    return db
-
-
 async def serve_index(request: Request) -> Response:
-    """Serve the SPA index.html."""
     index_path = _WEB_DIR / "index.html"
     if not index_path.is_file():
         return HTMLResponse("<h1>KiraOS Memory WebUI</h1><p>index.html not found.</p>", status_code=404)
@@ -99,355 +190,431 @@ async def serve_index(request: Request) -> Response:
 
 
 async def api_stats(request: Request) -> JSONResponse:
-    """GET /api/stats — Return global statistics."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+    entities = list_all_entities()
+    by_type: dict[str, int] = {}
+    for _eid, et in entities:
+        by_type[et] = by_type.get(et, 0) + 1
+    total_facts = manager.memory_index.count_memories(folder="facts")
+    total_reflections = manager.memory_index.count_memories(folder="reflections")
+    return JSONResponse({
+        "entity_count": len(entities),
+        "entities_by_type": by_type,
+        "fact_count": total_facts,
+        "reflection_count": total_reflections,
+    })
+
+
+async def api_list_entities(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+
+    filter_type = request.query_params.get("type") or None
+    if filter_type and filter_type not in VALID_ENTITY_TYPES:
+        return JSONResponse({"error": f"invalid type: {filter_type}"}, status_code=400)
+
+    rows = list_all_entities(filter_type)
+    result = []
+    for eid, et in rows:
+        try:
+            profile = await manager.profile_store.get_profile(eid, et)
+            label = profile.name or profile.nickname or eid
+            result.append({
+                "entity_id": eid,
+                "entity_type": et,
+                "label": label,
+                "interaction_count": profile.interaction_count,
+                "last_interaction": profile.last_interaction,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to load profile for {_mask_id(eid)}: {e}")
+            result.append({
+                "entity_id": eid,
+                "entity_type": et,
+                "label": eid,
+                "interaction_count": 0,
+                "last_interaction": 0,
+            })
+    return JSONResponse({"entities": result})
+
+
+async def api_get_entity(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
+
     try:
-        stats = db.get_stats()
-        return JSONResponse(stats)
+        profile = await manager.profile_store.get_profile(entity_id, entity_type)
     except Exception:
-        logger.exception("Error getting stats")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
+        logger.exception("get_entity profile load failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
-
-async def api_list_users(request: Request) -> JSONResponse:
-    """GET /api/users — List all users with memory data.
-
-    Optional ``?q=<term>`` triggers a content search across user_id, profile
-    values, and event summaries; the response includes ``match_in`` and
-    ``snippet`` fields per row.
-    """
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-    try:
-        q = (request.query_params.get("q") or "").strip()
-        if q:
-            users = db.search_users(q, limit=200)
-        else:
-            users = db.list_users()
-        return JSONResponse(users)
-    except Exception:
-        logger.exception("Error listing users")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-
-# ── Bulk export / import ──────────────────────────────────────────
-
-# Cap the size of an uploaded import payload so a malicious or runaway
-# request can't OOM the server.
-MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB
-
-
-async def api_export(request: Request) -> JSONResponse:
-    """GET /api/export — Dump all users' profiles and events as JSON."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-    try:
-        snapshot = db.export_all()
-        return JSONResponse(
-            snapshot,
-            headers={
-                "Content-Disposition": (
-                    f"attachment; filename=kiraos-memory-"
-                    f"{snapshot['exported_at'][:10]}.json"
-                )
-            },
+    # 走 `tree_store.get_all_memories` 而不是直接读 SQLite 索引——TOML 才是
+    # 真相源，索引行可能有用户手动编辑后没同步的旧值。`_memory_to_dict` 做受
+    # 控序列化，把 `file_path` 之类的内部字段过滤掉。
+    facts = [
+        _memory_to_dict(m)
+        for m in await manager.tree_store.get_all_memories(
+            entity_id=entity_id, entity_type=entity_type, folder="facts"
         )
-    except Exception:
-        logger.exception("Error exporting memory")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-
-async def api_import(request: Request) -> JSONResponse:
-    """POST /api/import — Bulk-load a snapshot produced by /api/export.
-
-    Accepts ``mode=merge|upsert|replace`` (default ``merge``).
-    """
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-    cl = request.headers.get("content-length")
-    if cl and cl.isdigit() and int(cl) > MAX_IMPORT_BYTES:
-        return JSONResponse(
-            {"error": f"Import payload too large (>{MAX_IMPORT_BYTES} bytes)"},
-            status_code=413,
+    ]
+    reflections = [
+        _memory_to_dict(m)
+        for m in await manager.tree_store.get_all_memories(
+            entity_id=entity_id, entity_type=entity_type, folder="reflections"
         )
-    try:
-        body = await request.body()
-    except Exception:
-        return JSONResponse({"error": "Failed to read request body"}, status_code=400)
-    if len(body) > MAX_IMPORT_BYTES:
-        return JSONResponse(
-            {"error": f"Import payload too large (>{MAX_IMPORT_BYTES} bytes)"},
-            status_code=413,
-        )
-    try:
-        data = json.loads(body)
-    except (json.JSONDecodeError, ValueError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    if not isinstance(data, dict):
-        return JSONResponse({"error": "Top-level JSON must be an object"}, status_code=400)
-    mode = (request.query_params.get("mode") or "merge").lower()
-    if mode not in ("merge", "upsert", "replace"):
-        return JSONResponse({"error": f"invalid mode '{mode}'"}, status_code=400)
-    try:
-        result = db.import_all(data, mode=mode)
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception:
-        logger.exception("Error importing memory")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-    return JSONResponse({"ok": True, **result})
+    ]
 
-
-async def api_get_user(request: Request) -> JSONResponse:
-    """GET /api/users/{user_id} — Get all profiles + events for a user."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-
-    user_id = request.path_params["user_id"]
-
-    try:
-        profiles = db.get_profiles(user_id, include_expired=True)
-        events = db.get_events_with_id(user_id, limit=200)
-
-        from .db import _epoch_to_iso_date
-        profile_list = [
-            {
-                "key": key,
-                "value": value,
-                "updated_at": updated_at,
-                "confidence": confidence,
-                "category": category,
-                # expires_at is stored as integer epoch; expose as ISO date for the UI
-                "expires_at": _epoch_to_iso_date(expires_at),
-            }
-            for key, value, updated_at, confidence, category, expires_at in profiles
-        ]
-
-        event_list = [
-            {
-                "id": eid,
-                "event_summary": summary,
-                "created_at": created_at,
-                "tag": tag,
-            }
-            for eid, summary, created_at, tag in events
-        ]
-
-        return JSONResponse({
-            "user_id": user_id,
-            "profiles": profile_list,
-            "events": event_list,
-        })
-    except Exception:
-        logger.exception("Error getting user %s", _mask_id(user_id))
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
+    return JSONResponse({
+        "entity_id": entity_id,
+        "entity_type": entity_type,
+        "profile": profile.to_dict(),
+        "facts": facts,
+        "reflections": reflections,
+    })
 
 
 async def api_update_profile(request: Request) -> JSONResponse:
-    """PUT /api/users/{user_id}/profiles/{key} — Update a profile entry."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    user_id = request.path_params["user_id"]
-    key = request.path_params["key"]
-
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    value = body.get("value", "")
-    if not value:
-        return JSONResponse({"error": "value is required"}, status_code=400)
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
 
     try:
-        confidence = max(0.0, min(1.0, float(body.get("confidence", 0.5))))
-    except (ValueError, TypeError):
-        return JSONResponse({"error": "Invalid confidence value, must be a number"}, status_code=400)
-    category = body.get("category", "basic")
-    expires_at = body.get("expires_at")
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"error": "JSON body must be an object"}, status_code=400
+        )
 
-    from .db import VALID_CATEGORIES
-    if category not in VALID_CATEGORIES:
-        category = "basic"
+    allowed = {"name", "nickname", "description", "platform"}
+    updates = {k: v for k, v in payload.items() if k in allowed and isinstance(v, str)}
+    if not updates:
+        return JSONResponse({"error": "no valid fields"}, status_code=400)
 
     try:
-        db.save_profile(user_id, key, value,
-                        confidence=confidence,
-                        category=category,
-                        expires_at=expires_at)
-        return JSONResponse({"ok": True, "key": key, "value": value})
+        await manager.profile_store.update_profile(entity_id, entity_type, **updates)
     except Exception:
-        logger.exception("Error updating profile %s/%s", _mask_id(user_id), key)
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-
-async def api_delete_profile(request: Request) -> JSONResponse:
-    """DELETE /api/users/{user_id}/profiles/{key} — Delete a profile entry."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-
-    user_id = request.path_params["user_id"]
-    key = request.path_params["key"]
-
-    try:
-        removed = db.remove_profile(user_id, key)
-        if removed:
-            return JSONResponse({"ok": True})
-        return JSONResponse({"error": "Profile not found"}, status_code=404)
-    except Exception:
-        logger.exception("Error deleting profile %s/%s", _mask_id(user_id), key)
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-
-async def api_delete_event(request: Request) -> JSONResponse:
-    """DELETE /api/users/{user_id}/events/{event_id} — Delete a single event."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-
-    user_id = request.path_params["user_id"]
-    try:
-        event_id = int(request.path_params["event_id"])
-    except ValueError:
-        return JSONResponse({"error": "Invalid event_id"}, status_code=400)
-
-    try:
-        removed = db.delete_event(event_id, user_id=user_id)
-        if removed:
-            return JSONResponse({"ok": True})
-        return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
-    except Exception:
-        logger.exception(f"Error deleting event {event_id}")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-
-async def api_clear_user(request: Request) -> JSONResponse:
-    """DELETE /api/users/{user_id} — Clear all memory for a user."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-
-    user_id = request.path_params["user_id"]
-
-    try:
-        profiles_del, events_del = db.clear_user_memory(user_id)
-        return JSONResponse({
-            "ok": True,
-            "profiles_deleted": profiles_del,
-            "events_deleted": events_del,
-        })
-    except Exception:
-        logger.exception("Error clearing user %s", _mask_id(user_id))
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-
-async def api_add_event(request: Request) -> JSONResponse:
-    """POST /api/users/{user_id}/events — Add a new event."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
-
-    user_id = request.path_params["user_id"]
-
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    event_summary = (body.get("event_summary") or "").strip()
-    if not event_summary:
-        return JSONResponse({"error": "event_summary is required"}, status_code=400)
-    if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
-        return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
-    tag = body.get("tag")
-    if tag is not None and not isinstance(tag, str):
-        return JSONResponse({"error": "tag must be a string"}, status_code=400)
-
-    try:
-        db.save_event(user_id, event_summary, tag=tag)
-    except Exception:
-        logger.exception("Error adding event for %s", _mask_id(user_id))
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
-
-    # Cleanup runs best-effort after successful save
-    try:
-        max_keep = max(0, int(request.app.state.max_event_keep))
-        if max_keep > 0:
-            db.cleanup_old_events(user_id, keep=max_keep)
-    except (ValueError, TypeError):
-        logger.warning("Invalid max_event_keep value, skipping cleanup")
-    except Exception:
-        logger.exception("Error during event cleanup for %s", _mask_id(user_id))
+        logger.exception("update_profile failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
     return JSONResponse({"ok": True})
 
 
-async def api_update_event(request: Request) -> JSONResponse:
-    """PUT /api/users/{user_id}/events/{event_id} — Update an event's summary."""
-    db = _get_db(request)
-    if not db:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+async def api_add_fact(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
 
-    user_id = request.path_params["user_id"]
-    try:
-        event_id = int(request.path_params["event_id"])
-    except ValueError:
-        return JSONResponse({"error": "Invalid event_id"}, status_code=400)
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
 
     try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    event_summary = (body.get("event_summary") or "").strip()
-    if not event_summary:
-        return JSONResponse({"error": "event_summary is required"}, status_code=400)
-    if len(event_summary) > MAX_EVENT_SUMMARY_LEN:
-        return JSONResponse({"error": f"event_summary must be at most {MAX_EVENT_SUMMARY_LEN} characters"}, status_code=400)
-    # Tag is optional; ``"tag" in body`` distinguishes "no change" from "clear".
-    tag_provided = "tag" in body
-    tag_value = body.get("tag")
-    if tag_provided and tag_value is not None and not isinstance(tag_value, str):
-        return JSONResponse({"error": "tag must be a string or null"}, status_code=400)
-
-    try:
-        updated = db.update_event(
-            event_id, event_summary, user_id=user_id,
-            tag=tag_value if tag_provided else None,
-            set_tag=tag_provided,
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"error": "JSON body must be an object"}, status_code=400
         )
-        if updated:
-            return JSONResponse({"ok": True})
-        return JSONResponse({"error": "Event not found or not owned by this user"}, status_code=404)
+
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > MAX_TEXT_LEN:
+        return JSONResponse({"error": f"text too long (>{MAX_TEXT_LEN})"}, status_code=400)
+    try:
+        importance = max(1, min(10, int(payload.get("importance", 5))))
+    except (TypeError, ValueError):
+        importance = 5
+    tags = payload.get("tags", []) or []
+    if not isinstance(tags, list):
+        return JSONResponse({"error": "tags must be a list"}, status_code=400)
+
+    try:
+        mem = await manager.tree_store.add_memory(
+            content_text=text,
+            memory_type="fact",
+            importance=importance,
+            tags=[str(t) for t in tags],
+            entity_id=entity_id,
+            entity_type=entity_type,
+            folder="facts",
+        )
     except Exception:
-        logger.exception(f"Error updating event {event_id}")
-        return JSONResponse({"error": "Internal server error"}, status_code=500)
+        logger.exception("add_fact failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
+
+    return JSONResponse({"ok": True, "memory_id": mem.id})
+
+
+async def api_delete_entity(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+
+    err, entity_type, entity_id, _ = _resolve_path_params(request)
+    if err is not None:
+        return err
+
+    base_dir = get_entity_dir(entity_id, entity_type)
+    if not os.path.isdir(base_dir):
+        return JSONResponse({"error": "entity not found"}, status_code=404)
+
+    # Move the whole entity dir into archive/ to keep raw data recoverable.
+    # Order matters: clear index rows FIRST so a crash between the two steps
+    # leaves at worst orphan archived files (recoverable) rather than stale
+    # index rows pointing into a moved-away directory (would surface as ghost
+    # search results that then fail to open).
+    #
+    # The whole thing is offloaded to `asyncio.to_thread` so the sync SQLite
+    # work + (potentially cross-filesystem) `shutil.move` doesn't stall the
+    # event loop. With many entities or large dirs this used to make every
+    # other API jitter for the duration of the delete.
+    def _do_delete_entity_sync():
+        # 1. Drop index rows for this entity so search/recall stop surfacing
+        #    them. `MemoryIndex.delete` 按复合主键 (entity_type, entity_id,
+        #    folder, base_dir, id) 删单行；row 自身就携带完整 entity 维度，
+        #    直接转发。
+        for folder in ("facts", "reflections"):
+            for row in manager.memory_index.list_memories(
+                entity_id=entity_id, entity_type=entity_type, folder=folder
+            ):
+                manager.memory_index.delete(
+                    row.get("id"),
+                    entity_id=row.get("entity_id", entity_id),
+                    entity_type=row.get("entity_type", entity_type),
+                    folder=row.get("folder", folder),
+                    base_dir=row.get("base_dir", ""),
+                )
+        # 2. Move the on-disk entity dir into archive. Wall-clock `time.time()`
+        #    intentionally, not `asyncio.get_event_loop().time()` (monotonic).
+        archive_root = Path(get_entities_dir()).parent / "archive" / "_full_entities"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        target = archive_root / f"{entity_type}_{_id_to_path_segment(entity_id)}_{int(time.time())}"
+        shutil.move(base_dir, target)
+
+    try:
+        await asyncio.to_thread(_do_delete_entity_sync)
+    except Exception:
+        logger.exception("delete_entity failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
+
+    return JSONResponse({"ok": True})
+
+
+async def api_update_memory(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+
+    err, entity_type, entity_id, folder = _resolve_path_params(request, require_folder=True)
+    if err is not None:
+        return err
+    memory_id = request.path_params["memory_id"]
+    # memory_id 会拼进 os.path.join(dir, f"{memory_id}.toml")，必须先走和
+    # entity_id 同等的 safe-id 校验，否则一个含 `/` / `\` 的 segment 就能
+    # 越出目标目录读到别处。
+    if not _validate_entity_id(memory_id):
+        return JSONResponse({"error": "invalid memory_id"}, status_code=400)
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"error": "JSON body must be an object"}, status_code=400
+        )
+
+    memory = await manager.tree_store.get_memory(
+        memory_id=memory_id,
+        entity_id=entity_id,
+        entity_type=entity_type,
+        folder=folder,
+    )
+    if not memory:
+        return JSONResponse({"error": "memory not found"}, status_code=404)
+
+    # 编辑接口里凡是显式提供了字段但类型不对，都直接报 400 而不是静默忽略。
+    # 之前的 silent-drop 会让前端误以为修改已落地，实际磁盘没动。
+    if "text" in payload:
+        if not isinstance(payload["text"], str):
+            return JSONResponse({"error": "text must be a string"}, status_code=400)
+        if len(payload["text"]) > MAX_TEXT_LEN:
+            return JSONResponse({"error": f"text too long (>{MAX_TEXT_LEN})"}, status_code=400)
+        memory.text = payload["text"]
+    if "importance" in payload:
+        try:
+            memory.importance = max(1, min(10, int(payload["importance"])))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "importance must be an integer 1-10"}, status_code=400
+            )
+    if "tags" in payload:
+        if not isinstance(payload["tags"], list):
+            return JSONResponse({"error": "tags must be a list"}, status_code=400)
+        memory.tags = [str(t) for t in payload["tags"]]
+
+    ok = await manager.tree_store.update_memory(memory)
+    if not ok:
+        # 把持久化失败映射成 5xx，避免前端 / SDK 以 2xx 判定成功而误以为
+        # 修改已落地。日志里有具体异常上下文（tree_store.update_memory 会
+        # logger.error）；body 不暴露底层细节。
+        logger.warning(
+            "update_memory returned False for %s/%s/%s/%s",
+            entity_type,
+            _mask_id(entity_id),
+            folder,
+            memory_id,
+        )
+        return JSONResponse({"error": "update failed"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+async def api_delete_memory(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+
+    err, entity_type, entity_id, folder = _resolve_path_params(request, require_folder=True)
+    if err is not None:
+        return err
+    memory_id = request.path_params["memory_id"]
+    # memory_id 会拼进文件路径，同样必须做 safe-id 校验防路径逃逸
+    if not _validate_entity_id(memory_id):
+        return JSONResponse({"error": "invalid memory_id"}, status_code=400)
+
+    # 先用 get_memory 探一下记录是否真的存在——`archive_memory` 的 False
+    # 同时表示"目标不存在"和"写归档/删索引失败"，把两者都报 404 会让真实
+    # 的 5xx 故障被前端 / SDK 误当成 not found。
+    existing = await manager.tree_store.get_memory(
+        memory_id=memory_id,
+        entity_id=entity_id,
+        entity_type=entity_type,
+        folder=folder,
+    )
+    if not existing:
+        return JSONResponse({"error": "memory not found"}, status_code=404)
+
+    ok = await manager.tree_store.archive_memory(
+        memory_id=memory_id,
+        entity_id=entity_id,
+        entity_type=entity_type,
+        folder=folder,
+    )
+    if not ok:
+        # 文件刚才还在但 archive 失败——是真实的写归档 / 删索引错误。
+        logger.warning(
+            "archive_memory returned False after get_memory hit for %s/%s/%s/%s",
+            entity_type,
+            _mask_id(entity_id),
+            folder,
+            memory_id,
+        )
+        return JSONResponse({"error": "archive failed"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+async def api_search(request: Request) -> JSONResponse:
+    manager = _get_manager(request)
+    if not manager:
+        return JSONResponse({"error": "memory not ready"}, status_code=503)
+
+    query = request.query_params.get("q", "").strip()
+    if not query:
+        return JSONResponse({"error": "q is required"}, status_code=400)
+    entity_id = request.query_params.get("entity_id", "")
+    raw_etype = request.query_params.get("entity_type", "")
+    # Treat empty entity_type as "any" instead of defaulting to ENTITY_USER —
+    # the frontend uses an empty value to mean "search across user/group/channel".
+    if raw_etype and raw_etype not in VALID_ENTITY_TYPES:
+        return JSONResponse({"error": "invalid entity_type"}, status_code=400)
+    entity_type = raw_etype  # "" or a valid type
+    try:
+        k = max(1, min(50, int(request.query_params.get("k", 10))))
+    except (TypeError, ValueError):
+        k = 10
+
+    # When neither entity_id nor entity_type is pinned, fan out across every
+    # known entity so the user can do a true global recall.
+    # - **Concurrent**: `asyncio.gather` the per-entity `recall` calls instead
+    #   of running them sequentially — that turns O(N) latency back into the
+    #   slowest single call.
+    # - **Score-preserving sort**: each Memory's `meta["_score"]` carries the
+    #   hybrid BM25 + vector + importance + decay score from `MemoryIndex.
+    #   hybrid_search`. Merging by `_score` keeps cross-entity relevance
+    #   ordering intact; falling back to `(importance, last_accessed)` only
+    #   when the score is missing (e.g. a memory that never went through the
+    #   FTS path).
+    if not entity_id and not entity_type:
+        entities = list_all_entities()
+
+        async def _recall_one(eid: str, etype: str):
+            try:
+                return await manager.recall(
+                    query=query, entity_id=eid, entity_type=etype, k=k
+                )
+            except Exception as e:
+                logger.warning(
+                    "global recall failed for %s:%s: %s",
+                    etype,
+                    _mask_id(eid),
+                    e,
+                )
+                return []
+
+        per_entity = await asyncio.gather(
+            *(_recall_one(eid, etype) for eid, etype in entities)
+        )
+        results = [m for hits in per_entity for m in hits]
+
+        def _sort_key(m):
+            meta = getattr(m, "meta", None) or {}
+            return (
+                float(meta.get("_score") or 0.0),
+                int(m.importance or 0),
+                float(m.last_accessed or 0),
+            )
+
+        results.sort(key=_sort_key, reverse=True)
+        memories = results[:k]
+    else:
+        memories = await manager.recall(
+            query=query,
+            entity_id=entity_id,
+            entity_type=entity_type or ENTITY_USER,
+            k=k,
+        )
+    return JSONResponse({"memories": [_memory_to_dict(m) for m in memories]})
 
 
 # ════════════════════════════════════════════════════════════════════
-#  Logging Filter — suppress noisy polling endpoints
+#  Polling log filter
 # ════════════════════════════════════════════════════════════════════
 
 class _PollLogFilter(logging.Filter):
     """Drop access-log records for high-frequency GET polling paths."""
-    _QUIET_EXACT = frozenset({'/api/stats', '/api/users'})
+    _QUIET_EXACT = frozenset({'/api/stats', '/api/entities'})
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        # Uvicorn access log format: '<addr> - "<METHOD> <path> HTTP/..." <status>'
         if '"GET ' not in msg:
             return True
         for path in self._QUIET_EXACT:
-            # Match exact path followed by space or query string
             marker = f'"GET {path} '
             if marker in msg or f'"GET {path}?' in msg:
                 return False
@@ -458,22 +625,27 @@ class _PollLogFilter(logging.Filter):
 #  App Factory & Server Management
 # ════════════════════════════════════════════════════════════════════
 
-def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
-    """Create the Starlette app with routes and middleware."""
-    # Order matters: more-specific (longer) routes first, then catch-all.
+def create_app(memory_manager: MemoryManager, token: str = "") -> Starlette:
+    """Build the Starlette app for the WebUI."""
     routes = [
         Route("/", serve_index, methods=["GET"]),
-        Route("/api/users/{user_id}/profiles/{key}", api_update_profile, methods=["PUT"]),
-        Route("/api/users/{user_id}/profiles/{key}", api_delete_profile, methods=["DELETE"]),
-        Route("/api/users/{user_id}/events/{event_id:int}", api_update_event, methods=["PUT"]),
-        Route("/api/users/{user_id}/events/{event_id:int}", api_delete_event, methods=["DELETE"]),
-        Route("/api/users/{user_id}/events", api_add_event, methods=["POST"]),
-        Route("/api/users/{user_id}", api_get_user, methods=["GET"]),
-        Route("/api/users/{user_id}", api_clear_user, methods=["DELETE"]),
-        Route("/api/export", api_export, methods=["GET"]),
-        Route("/api/import", api_import, methods=["POST"]),
         Route("/api/stats", api_stats, methods=["GET"]),
-        Route("/api/users", api_list_users, methods=["GET"]),
+        Route("/api/entities", api_list_entities, methods=["GET"]),
+        Route("/api/search", api_search, methods=["GET"]),
+        Route("/api/entity/{entity_type}/{entity_id}", api_get_entity, methods=["GET"]),
+        Route("/api/entity/{entity_type}/{entity_id}", api_delete_entity, methods=["DELETE"]),
+        Route("/api/entity/{entity_type}/{entity_id}/profile", api_update_profile, methods=["PUT"]),
+        Route("/api/entity/{entity_type}/{entity_id}/facts", api_add_fact, methods=["POST"]),
+        Route(
+            "/api/memory/{entity_type}/{entity_id}/{folder}/{memory_id}",
+            api_update_memory,
+            methods=["PUT"],
+        ),
+        Route(
+            "/api/memory/{entity_type}/{entity_id}/{folder}/{memory_id}",
+            api_delete_memory,
+            methods=["DELETE"],
+        ),
     ]
 
     middleware = []
@@ -481,35 +653,32 @@ def create_app(db, token: str = "", max_event_keep: int = 0) -> Starlette:
         middleware.append(Middleware(TokenAuthMiddleware, token=token))
 
     app = Starlette(routes=routes, middleware=middleware)
-    app.state.db = db
-    app.state.max_event_keep = max_event_keep
+    app.state.memory_manager = memory_manager
     return app
 
 
 class WebUIServer:
     """Manages the uvicorn server lifecycle for the memory WebUI."""
 
-    def __init__(self, db, host: str = "127.0.0.1", port: int = 8765, token: str = "", max_event_keep: int = 0):
-        self.db = db
+    def __init__(
+        self,
+        memory_manager: MemoryManager,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        token: str = "",
+    ):
+        self.memory_manager = memory_manager
         self.host = host
         self.port = port
         self.token = token
-        self.max_event_keep = max_event_keep
         self._server: Optional[uvicorn.Server] = None
         self._task: Optional[asyncio.Task] = None
         self._original_handler = None
         self._poll_log_filter: Optional[_PollLogFilter] = None
 
     async def start(self):
-        """Start the web server in a background asyncio task.
-
-        Raises ``RuntimeError`` if the server fails to come up within a short
-        readiness window — typically because the configured port is already
-        bound. Without this check the failure was silent: ``serve()`` raised
-        inside the task, the plugin logged 'started', and every subsequent
-        request returned a connection error.
-        """
-        app = create_app(self.db, self.token, max_event_keep=self.max_event_keep)
+        """Start the web server in a background asyncio task."""
+        app = create_app(self.memory_manager, self.token)
         config = uvicorn.Config(
             app,
             host=self.host,
@@ -519,23 +688,14 @@ class WebUIServer:
         )
         self._server = uvicorn.Server(config)
 
-        # Suppress repetitive access logs from high-frequency polling endpoints
         self._poll_log_filter = _PollLogFilter()
         access_logger = logging.getLogger("uvicorn.access")
         access_logger.addFilter(self._poll_log_filter)
 
-        # Suppress Windows ProactorEventLoop ConnectionResetError noise
-        # that fires in async callbacks *after* connections close.
         loop = asyncio.get_running_loop()
         self._original_handler = loop.get_exception_handler()
         loop.set_exception_handler(self._quiet_exception_handler)
 
-        # uvicorn calls ``sys.exit(1)`` when it can't bind the port. ``SystemExit``
-        # is a ``BaseException`` and asyncio propagates it straight out of
-        # ``run_until_complete``, so a plain ``await self._server.serve()`` would
-        # tear down the whole event loop before we can inspect the failure.
-        # Wrapping it lets us translate to a normal exception that ``.exception()``
-        # surfaces in the polling loop below.
         server = self._server
 
         async def _serve_safely():
@@ -546,14 +706,9 @@ class WebUIServer:
 
         self._task = asyncio.create_task(_serve_safely())
 
-        # Wait for uvicorn to flip `started=True` (it does this once it's bound
-        # the socket and entered the accept loop). Polling every 50 ms keeps
-        # the happy path responsive while still surfacing bind failures fast.
         deadline = loop.time() + 5.0
         while loop.time() < deadline:
             if self._task.done():
-                # Task ended before the server became ready — re-raise the
-                # underlying exception so initialize() can fail loudly.
                 exc = self._task.exception()
                 self._task = None
                 self._cleanup_log_handlers()
@@ -569,15 +724,12 @@ class WebUIServer:
                 return
             await asyncio.sleep(0.05)
 
-        # Soft timeout — log loudly but don't kill the plugin; the server may
-        # still come up shortly. The next failed request will be the real signal.
         logger.warning(
             f"KiraOS WebUI did not report ready within 5s on {self.host}:{self.port}; "
             "continuing anyway"
         )
 
     def _cleanup_log_handlers(self):
-        """Detach the access-log filter and restore the asyncio exception handler."""
         if self._poll_log_filter:
             logging.getLogger("uvicorn.access").removeFilter(self._poll_log_filter)
             self._poll_log_filter = None
@@ -590,7 +742,6 @@ class WebUIServer:
 
     def _quiet_exception_handler(self, loop, context):
         exc = context.get("exception")
-        # Suppress connection-reset errors from ProactorEventLoop on Windows
         if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
             return
         if self._original_handler:
@@ -599,7 +750,6 @@ class WebUIServer:
             loop.default_exception_handler(context)
 
     async def stop(self):
-        """Gracefully shut down the web server."""
         if self._server:
             self._server.should_exit = True
         if self._task:
