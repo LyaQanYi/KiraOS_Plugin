@@ -617,16 +617,24 @@ class TomlTreeStore:
                 _base_dir=base_dir or r.get("base_dir", ""),
             )
 
-            # 尝试从 TOML 文件加载完整内容（可能有用户手动编辑的注释等）
+            # 尝试从 TOML 文件加载完整内容（可能有用户手动编辑的注释等）。
+            # 用 `asyncio.to_thread` 把每条命中的同步读盘 offload 到线程池，
+            # 否则在 k>1 的检索路径里事件循环会被磁盘 IO 接连卡住，WebUI
+            # 搜索 / 后台任务都会一起抖。
             fpath = r.get("file_path", "") or mem.file_path
             if fpath and os.path.exists(fpath):
                 try:
-                    file_data = self._sync_read_toml(fpath)
+                    file_data = await asyncio.to_thread(self._sync_read_toml, fpath)
                     mem.text = file_data.get("text", mem.text)
                     mem.tags = file_data.get("tags", mem.tags)
                     mem.importance = file_data.get("importance", mem.importance)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "search: failed to load file %s for %s: %s",
+                        fpath,
+                        mem.id,
+                        e,
+                    )
 
             memories.append(mem)
 

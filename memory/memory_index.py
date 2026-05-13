@@ -862,10 +862,16 @@ class MemoryIndex:
         entity_id: str = "",
         entity_type: str = "",
         folder: str = "",
+        base_dir: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """通过内容 hash 快速查找精确重复"""
+        """通过内容 hash 快速查找精确重复（按完整命名空间过滤）。
+
+        `base_dir` 同样是命名空间维度——比如 `global/self`、`global/skills`
+        下的记忆和某个 user/group 的记忆完全不能算同一条，即使内容 hash
+        相同。漏掉这个维度会让 dedup / merge 跨命名空间串线。
+        """
         conditions = ["content_hash = ?"]
-        params = [content_hash]
+        params: list = [content_hash]
 
         if entity_id:
             conditions.append("entity_id = ?")
@@ -876,6 +882,10 @@ class MemoryIndex:
         if folder:
             conditions.append("folder = ?")
             params.append(folder)
+        # base_dir 显式参与命名空间隔离：传值时按值过滤，未传时默认锁定
+        # 普通 entity 域（base_dir = ''），避免 global 域记忆误命中。
+        conditions.append("base_dir = ?")
+        params.append(base_dir or "")
 
         where = " AND ".join(conditions)
         with self._read() as conn:

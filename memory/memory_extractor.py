@@ -299,6 +299,7 @@ class MemoryExtractor:
         entity_id: str,
         entity_type: str = "user",
         folder: str = "facts",
+        base_dir: str = "",
     ) -> tuple[str, Optional[Memory]]:
         """两级去重：SHA-256 精确匹配 → FTS5 语义搜索 + LLM 判断
 
@@ -310,7 +311,7 @@ class MemoryExtractor:
         # === 第一级：SHA-256 精确去重（零 LLM 调用） ===
         content_hash = MemoryIndex.content_hash(new_content)
         exact_match = self.index.find_by_hash(
-            content_hash, entity_id, entity_type, folder
+            content_hash, entity_id, entity_type, folder, base_dir
         )
         if exact_match:
             logger.debug(f"Exact hash match: {new_content[:50]}...")

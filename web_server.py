@@ -359,11 +359,20 @@ async def api_delete_entity(request: Request) -> JSONResponse:
     # search results that then fail to open).
     try:
         # 1. Drop index rows for this entity so search/recall stop surfacing them.
+        # `MemoryIndex.delete` 现在按复合主键 (entity_type, entity_id, folder,
+        # base_dir, id) 删单行——只传裸 id 会一行都删不掉。`row` 自身就携带
+        # 完整 entity 维度，照搬即可。
         for folder in ("facts", "reflections"):
             for row in manager.memory_index.list_memories(
                 entity_id=entity_id, entity_type=entity_type, folder=folder
             ):
-                manager.memory_index.delete(row.get("id"))
+                manager.memory_index.delete(
+                    row.get("id"),
+                    entity_id=row.get("entity_id", entity_id),
+                    entity_type=row.get("entity_type", entity_type),
+                    folder=row.get("folder", folder),
+                    base_dir=row.get("base_dir", ""),
+                )
         # 2. Move the on-disk entity dir into archive. Use wall-clock time.time()
         #    — `asyncio.get_event_loop().time()` returns a monotonic clock that
         #    resets across restarts and can produce colliding archive names.
@@ -387,6 +396,11 @@ async def api_update_memory(request: Request) -> JSONResponse:
     if err is not None:
         return err
     memory_id = request.path_params["memory_id"]
+    # memory_id 会拼进 os.path.join(dir, f"{memory_id}.toml")，必须先走和
+    # entity_id 同等的 safe-id 校验，否则一个含 `/` / `\` 的 segment 就能
+    # 越出目标目录读到别处。
+    if not _validate_entity_id(memory_id):
+        return JSONResponse({"error": "invalid memory_id"}, status_code=400)
 
     try:
         payload = await request.json()
@@ -439,6 +453,9 @@ async def api_delete_memory(request: Request) -> JSONResponse:
     if err is not None:
         return err
     memory_id = request.path_params["memory_id"]
+    # memory_id 会拼进文件路径，同样必须做 safe-id 校验防路径逃逸
+    if not _validate_entity_id(memory_id):
+        return JSONResponse({"error": "invalid memory_id"}, status_code=400)
 
     ok = await manager.tree_store.archive_memory(
         memory_id=memory_id,
