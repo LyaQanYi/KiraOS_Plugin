@@ -134,7 +134,12 @@ class EntityProfileStore:
     async def get_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER
     ) -> EntityProfile:
-        """获取实体画像，不存在则创建默认画像"""
+        """获取实体画像；不存在时自动创建默认画像并落盘。
+
+        **关键安全语义**：如果文件存在但读取/解析失败（手工编辑出错、权限异常、
+        瞬时 I/O 故障…），返回一个内存级默认画像但**不**回写覆盖磁盘——否则就
+        会把用户原本的数据静默清空。文件不存在的情况才会触发自动创建。
+        """
         fpath = get_entity_profile_path(entity_id, entity_type)
 
         if os.path.exists(fpath):
@@ -142,9 +147,14 @@ class EntityProfileStore:
                 data = await asyncio.to_thread(self._sync_read, fpath)
                 return EntityProfile.from_dict(data)
             except Exception as e:
-                logger.error(f"Failed to read profile {fpath}: {e}")
+                logger.error(
+                    f"Failed to read profile {fpath}: {e} — returning "
+                    "in-memory default WITHOUT overwriting the file on disk"
+                )
+                # 返回内存默认画像，但保留磁盘原文件不动，等管理员排查/恢复。
+                return EntityProfile(entity_id=entity_id, entity_type=entity_type)
 
-        # 创建默认画像
+        # 文件不存在 → 安全地落盘默认画像
         profile = EntityProfile(entity_id=entity_id, entity_type=entity_type)
         await self.save_profile(profile)
         return profile
@@ -162,17 +172,49 @@ class EntityProfileStore:
                 logger.error(f"Failed to save profile {fpath}: {e}")
                 return False
 
+    # 字段级类型契约：从外部进来的 kwargs 必须先用这张表过一遍，避免一个
+    # 字符串被塞进 `traits: list` 后下游 `.append` 直接炸。dataclass 不会
+    # 帮忙做 runtime 校验，所以这里手工守门。
+    _FIELD_TYPE_CHECKS: dict[str, tuple] = {
+        "name": (str,),
+        "nickname": (str,),
+        "description": (str,),
+        "platform": (str,),
+        "traits": (list,),
+        "preferences": (dict,),
+        "relationships": (dict,),
+        "facts": (list,),
+        "aliases": (list,),
+        "interaction_count": (int,),
+        "last_interaction": (int, float),
+        "metadata": (dict,),
+    }
+
     async def update_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER, **kwargs
     ) -> EntityProfile:
-        """部分更新画像字段（持 per-entity 锁，read-modify-write 原子化）"""
+        """部分更新画像字段（持 per-entity 锁，read-modify-write 原子化）。
+
+        对白名单字段做**字段级类型校验**——把字符串塞给 `traits` 这类 list
+        字段会让后续 `.append/.remove` 静默崩溃；类型不符的字段直接拒掉
+        并 warn，不阻塞合法字段的更新。
+        """
         async with await self._get_entity_lock(entity_id, entity_type):
             profile = await self.get_profile(entity_id, entity_type)
             allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
 
             for key, value in kwargs.items():
-                if key in allowed:
-                    setattr(profile, key, value)
+                if key not in allowed:
+                    continue
+                expected = self._FIELD_TYPE_CHECKS.get(key)
+                if expected and not isinstance(value, expected):
+                    logger.warning(
+                        f"update_profile: rejected field {key!r} for "
+                        f"{entity_type}:{entity_id} — expected {expected}, "
+                        f"got {type(value).__name__}"
+                    )
+                    continue
+                setattr(profile, key, value)
 
             profile.last_interaction = time.time()
             await self.save_profile(profile)
@@ -237,11 +279,21 @@ class EntityProfileStore:
             await self.save_profile(profile)
 
     async def increment_interaction(
-        self, entity_id: str, entity_type: str = ENTITY_USER, **extra_updates
+        self,
+        entity_id: str,
+        entity_type: str = ENTITY_USER,
+        *,
+        fill_name_from_nickname: bool = False,
+        **extra_updates,
     ):
         """递增交互计数并可选更新其他字段（read-modify-write 原子化）
 
         特别处理 nickname 变更：旧昵称自动归档到 aliases。
+
+        `fill_name_from_nickname=True` 时，**在同一把锁的 critical section
+        内**判断 `profile.name` 是否为空；为空就用本次传入的 nickname 回填。
+        这避免了"先 get_profile 判断、再调 increment_interaction 写"两次
+        IO 之间被并发协程把正式 name 写进去后又被覆盖的竞态。
         """
         async with await self._get_entity_lock(entity_id, entity_type):
             profile = await self.get_profile(entity_id, entity_type)
@@ -253,6 +305,15 @@ class EntityProfileStore:
             if new_nickname and profile.nickname and new_nickname != profile.nickname:
                 if profile.nickname not in profile.aliases:
                     profile.aliases.append(profile.nickname)
+
+            # 锁内判断：name 仍为空 + 传入了 nickname 才回填，避免并发覆盖。
+            if (
+                fill_name_from_nickname
+                and not profile.name
+                and new_nickname
+                and "name" not in extra_updates
+            ):
+                extra_updates["name"] = new_nickname
 
             allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
             for key, value in extra_updates.items():

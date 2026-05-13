@@ -338,12 +338,14 @@ class MemoryManager:
             updates["platform"] = platform
         if nickname:
             updates["nickname"] = nickname
-            # name 为空时用 nickname 自动补位，保证昵称索引可查
-            profile = await self.profile_store.get_profile(user_id, ENTITY_USER)
-            if not profile.name:
-                updates["name"] = nickname
+        # "name 为空时回填 nickname" 的判断必须在 increment_interaction 的
+        # critical section 内做，否则两次 IO 之间会被并发协程把正式 name 写
+        # 进去后又覆盖回 nickname。把开关通过 kwarg 传下去即可。
         await self.profile_store.increment_interaction(
-            user_id, ENTITY_USER, **updates
+            user_id,
+            ENTITY_USER,
+            fill_name_from_nickname=bool(nickname),
+            **updates,
         )
 
     # ==========================================

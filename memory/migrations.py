@@ -128,11 +128,21 @@ def _run_blocking_migration(legacy_db_path: Path, data_root: Path) -> dict:
             user_id = row["user_id"]
             if not user_id:
                 continue
-            # 跳过已过期
+            # 跳过已过期；脏数据（非整数）按"不过期"处理，单条坏行不应拖垮
+            # 整次迁移。
             exp = row["expires_at"]
-            if exp is not None and exp != "" and int(exp) <= now_epoch:
-                counts["skipped_expired"] += 1
-                continue
+            if exp is not None and exp != "":
+                try:
+                    exp_epoch = int(exp)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"Bad expires_at value {exp!r} for user {user_id} — "
+                        "treating as non-expiring"
+                    )
+                    exp_epoch = None
+                if exp_epoch is not None and exp_epoch <= now_epoch:
+                    counts["skipped_expired"] += 1
+                    continue
 
             if user_id not in profiles_by_user:
                 profiles_by_user[user_id] = EntityProfile(

@@ -442,6 +442,10 @@ async def profile_update(
 ) -> str:
     if not manager or not getattr(manager, "profile_store", None):
         return "Profile system not available"
+    # 防呆：strip 后再判空，避免 "   " / "\t" 这类空白被当成合法 trait/name 写入。
+    action = (action or "").strip()
+    value = (value or "").strip()
+    target = (target or "").strip()
     if not action or not value:
         return "Error: action and value are required"
 

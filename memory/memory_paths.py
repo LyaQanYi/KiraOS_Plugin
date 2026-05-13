@@ -110,7 +110,14 @@ def get_entity_dir(entity_id: str, entity_type: str) -> str:
 
 
 def get_entity_folder(entity_id: str, entity_type: str, folder: str) -> str:
-    """获取实体下的子目录: <data_root>/entities/{type}_{id}/{folder}/"""
+    """获取实体下的子目录: <data_root>/entities/{type}_{id}/{folder}/
+
+    `folder` 必须在 `MEMORY_FOLDERS` 白名单内，防止上层把 `"../../archive"`
+    之类的值传进来造成路径逃逸。`entity_id` 由 `_validate_id` 在 `get_entity_dir`
+    中收口；这里补上对 `folder` 的收口，公共 helper 的安全性不再外包给调用方。
+    """
+    if folder not in MEMORY_FOLDERS:
+        raise ValueError(f"未知实体子目录: {folder!r}, 可选: {MEMORY_FOLDERS}")
     return os.path.join(get_entity_dir(entity_id, entity_type), folder)
 
 

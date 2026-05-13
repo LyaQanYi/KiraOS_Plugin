@@ -129,8 +129,23 @@ class MemoryDecayEngine:
                 old_imp = meta.get("importance", 5)
                 new_imp = max(1, old_imp - 1)
                 if new_imp != old_imp:
-                    self.index.update_meta(mem_id, importance=new_imp)
-                    downgraded += 1
+                    # `importance` 是 TOML 真相源里的字段——如果只更新 SQLite
+                    # 索引，下次 `rebuild_index_from_files()`（或简单地重启）就
+                    # 会把旧值从文件读回，衰减白做了。走 `update_memory` 让
+                    # tree_store 同步写 TOML + 索引。
+                    mem = await self.tree_store.get_memory(
+                        memory_id=mem_id,
+                        entity_id=entity_id,
+                        entity_type=entity_type,
+                        folder=folder,
+                    )
+                    if mem is not None:
+                        mem.importance = new_imp
+                        # `meta` 同步，避免 to_full_dict 落回旧值
+                        if isinstance(mem.meta, dict):
+                            mem.meta["importance"] = new_imp
+                        if await self.tree_store.update_memory(mem):
+                            downgraded += 1
                 continue
 
             # GC: importance ≤ 3 且长期未访问

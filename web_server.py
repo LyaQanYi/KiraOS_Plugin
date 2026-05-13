@@ -196,8 +196,12 @@ async def api_get_entity(request: Request) -> JSONResponse:
 
     try:
         profile = await manager.profile_store.get_profile(entity_id, entity_type)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+    except ValueError:
+        # _validate_id 之类的预期错误：把错误码定准，body 不暴露底层异常文本
+        return JSONResponse({"error": "invalid entity_id"}, status_code=400)
+    except Exception:
+        logger.exception("get_entity profile load failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
     facts = manager.memory_index.list_memories(
         entity_id=entity_id, entity_type=entity_type, folder="facts"
@@ -237,9 +241,9 @@ async def api_update_profile(request: Request) -> JSONResponse:
 
     try:
         await manager.profile_store.update_profile(entity_id, entity_type, **updates)
-    except Exception as e:
+    except Exception:
         logger.exception("update_profile failed for %s/%s", entity_type, _mask_id(entity_id))
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
     return JSONResponse({"ok": True})
 
@@ -282,9 +286,9 @@ async def api_add_fact(request: Request) -> JSONResponse:
             entity_type=entity_type,
             folder="facts",
         )
-    except Exception as e:
-        logger.exception("add_fact failed")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("add_fact failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
     return JSONResponse({"ok": True, "memory_id": mem.id})
 
@@ -322,9 +326,9 @@ async def api_delete_entity(request: Request) -> JSONResponse:
         archive_root.mkdir(parents=True, exist_ok=True)
         target = archive_root / f"{entity_type}_{_id_to_path_segment(entity_id)}_{int(time.time())}"
         shutil.move(base_dir, target)
-    except Exception as e:
-        logger.exception("delete_entity failed")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("delete_entity failed for %s/%s", entity_type, _mask_id(entity_id))
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
     return JSONResponse({"ok": True})
 
@@ -425,7 +429,9 @@ async def api_search(request: Request) -> JSONResponse:
                 )
                 results.extend(hits)
             except Exception as e:
-                logger.warning(f"global recall failed for {etype}:{eid}: {e}")
+                logger.warning(
+                    f"global recall failed for {etype}:{_mask_id(eid)}: {e}"
+                )
         results.sort(
             key=lambda m: (m.importance, m.last_accessed), reverse=True
         )

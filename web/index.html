@@ -237,11 +237,26 @@ async function refreshEntities() {
     if (selected && selected.entity_id === e.entity_id && selected.entity_type === e.entity_type) {
       div.classList.add("selected");
     }
+    // 键盘可访问性：纯 div + onclick 屏幕阅读器无法识别，键盘用户也按不到。
+    // 加 role=button / tabindex=0 进 Tab 序列，并把 Enter / Space 当点击处理。
+    div.setAttribute("role", "button");
+    div.setAttribute("tabindex", "0");
+    div.setAttribute(
+      "aria-label",
+      `${e.entity_type} ${e.entity_id} — ${e.label}，互动 ${e.interaction_count} 次`
+    );
     div.innerHTML = `
       <div class="label">${escapeHtml(e.label)}</div>
       <div class="meta">${e.entity_type} · ${escapeHtml(e.entity_id)} · 互动 ${e.interaction_count}</div>
     `;
-    div.onclick = () => selectEntity(e.entity_id, e.entity_type);
+    const activate = () => selectEntity(e.entity_id, e.entity_type);
+    div.onclick = activate;
+    div.onkeydown = (ev) => {
+      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+        ev.preventDefault();
+        activate();
+      }
+    };
     list.appendChild(div);
   }
 }
@@ -352,7 +367,9 @@ async function saveProfile() {
       `/api/entity/${selected.entity_type}/${encodeURIComponent(selected.entity_id)}/profile`,
       { method: "PUT", body },
     );
-    await renderDetail();
+    // 侧边栏的 label 来自 /api/entities 的 profile.name / nickname，
+    // 改完 profile 必须同步刷新左边，不然名称会滞后到下一次轮询。
+    await Promise.all([renderDetail(), refreshEntities()]);
   } catch (e) {
     alert("保存失败: " + e.message);
   }

@@ -172,7 +172,7 @@ KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时
 ```
 
 数据存储是**双层**：
-- `data/memory/entities/{type}_{id}/*.toml` — 真相源（人类可直接编辑）
+- `data/memory/entities/{type}_{quoted_id}/*.toml` — 真相源（人类可直接编辑）。`entity_id` 在落盘前会先做 URL-encoding，所以 `telegram:12345` 实际目录是 `user_telegram%3A12345/`，跨平台都安全
 - `data/memory/memory_index.db` — SQLite 索引（启动时从 TOML 全量 rebuild）
 
 ### LLM 工具清单
@@ -275,7 +275,9 @@ webui_host: "127.0.0.1"
 webui_token: "your-secret-token"  # 可选；为空表示无认证
 ```
 
-访问 `http://127.0.0.1:8765/?token=your-secret-token`，token 会被 SPA 读到 sessionStorage 后从 URL 移除。
+访问 `http://127.0.0.1:8765/`。如果配置了 `webui_token`，**不要**把 token 放进 URL 的 query string——即使前端会自动把它移除，token 也已经进过浏览器历史、代理 access log 和截图分享渠道了。推荐做法：
+- 通过 URL fragment 传入（不会发到服务器、不会进 Referer）：访问 `http://127.0.0.1:8765/#token=your-secret-token`，SPA 读取后立刻 `history.replaceState` 把 fragment 擦掉
+- 或者直接在浏览器开发者工具里 `sessionStorage.setItem("kira_token", "your-secret-token")` 然后刷新
 
 ### REST API
 
@@ -339,15 +341,15 @@ data/memory/
 ├── chat_memory.json                     # 短期对话历史
 ├── .migrated_v3                         # 迁移标记（v2 → v3 一次性迁移）
 ├── entities/
-│   ├── user_{adapter}:{uid}/
+│   ├── user_{quoted_id}/                # 例: user_telegram%3A12345 (URL-encoded)
 │   │   ├── profile.json                 # 用户画像
 │   │   ├── facts/{id}.toml              # 细粒度事实
 │   │   └── reflections/{id}.toml        # 高阶洞察
-│   ├── group_{gid}/
+│   ├── group_{quoted_id}/               # 群 ID 同样 URL-encoded
 │   │   ├── profile.json
 │   │   ├── facts/
 │   │   └── reflections/
-│   └── channel_{cid}/...
+│   └── channel_{quoted_id}/...
 ├── global/
 │   ├── facts/
 │   ├── self/                            # AI 自我觉察（Phase 1）

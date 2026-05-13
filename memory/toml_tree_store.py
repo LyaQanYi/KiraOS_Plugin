@@ -269,6 +269,26 @@ class TomlTreeStore:
 
         lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
         async with self._get_lock(lock_key):
+            # 0. 处理 semantic_id 冲突 —— 不同事实生成同一 slug 时，给 id 加
+            #    内容 hash 后缀避免覆盖旧 TOML。内容完全相同（hash 相等）则
+            #    沿用旧 id 走 upsert 路径，保留访问历史。
+            new_hash = MemoryIndex.content_hash(content_text)
+            target_path = memory.file_path
+            if os.path.exists(target_path):
+                try:
+                    existing = await asyncio.to_thread(self._sync_read_toml, target_path)
+                    existing_hash = MemoryIndex.content_hash(existing.get("text", ""))
+                except Exception:
+                    existing_hash = ""
+                if existing_hash and existing_hash != new_hash:
+                    suffix = new_hash[:8]
+                    memory.id = f"{mem_id}_{suffix}"
+                    mem_id = memory.id
+                    logger.info(
+                        f"semantic_id collision on {entity_type}:{entity_id}/{folder} — "
+                        f"using suffixed id {mem_id}"
+                    )
+
             # 1. 写 TOML 文件（人类可读内容）
             await asyncio.to_thread(self._sync_write_toml, memory)
 
@@ -412,7 +432,7 @@ class TomlTreeStore:
         竞态。`asyncio.Lock` 不可重入，所以这里直接调用裸操作，不再走
         `delete_memory`（它会再次尝试同一把锁导致死锁）。
         """
-        from .memory_paths import get_archive_dir
+        from .memory_paths import get_archive_dir, _id_to_path_segment
 
         lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
         async with self._get_lock(lock_key):
@@ -422,9 +442,21 @@ class TomlTreeStore:
             if not memory:
                 return False
 
+            # 归档目录是平铺的，memory_id 只在各自 entity/folder 内唯一。
+            # 不同用户都生成 `likes_python` 时，后归档的会直接覆盖先归档的。
+            # 这里把 entity_type/entity_id/folder 编进归档文件名做命名空间隔离；
+            # entity_id 走 url-encode 防 Windows 非法字符。
             archive_dir = get_archive_dir()
             os.makedirs(archive_dir, exist_ok=True)
-            archive_path = os.path.join(archive_dir, f"{memory_id}.toml")
+            if base_dir:
+                ns = base_dir.replace("/", "_").replace("\\", "_")
+                archive_name = f"{ns}__{folder}__{memory_id}.toml"
+            else:
+                archive_name = (
+                    f"{entity_type}__{_id_to_path_segment(entity_id)}"
+                    f"__{folder}__{memory_id}.toml"
+                )
+            archive_path = os.path.join(archive_dir, archive_name)
 
             try:
                 # 1. 归档时写入完整数据（含 meta，方便恢复）
@@ -638,13 +670,35 @@ class TomlTreeStore:
     # ==========================================
 
     @staticmethod
-    def _sync_write_toml(memory: Memory):
-        """写入 TOML 文件（人类可读内容，无运行时 meta）"""
-        fpath = memory.file_path
+    def _atomic_write_bytes(fpath: str, payload: bytes) -> None:
+        """跨平台原子写：dump 到同目录 .tmp，fsync，再 os.replace 重命名。
+
+        没有这一步的话，TOML 写到一半被读取协程读到，就会拿到半文件 ——
+        而读取路径并不持锁。`os.replace` 是 atomic rename（同文件系统），
+        保证读者永远看到完整的旧文件或完整的新文件。
+        """
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        tmp = f"{fpath}.tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, fpath)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def _sync_write_toml(cls, memory: Memory):
+        """写入 TOML 文件（人类可读内容，无运行时 meta）；原子替换。"""
+        fpath = memory.file_path
         data = memory.to_toml_dict()
-        with open(fpath, "wb") as f:
-            tomli_w.dump(data, f)
+        cls._atomic_write_bytes(fpath, tomli_w.dumps(data).encode("utf-8"))
 
     @staticmethod
     def _sync_read_toml(fpath: str) -> dict:
@@ -652,14 +706,12 @@ class TomlTreeStore:
         with open(fpath, "rb") as f:
             return tomllib.load(f)
 
-    @staticmethod
-    def _sync_write_toml_to_path(data: dict, fpath: str):
-        """写入 TOML 到指定路径"""
-        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+    @classmethod
+    def _sync_write_toml_to_path(cls, data: dict, fpath: str):
+        """写入 TOML 到指定路径；原子替换。"""
         # 过滤掉 None 值（TOML 不支持）
         clean = _clean_for_toml(data)
-        with open(fpath, "wb") as f:
-            tomli_w.dump(clean, f)
+        cls._atomic_write_bytes(fpath, tomli_w.dumps(clean).encode("utf-8"))
 
     @staticmethod
     def _generate_fallback_id(text: str) -> str:

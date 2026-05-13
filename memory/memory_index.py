@@ -623,13 +623,15 @@ class MemoryIndex:
                 d["_vec_score"] = 1.0 / (1.0 + row["distance"])
                 results.append(d)
 
-            # 过滤 entity 范围
-            if entity_id or entity_type or folder:
+            # 过滤 entity 范围 —— 必须同时包含 base_dir，否则 global/self
+            # 这类按 base_dir 划分命名空间的搜索路径会把别的命名空间结果混进来。
+            if entity_id or entity_type or folder or base_dir:
                 results = [
                     r for r in results
                     if (not entity_id or r["entity_id"] == entity_id)
                     and (not entity_type or r["entity_type"] == entity_type)
                     and (not folder or r["folder"] == folder)
+                    and (not base_dir or r.get("base_dir", "") == base_dir)
                 ]
 
             return results
@@ -789,13 +791,14 @@ class MemoryIndex:
                 with open(fpath, "rb") as f:
                     data = tomllib.load(f)
 
-                entity_id, entity_type, folder = self._parse_path(fpath, scan_dir)
+                entity_id, entity_type, folder, base_dir = self._parse_path(fpath, scan_dir)
 
                 rec = {
                     "id": data.get("id", os.path.basename(fpath)[:-5]),
                     "entity_id": entity_id,
                     "entity_type": entity_type,
                     "folder": folder,
+                    "base_dir": base_dir,
                     "memory_type": data.get("type", "fact"),
                     "raw_text": data.get("text", ""),
                     "importance": data.get("importance", 5),
@@ -824,13 +827,14 @@ class MemoryIndex:
                 with open(fpath, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
-                entity_id, entity_type, folder = self._parse_path(fpath, scan_dir)
+                entity_id, entity_type, folder, base_dir = self._parse_path(fpath, scan_dir)
 
                 rec = {
                     "id": data.get("id", ""),
                     "entity_id": entity_id,
                     "entity_type": entity_type,
                     "folder": folder,
+                    "base_dir": base_dir,
                     "memory_type": data.get("type", "fact"),
                     "raw_text": data.get("content", {}).get("raw_text", ""),
                     "file_path": fpath,
@@ -857,16 +861,25 @@ class MemoryIndex:
     @staticmethod
     def _parse_path(
         fpath: str, base_scan_dir: str
-    ) -> Tuple[str, str, str]:
-        """从文件路径解析 entity 信息"""
+    ) -> Tuple[str, str, str, str]:
+        """从文件路径解析 entity 信息
+
+        Returns:
+            (entity_id, entity_type, folder, base_dir)
+
+        `base_dir` 用于把 `global/self`、`global/facts` 这类按命名空间划分
+        的文件区分开——之前直接丢空，rebuild 后混合检索的 base_dir 过滤就
+        把它们当成普通域，与真正的 user 数据混到一起。
+        """
         rel = os.path.relpath(fpath, base_scan_dir)
         parts = rel.replace("\\", "/").split("/")
 
         entity_id = ""
         entity_type = ""
         folder = "facts"
+        base_dir = ""
 
-        # entities/{type}_{quoted_id}/{folder}/{mem_id}.json
+        # entities/{type}_{quoted_id}/{folder}/{mem_id}.toml
         if len(parts) >= 3 and parts[0] == "entities":
             dirname = parts[1]
             for et in ("user", "group", "channel"):
@@ -876,13 +889,20 @@ class MemoryIndex:
                     entity_id = _path_segment_to_id(dirname[len(prefix):])
                     break
             folder = parts[2] if len(parts) >= 3 else "facts"
-        # global/self/{folder}/{mem_id}.json
+        # global/{...} 各种命名空间——把 global 根之下的子段保留进 base_dir
+        # 让查询能按命名空间隔离。
         elif len(parts) >= 2 and parts[0] == "global":
-            entity_type = ""
-            entity_id = ""
-            folder = parts[-2] if len(parts) >= 2 else ""
+            # global/self/{folder}/{mem_id}.toml → base_dir = "global/self"
+            # global/facts/{mem_id}.toml         → base_dir = "global"
+            # global/skills/{...}                → base_dir = "global/skills"
+            if len(parts) >= 4 and parts[1] in ("self", "skills"):
+                base_dir = f"global/{parts[1]}"
+                folder = parts[2]
+            else:
+                base_dir = "global"
+                folder = parts[-2] if len(parts) >= 2 else "facts"
 
-        return entity_id, entity_type, folder
+        return entity_id, entity_type, folder, base_dir
 
     # ==========================================
     # 内部工具
