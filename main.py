@@ -49,6 +49,34 @@ from .skill_router import SkillRouter, SkillInfo
 
 SKILL_FEW_SHOT_HEADER = "技能工具（调用后按返回的指令执行）: "
 
+
+# ════════════════════════════════════════════════════════════════════
+#  LLM Client Adapter
+# ════════════════════════════════════════════════════════════════════
+#
+# 移植自 lightning 的 MemoryExtractor 假设 LLM client 是
+#   await client.chat([{"role": "user", "content": ...}]) -> obj.text_response
+# 而 KiraAI 的 LLMModelClient 的实际签名是
+#   await client.chat(LLMRequest) -> LLMResponse (带 .text_response)
+# 这个小 adapter 把两套对接起来。多支持一个 .chat_fast() 让海马体可以用 fast
+# LLM 跑提取（成本更低、延迟更小），不存在则回退到 default。
+
+class _MemoryLLMAdapter:
+    """把 lightning 的 chat(messages_list) 适配到 KiraAI 的 chat(LLMRequest)。"""
+
+    def __init__(self, default_client, fast_client=None):
+        self._default = default_client
+        self._fast = fast_client or default_client
+
+    async def chat(self, messages: list):
+        req = LLMRequest(messages=list(messages))
+        return await self._default.chat(req)
+
+    async def chat_fast(self, messages: list):
+        req = LLMRequest(messages=list(messages))
+        return await self._fast.chat(req)
+
+
 MEMORY_ACTIVE_RECALL_HINT = (
     "📝 本轮检查：如果用户提到任何关于自身的事实信息（姓名/地点/职业/关系/偏好/经历），"
     "主动调用 memory_add 记录；如果需要回忆过往，调用 memory_search。"
@@ -135,11 +163,31 @@ class UserMemoryPlugin(BasePlugin):
         )
         await self.memory_manager.async_init()
 
-        # Wire in the host LLM as the hippocampus LLM client. The memory
-        # manager only needs a client object exposing async chat() (and
-        # optionally chat_fast()), which KiraAI's llm_api provides.
-        if getattr(self.ctx, "llm_api", None) is not None:
-            self.memory_manager.set_llm_client(self.ctx.llm_api)
+        # Wire in the host LLM as the hippocampus LLM client. The extractor
+        # expects `await client.chat(messages_list)` returning `.text_response`
+        # — KiraAI's LLMModelClient uses `.chat(LLMRequest)`, so we adapt.
+        try:
+            default_llm = self.ctx.get_default_llm_client()
+        except Exception as e:
+            default_llm = None
+            logger.warning(f"Could not resolve default LLM client: {e}")
+        try:
+            fast_llm = self.ctx.get_default_fast_llm_client()
+        except Exception:
+            fast_llm = None
+
+        if default_llm is not None:
+            adapter = _MemoryLLMAdapter(default_llm, fast_llm)
+            self.memory_manager.set_llm_client(adapter)
+            logger.info(
+                f"Hippocampus LLM client wired (default={getattr(default_llm.model, 'model_id', '?')}, "
+                f"fast={getattr(fast_llm.model, 'model_id', '?') if fast_llm else 'same'})"
+            )
+        else:
+            logger.warning(
+                "No default LLM client available — hippocampus will skip fact extraction "
+                "(memory_add/search/profile_* tools still work via TOML+FTS5)"
+            )
 
         logger.info("Dual-brain memory ready")
 
