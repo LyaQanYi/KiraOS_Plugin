@@ -259,16 +259,23 @@ async def memory_add(
     folder = "reflections" if memory_type == "reflection" else "facts"
 
     try:
-        # 走去重管线（与海马体一致）
+        # 走去重管线（与海马体一致）。即使 LLM 未注入，extractor.deduplicate
+        # 的第一级（SHA-256 hash）仍能命中精确重复；第二级 LLM 缺失时回退到
+        # 视为新记忆——这样工具描述里"已做两级去重"的契约在降级场景下也至少
+        # 兑现了哈希级去重。
         extractor = getattr(manager, "extractor", None)
-        if extractor and extractor._llm_client is not None:
+        if extractor is not None:
             decision, matched = await extractor.deduplicate(
                 text, entity_id, entity_type, folder
             )
             if decision == "duplicate":
                 return f"Memory already exists (duplicate detected), skipped"
             if decision == "update" and matched:
-                merged_text = await extractor.merge_facts(matched.text, text)
+                # 合并步骤需要 LLM；没有 LLM 时退化为"保留新文本+旧文本拼接"。
+                if extractor._llm_client is not None:
+                    merged_text = await extractor.merge_facts(matched.text, text)
+                else:
+                    merged_text = f"{matched.text}；{text}"
                 matched.text = merged_text
                 matched.importance = max(matched.importance, importance)
                 await manager.tree_store.update_memory(matched)
@@ -350,6 +357,9 @@ async def memory_update_entry(
 ) -> str:
     if not manager or not getattr(manager, "tree_store", None):
         return "Memory system not available"
+    # 防呆：和 memory_add 对齐，拦住空/纯空白的 text 避免把已有记忆覆写成空串。
+    if not text or not text.strip():
+        return "Error: text is required"
 
     entity_id, entity_type = _resolve_entity(event, entity_id, entity_type)
     if not entity_id:

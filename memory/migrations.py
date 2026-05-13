@@ -114,11 +114,16 @@ def _run_blocking_migration(legacy_db_path: Path, data_root: Path) -> dict:
     conn.row_factory = sqlite3.Row
     try:
         # ── 1. 迁移 user_profiles → EntityProfile ─────────────────
+        # 前置 _has_legacy_tables 检查只要求 user_profiles / event_logs 任一存在
+        # 就触发迁移，所以这里要兜底缺表的情况——和下面 event_logs 的处理对称。
         profiles_by_user: dict[str, EntityProfile] = {}
-        cur = conn.execute(
-            "SELECT user_id, memory_key, memory_value, confidence, category, expires_at "
-            "FROM user_profiles ORDER BY user_id, memory_key"
-        )
+        try:
+            cur = conn.execute(
+                "SELECT user_id, memory_key, memory_value, confidence, category, expires_at "
+                "FROM user_profiles ORDER BY user_id, memory_key"
+            )
+        except sqlite3.OperationalError:
+            cur = []
         for row in cur:
             user_id = row["user_id"]
             if not user_id:

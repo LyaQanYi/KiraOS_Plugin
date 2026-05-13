@@ -406,27 +406,43 @@ class TomlTreeStore:
         folder: str = "facts",
         base_dir: str = "",
     ) -> bool:
-        """将记忆移入归档目录（TOML 格式，含完整 meta 方便恢复）"""
+        """将记忆移入归档目录（TOML 格式，含完整 meta 方便恢复）
+
+        全程持 per-(entity, folder) 锁，防止与 `update_memory`/`add_memory`
+        竞态。`asyncio.Lock` 不可重入，所以这里直接调用裸操作，不再走
+        `delete_memory`（它会再次尝试同一把锁导致死锁）。
+        """
         from .memory_paths import get_archive_dir
 
-        memory = await self.get_memory(memory_id, entity_id, entity_type, folder, base_dir)
-        if not memory:
-            return False
+        lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
+        async with self._get_lock(lock_key):
+            memory = await self.get_memory(
+                memory_id, entity_id, entity_type, folder, base_dir
+            )
+            if not memory:
+                return False
 
-        archive_dir = get_archive_dir()
-        os.makedirs(archive_dir, exist_ok=True)
-        archive_path = os.path.join(archive_dir, f"{memory_id}.toml")
+            archive_dir = get_archive_dir()
+            os.makedirs(archive_dir, exist_ok=True)
+            archive_path = os.path.join(archive_dir, f"{memory_id}.toml")
 
-        try:
-            # 归档时写入完整数据（含 meta，方便恢复）
-            full_data = memory.to_full_dict()
-            await asyncio.to_thread(self._sync_write_toml_to_path, full_data, archive_path)
-            await self.delete_memory(memory_id, entity_id, entity_type, folder, base_dir)
-            logger.debug(f"Memory archived: {memory_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Archive memory error {memory_id}: {e}")
-            return False
+            try:
+                # 1. 归档时写入完整数据（含 meta，方便恢复）
+                full_data = memory.to_full_dict()
+                await asyncio.to_thread(
+                    self._sync_write_toml_to_path, full_data, archive_path
+                )
+                # 2. 删除源文件 + 索引（裸操作，避免锁重入）
+                d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
+                fpath = os.path.join(d, f"{memory_id}.toml")
+                if os.path.exists(fpath):
+                    await asyncio.to_thread(os.remove, fpath)
+                await asyncio.to_thread(self.index.delete, memory_id)
+                logger.debug(f"Memory archived: {memory_id}")
+                return True
+            except Exception as e:
+                logger.error(f"Archive memory error {memory_id}: {e}")
+                return False
 
     async def get_all_memories(
         self,

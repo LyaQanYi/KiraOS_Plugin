@@ -176,12 +176,17 @@
 </main>
 <script>
 const token = (() => {
-  const url = new URL(location.href);
-  const t = url.searchParams.get("token") || sessionStorage.getItem("kira_token") || "";
-  if (url.searchParams.has("token")) {
+  // URL fragment (#token=xxx) instead of ?token=xxx: fragments are never
+  // sent to the server (no access-log leak) and never appear in Referer
+  // headers fired by external resources / outbound clicks. Falls back to a
+  // previously-saved value in sessionStorage so reloads keep working.
+  const hashParams = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : location.hash);
+  const fromHash = hashParams.get("token");
+  const t = fromHash || sessionStorage.getItem("kira_token") || "";
+  if (fromHash) {
     sessionStorage.setItem("kira_token", t);
-    url.searchParams.delete("token");
-    history.replaceState({}, "", url);
+    // Strip the fragment so the token doesn't sit in the address bar.
+    history.replaceState({}, "", location.pathname + location.search);
   }
   return t;
 })();
@@ -413,7 +418,9 @@ async function deleteMemory(m, folder) {
 
 async function runSearch(q) {
   const eid = selected ? selected.entity_id : "";
-  const etype = selected ? selected.entity_type : "user";
+  // Empty entity_type = global cross-type search; the backend now fans out
+  // over every entity instead of falling back to ENTITY_USER.
+  const etype = selected ? selected.entity_type : "";
   let res;
   try {
     res = await api(

@@ -136,16 +136,19 @@ class MemoryDecayEngine:
             # GC: importance ≤ 3 且长期未访问
             importance = meta.get("importance", 5)
             if importance <= self.GC_IMPORTANCE_THRESHOLD and mem_type == "fact":
-                last_accessed = meta.get("last_accessed", 0)
+                # 缺省回退到 timestamp（创建时间），再回退到 now —— 0 会让从未访问
+                # 过的新记忆被误判为"超久未访问"并误删。
+                last_accessed = meta.get("last_accessed") or meta.get("timestamp") or now
                 days_unaccessed = (now - last_accessed) / 86400
                 if days_unaccessed >= self.GC_UNACCESSED_DAYS:
-                    await self.tree_store.archive_memory(
+                    # 只在归档成功时才累计 deleted，与前一分支保持一致。
+                    if await self.tree_store.archive_memory(
                         memory_id=mem_id,
                         entity_id=entity_id,
                         entity_type=entity_type,
                         folder=folder,
-                    )
-                    deleted += 1
+                    ):
+                        deleted += 1
 
         return deleted, downgraded
 

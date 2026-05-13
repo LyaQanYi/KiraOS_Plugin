@@ -17,6 +17,7 @@ from .memory_manager import MemoryManager
 from .toml_tree_store import TomlTreeStore, Memory
 from .entity_profile import EntityProfileStore, EntityProfile
 from .memory_index import MemoryIndex
+from .migrations import migrate_legacy_db_if_needed
 from .memory_paths import (
     set_data_root,
     get_memory_root,
@@ -37,6 +38,7 @@ __all__ = [
     "EntityProfileStore",
     "EntityProfile",
     "MemoryIndex",
+    "migrate_legacy_db_if_needed",
     "set_data_root",
     "get_memory_root",
     "get_entities_dir",

@@ -106,7 +106,30 @@ class EntityProfileStore:
 
     def __init__(self):
         self._lock = asyncio.Lock()
+        # Per-entity locks: serialize the read-modify-write sequence on each
+        # `(entity_id, entity_type)` so concurrent updates to the same entity
+        # don't clobber each other's traits/facts/aliases/interaction_count.
+        self._entity_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # Guards the creation of new per-entity locks (so two coroutines don't
+        # race to create separate locks for the same entity and then both
+        # think they hold "the" lock).
+        self._lock_table_guard = asyncio.Lock()
         logger.info("EntityProfileStore initialized")
+
+    async def _get_entity_lock(
+        self, entity_id: str, entity_type: str
+    ) -> asyncio.Lock:
+        """Return the per-entity lock, creating it on first use."""
+        key = (entity_id, entity_type)
+        lock = self._entity_locks.get(key)
+        if lock is not None:
+            return lock
+        async with self._lock_table_guard:
+            lock = self._entity_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._entity_locks[key] = lock
+            return lock
 
     async def get_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER
@@ -142,57 +165,63 @@ class EntityProfileStore:
     async def update_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER, **kwargs
     ) -> EntityProfile:
-        """部分更新画像字段"""
-        profile = await self.get_profile(entity_id, entity_type)
-        allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
+        """部分更新画像字段（持 per-entity 锁，read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
 
-        for key, value in kwargs.items():
-            if key in allowed:
-                setattr(profile, key, value)
+            for key, value in kwargs.items():
+                if key in allowed:
+                    setattr(profile, key, value)
 
-        profile.last_interaction = time.time()
-        await self.save_profile(profile)
-        return profile
+            profile.last_interaction = time.time()
+            await self.save_profile(profile)
+            return profile
 
     # === 便捷方法 ===
 
     async def add_trait(self, entity_id: str, trait: str, entity_type: str = ENTITY_USER):
-        """添加特征标签"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if trait not in profile.traits:
-            profile.traits.append(trait)
-            await self.save_profile(profile)
+        """添加特征标签（read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if trait not in profile.traits:
+                profile.traits.append(trait)
+                await self.save_profile(profile)
 
     async def remove_trait(self, entity_id: str, trait: str, entity_type: str = ENTITY_USER):
-        """移除特征标签"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if trait in profile.traits:
-            profile.traits.remove(trait)
-            await self.save_profile(profile)
+        """移除特征标签（read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if trait in profile.traits:
+                profile.traits.remove(trait)
+                await self.save_profile(profile)
 
     async def add_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
-        """添加核心事实到画像"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if fact not in profile.facts:
-            profile.facts.append(fact)
-            await self.save_profile(profile)
+        """添加核心事实到画像（read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if fact not in profile.facts:
+                profile.facts.append(fact)
+                await self.save_profile(profile)
 
     async def update_fact(
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER
     ):
-        """更新画像中的事实"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if old_fact in profile.facts:
-            idx = profile.facts.index(old_fact)
-            profile.facts[idx] = new_fact
-            await self.save_profile(profile)
+        """更新画像中的事实（read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if old_fact in profile.facts:
+                idx = profile.facts.index(old_fact)
+                profile.facts[idx] = new_fact
+                await self.save_profile(profile)
 
     async def remove_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
-        """移除画像中的事实"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if fact in profile.facts:
-            profile.facts.remove(fact)
-            await self.save_profile(profile)
+        """移除画像中的事实（read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if fact in profile.facts:
+                profile.facts.remove(fact)
+                await self.save_profile(profile)
 
     async def set_relationship(
         self,
@@ -201,34 +230,36 @@ class EntityProfileStore:
         relation: str,
         entity_type: str = ENTITY_USER,
     ):
-        """设置关系"""
-        profile = await self.get_profile(entity_id, entity_type)
-        profile.relationships[target] = relation
-        await self.save_profile(profile)
+        """设置关系（read-modify-write 原子化）"""
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            profile.relationships[target] = relation
+            await self.save_profile(profile)
 
     async def increment_interaction(
         self, entity_id: str, entity_type: str = ENTITY_USER, **extra_updates
     ):
-        """递增交互计数并可选更新其他字段
+        """递增交互计数并可选更新其他字段（read-modify-write 原子化）
 
         特别处理 nickname 变更：旧昵称自动归档到 aliases。
         """
-        profile = await self.get_profile(entity_id, entity_type)
-        profile.interaction_count += 1
-        profile.last_interaction = time.time()
+        async with await self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            profile.interaction_count += 1
+            profile.last_interaction = time.time()
 
-        # 昵称变更时，将旧昵称归档到 aliases
-        new_nickname = extra_updates.get("nickname", "")
-        if new_nickname and profile.nickname and new_nickname != profile.nickname:
-            if profile.nickname not in profile.aliases:
-                profile.aliases.append(profile.nickname)
+            # 昵称变更时，将旧昵称归档到 aliases
+            new_nickname = extra_updates.get("nickname", "")
+            if new_nickname and profile.nickname and new_nickname != profile.nickname:
+                if profile.nickname not in profile.aliases:
+                    profile.aliases.append(profile.nickname)
 
-        allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
-        for key, value in extra_updates.items():
-            if key in allowed:
-                setattr(profile, key, value)
+            allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
+            for key, value in extra_updates.items():
+                if key in allowed:
+                    setattr(profile, key, value)
 
-        await self.save_profile(profile)
+            await self.save_profile(profile)
 
     async def resolve_entity_by_name(
         self, name_query: str, entity_type: str = ENTITY_USER
@@ -318,6 +349,26 @@ class EntityProfileStore:
 
     @staticmethod
     def _sync_write(fpath: str, data: dict):
+        """Atomic write: dump to a sibling .tmp, fsync, then os.replace.
+
+        Readers (`_sync_read`) only ever see fully-written files even if
+        the writer is preempted mid-stream or the process crashes. The
+        scratch file is placed in the same directory so `os.replace` is
+        a true rename, not a cross-filesystem copy.
+        """
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp = f"{fpath}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, fpath)
+        except Exception:
+            # Best-effort cleanup of the half-written scratch file.
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise

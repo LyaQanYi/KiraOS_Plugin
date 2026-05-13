@@ -209,6 +209,10 @@ class MemoryManager:
 
     async def write_memory(self, session: str, memory: list[list[dict]]):
         async with self.memory_lock:
+            # First write for a brand-new session would otherwise KeyError —
+            # match the shape used by update_memory/read_memory/etc.
+            if session not in self.chat_memory:
+                self.chat_memory[session] = {"title": "", "description": "", "memory": []}
             self.chat_memory[session]["memory"] = memory
             await self._save_memory()
         logger.info(f"Memory written for {session}")
@@ -292,10 +296,24 @@ class MemoryManager:
 
         宪章 §7.4：只有在记忆被实质引用时才 +1。
         由消息处理器在生成回复后调用。
+
+        实现：依赖 `MemoryIndex.touch_access`，按 memory_id 直接定位行
+        （索引以 id 为主键，无需额外的 entity 信息）。`touch_access` 是
+        同步 SQLite 操作，整体 dispatch 到线程池避免阻塞 event loop。
         """
-        # TODO: 需要根据具体 entity 信息定位记忆
-        # 暂时按全局搜索处理
-        pass
+        if not memory_ids:
+            return
+
+        def _bulk_touch(ids: list[str]):
+            for mid in ids:
+                if not mid:
+                    continue
+                try:
+                    self.memory_index.touch_access(mid)
+                except Exception as e:
+                    logger.warning(f"touch_access failed for {mid}: {e}")
+
+        await asyncio.to_thread(_bulk_touch, list(memory_ids))
 
     # ==========================================
     # 实体画像

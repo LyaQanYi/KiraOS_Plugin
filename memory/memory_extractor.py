@@ -13,6 +13,7 @@
 - 回退：从文本前缀 + hash 生成
 """
 
+import asyncio
 import ast
 import json
 import re
@@ -24,6 +25,13 @@ from .toml_tree_store import TomlTreeStore, Memory
 from .memory_index import MemoryIndex
 
 logger = get_logger("memory_extractor", "green")
+
+# Upper bound on every external LLM call from the hippocampus pipeline. If a
+# call exceeds this, `asyncio.wait_for` raises TimeoutError which the
+# surrounding `except Exception` handlers translate into a safe fallback
+# (empty extraction / conservative dedup decision). Tuned for the slowest
+# tested provider; bump via the config story once exposed.
+_LLM_CHAT_TIMEOUT = 30.0
 
 
 class MemoryExtractor:
@@ -93,7 +101,7 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的个人事实，输出空数组 []。"""
 
         try:
-            resp = await self._llm_client.chat([{"role": "user", "content": prompt}])
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
@@ -140,7 +148,7 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的群组事实，输出空数组 []。"""
 
         try:
-            resp = await self._llm_client.chat([{"role": "user", "content": prompt}])
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
@@ -174,7 +182,7 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的事实，输出空数组 []。"""
 
         try:
-            resp = await self._llm_client.chat([{"role": "user", "content": prompt}])
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 return self._parse_json_array(resp.text_response)
         except Exception as e:
@@ -229,7 +237,7 @@ class MemoryExtractor:
 直接输出觉察内容或 NONE，不要有其他内容。"""
 
         try:
-            resp = await self._llm_client.chat([{"role": "user", "content": prompt}])
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 text = resp.text_response.strip()
                 if text.upper() == "NONE" or not text:
@@ -269,7 +277,7 @@ class MemoryExtractor:
 只输出标识符，不要有其他内容。"""
 
         try:
-            resp = await self._llm_client.chat([{"role": "user", "content": prompt}])
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 slug = resp.text_response.strip().lower()
                 # 清理非法字符
@@ -349,9 +357,9 @@ class MemoryExtractor:
 
         try:
             if hasattr(client, "chat_fast"):
-                resp = await client.chat_fast([{"role": "user", "content": prompt}])
+                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             else:
-                resp = await client.chat([{"role": "user", "content": prompt}])
+                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 result = resp.text_response.strip().strip('"').lower()
                 if result in ("duplicate", "update", "new"):
@@ -379,9 +387,9 @@ class MemoryExtractor:
 
         try:
             if hasattr(client, "chat_fast"):
-                resp = await client.chat_fast([{"role": "user", "content": prompt}])
+                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             else:
-                resp = await client.chat([{"role": "user", "content": prompt}])
+                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if resp and resp.text_response:
                 return resp.text_response.strip()
         except Exception as e:
@@ -511,7 +519,7 @@ class MemoryExtractor:
 
         generated = []
         try:
-            resp = await self._llm_client.chat([{"role": "user", "content": prompt}])
+            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=_LLM_CHAT_TIMEOUT)
             if not (resp and resp.text_response):
                 return []
 

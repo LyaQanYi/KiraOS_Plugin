@@ -26,6 +26,7 @@ import logging
 import os
 import secrets
 import shutil
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -303,17 +304,24 @@ async def api_delete_entity(request: Request) -> JSONResponse:
         return JSONResponse({"error": "entity not found"}, status_code=404)
 
     # Move the whole entity dir into archive/ to keep raw data recoverable.
+    # Order matters: clear index rows FIRST so a crash between the two steps
+    # leaves at worst orphan archived files (recoverable) rather than stale
+    # index rows pointing into a moved-away directory (would surface as ghost
+    # search results that then fail to open).
     try:
-        archive_root = Path(get_entities_dir()).parent / "archive" / "_full_entities"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        target = archive_root / f"{entity_type}_{_id_to_path_segment(entity_id)}_{int(asyncio.get_event_loop().time())}"
-        shutil.move(base_dir, target)
-        # Drop entity rows from index so search no longer surfaces them
+        # 1. Drop index rows for this entity so search/recall stop surfacing them.
         for folder in ("facts", "reflections"):
             for row in manager.memory_index.list_memories(
                 entity_id=entity_id, entity_type=entity_type, folder=folder
             ):
                 manager.memory_index.delete(row.get("id"))
+        # 2. Move the on-disk entity dir into archive. Use wall-clock time.time()
+        #    — `asyncio.get_event_loop().time()` returns a monotonic clock that
+        #    resets across restarts and can produce colliding archive names.
+        archive_root = Path(get_entities_dir()).parent / "archive" / "_full_entities"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        target = archive_root / f"{entity_type}_{_id_to_path_segment(entity_id)}_{int(time.time())}"
+        shutil.move(base_dir, target)
     except Exception as e:
         logger.exception("delete_entity failed")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -393,17 +401,42 @@ async def api_search(request: Request) -> JSONResponse:
     if not query:
         return JSONResponse({"error": "q is required"}, status_code=400)
     entity_id = request.query_params.get("entity_id", "")
-    entity_type = _validate_entity_type(request.query_params.get("entity_type", ""))
-    if entity_type is None:
+    raw_etype = request.query_params.get("entity_type", "")
+    # Treat empty entity_type as "any" instead of defaulting to ENTITY_USER —
+    # the frontend uses an empty value to mean "search across user/group/channel".
+    if raw_etype and raw_etype not in VALID_ENTITY_TYPES:
         return JSONResponse({"error": "invalid entity_type"}, status_code=400)
+    entity_type = raw_etype  # "" or a valid type
     try:
         k = max(1, min(50, int(request.query_params.get("k", 10))))
     except (TypeError, ValueError):
         k = 10
 
-    memories = await manager.recall(
-        query=query, entity_id=entity_id, entity_type=entity_type, k=k
-    )
+    # When neither entity_id nor entity_type is pinned, fan out across every
+    # known entity so the user can do a true global recall. The per-entity
+    # recall keeps doing its own scoring; we merge by descending importance
+    # (a cheap heuristic that matches the single-entity ordering well enough).
+    if not entity_id and not entity_type:
+        results = []
+        for eid, etype in list_all_entities():
+            try:
+                hits = await manager.recall(
+                    query=query, entity_id=eid, entity_type=etype, k=k
+                )
+                results.extend(hits)
+            except Exception as e:
+                logger.warning(f"global recall failed for {etype}:{eid}: {e}")
+        results.sort(
+            key=lambda m: (m.importance, m.last_accessed), reverse=True
+        )
+        memories = results[:k]
+    else:
+        memories = await manager.recall(
+            query=query,
+            entity_id=entity_id,
+            entity_type=entity_type or ENTITY_USER,
+            k=k,
+        )
     return JSONResponse({"memories": [_memory_to_dict(m) for m in memories]})
 
 

@@ -252,6 +252,12 @@ class MemoryIndex:
                      tags, source, content_hash, file_path, base_dir, raw_text)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    entity_id = excluded.entity_id,
+                    entity_type = excluded.entity_type,
+                    folder = excluded.folder,
+                    base_dir = excluded.base_dir,
+                    memory_type = excluded.memory_type,
+                    timestamp = excluded.timestamp,
                     importance = excluded.importance,
                     last_accessed = excluded.last_accessed,
                     access_count = excluded.access_count,
@@ -593,13 +599,22 @@ class MemoryIndex:
             import json as _json
             emb_json = _json.dumps(embedding)
 
+            # sqlite-vec 的 vec0 虚拟表无法把 JOIN 的 WHERE 条件下推到 KNN
+            # 计算阶段，所以 entity_id/entity_type/folder 的过滤只能事后做。
+            # 如果别的 entity 占了向量库的多数，预取 k*3 过完滤可能所剩无几。
+            # 抬高预取倍数确保过滤后还有充足候选；上限设 200，避免 k 极大时
+            # 把库扫空。如果未来切到 vec0 metadata 列做 KNN 阶段过滤，可以
+            # 把这里的倍数调回 3。
+            prefetch_k = max(k * 10, 50)
+            if prefetch_k > 200:
+                prefetch_k = 200
             rows = self._conn.execute("""
                 SELECT v.id, v.distance, m.*
                 FROM memories_vec v
                 JOIN memories m ON v.id = m.id
                 WHERE v.embedding MATCH ?
                 AND k = ?
-            """, (emb_json, k * 3)).fetchall()
+            """, (emb_json, prefetch_k)).fetchall()
 
             results = []
             for row in rows:
