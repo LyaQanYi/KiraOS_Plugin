@@ -10,11 +10,30 @@ KiraOS_Plugin 记忆系统路径管理中枢
 
 import os
 import re
+import urllib.parse
 from pathlib import Path
 
 from core.logging_manager import get_logger
 
 logger = get_logger("kiraos_memory_paths", "green")
+
+# Windows 文件系统禁止文件/目录名出现 < > : " | ? * \ /。lightning 用
+# `{adapter}:{user_id}` 作为 entity_id（含冒号），在 Linux/macOS 没问题但到
+# Windows 会炸。这里在「路径层」做 URL-encoding：内存与 SQLite 里仍是原始的
+# 含冒号 ID，只有写到文件系统时才 quote，扫目录反推回 ID 时再 unquote。
+# `urllib.parse.quote` 默认不转义 `-._~`，对我们足够：所有 Windows-不安全
+# 字符都会被编码成 `%XX`（`%` 在 Windows 上是合法路径字符）。
+_PATH_SAFE_CHARS = "-._~"
+
+
+def _id_to_path_segment(entity_id: str) -> str:
+    """把 entity_id 转成跨平台安全的路径片段（URL-quote 不安全字符）。"""
+    return urllib.parse.quote(entity_id, safe=_PATH_SAFE_CHARS)
+
+
+def _path_segment_to_id(segment: str) -> str:
+    """`_id_to_path_segment` 的反函数，用于扫目录反推回原始 entity_id。"""
+    return urllib.parse.unquote(segment)
 
 # ========== 实体类型 ==========
 ENTITY_USER = "user"
@@ -81,11 +100,13 @@ def _validate_id(entity_id: str) -> str:
 # ========== 实体路径 ==========
 
 def get_entity_dir(entity_id: str, entity_type: str) -> str:
-    """获取实体根目录: <data_root>/entities/{type}_{id}/"""
+    """获取实体根目录: <data_root>/entities/{type}_{quoted_id}/"""
     if entity_type not in VALID_ENTITY_TYPES:
         raise ValueError(f"未知实体类型: {entity_type!r}, 可选: {VALID_ENTITY_TYPES}")
     _validate_id(entity_id)
-    return os.path.join(get_entities_dir(), f"{entity_type}_{entity_id}")
+    return os.path.join(
+        get_entities_dir(), f"{entity_type}_{_id_to_path_segment(entity_id)}"
+    )
 
 
 def get_entity_folder(entity_id: str, entity_type: str, folder: str) -> str:
@@ -194,11 +215,11 @@ def list_all_entities(entity_type: str = None) -> list[tuple[str, str]]:
         return results
 
     for dirname in os.listdir(entities_dir):
-        # 格式: {type}_{id}
+        # 格式: {type}_{quoted_id} —— quoted_id 用 URL-encode 防 Windows 非法字符
         for et in VALID_ENTITY_TYPES:
             prefix = f"{et}_"
             if dirname.startswith(prefix):
-                eid = dirname[len(prefix):]
+                eid = _path_segment_to_id(dirname[len(prefix):])
                 if entity_type is None or et == entity_type:
                     results.append((eid, et))
                 break

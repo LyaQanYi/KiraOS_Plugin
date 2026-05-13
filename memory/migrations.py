@@ -27,7 +27,7 @@ from core.logging_manager import get_logger
 
 from .toml_tree_store import TomlTreeStore
 from .entity_profile import EntityProfileStore, EntityProfile
-from .memory_paths import ENTITY_USER, ensure_entity_dirs
+from .memory_paths import ENTITY_USER, ensure_entity_dirs, _id_to_path_segment
 
 logger = get_logger("kiraos_memory_migrations", "green")
 
@@ -224,7 +224,7 @@ def _sync_save_profile(profile: EntityProfile, data_root: Path) -> None:
     """直接同步写 profile.json（不走 EntityProfileStore 异步路径）"""
     import json
 
-    target_dir = data_root / "entities" / f"{profile.entity_type}_{profile.entity_id}"
+    target_dir = data_root / "entities" / f"{profile.entity_type}_{_id_to_path_segment(profile.entity_id)}"
     target_dir.mkdir(parents=True, exist_ok=True)
     fpath = target_dir / "profile.json"
     with open(fpath, "w", encoding="utf-8") as f:
@@ -244,7 +244,7 @@ def _write_fact_toml(
     """同步写一条 fact 到 entities/{type}_{id}/facts/{mem_id}.toml"""
     import tomli_w
 
-    facts_dir = data_root / "entities" / f"{entity_type}_{entity_id}" / "facts"
+    facts_dir = data_root / "entities" / f"{entity_type}_{_id_to_path_segment(entity_id)}" / "facts"
     facts_dir.mkdir(parents=True, exist_ok=True)
 
     fpath = facts_dir / f"{mem_id}.toml"

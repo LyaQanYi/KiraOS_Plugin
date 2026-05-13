@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.logging_manager import get_logger
-from .memory_paths import get_index_db_path
+from .memory_paths import get_index_db_path, _path_segment_to_id
 
 logger = get_logger("kiraos_memory_index", "green")
 
@@ -851,14 +851,14 @@ class MemoryIndex:
         entity_type = ""
         folder = "facts"
 
-        # entities/{type}_{id}/{folder}/{mem_id}.json
+        # entities/{type}_{quoted_id}/{folder}/{mem_id}.json
         if len(parts) >= 3 and parts[0] == "entities":
             dirname = parts[1]
             for et in ("user", "group", "channel"):
                 prefix = f"{et}_"
                 if dirname.startswith(prefix):
                     entity_type = et
-                    entity_id = dirname[len(prefix):]
+                    entity_id = _path_segment_to_id(dirname[len(prefix):])
                     break
             folder = parts[2] if len(parts) >= 3 else "facts"
         # global/self/{folder}/{mem_id}.json

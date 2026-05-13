@@ -44,6 +44,7 @@ from .memory.memory_paths import (
     get_entities_dir,
     get_entity_dir,
     list_all_entities,
+    _id_to_path_segment,
     ENTITY_USER,
     VALID_ENTITY_TYPES,
 )
@@ -305,7 +306,7 @@ async def api_delete_entity(request: Request) -> JSONResponse:
     try:
         archive_root = Path(get_entities_dir()).parent / "archive" / "_full_entities"
         archive_root.mkdir(parents=True, exist_ok=True)
-        target = archive_root / f"{entity_type}_{entity_id}_{int(asyncio.get_event_loop().time())}"
+        target = archive_root / f"{entity_type}_{_id_to_path_segment(entity_id)}_{int(asyncio.get_event_loop().time())}"
         shutil.move(base_dir, target)
         # Drop entity rows from index so search no longer surfaces them
         for folder in ("facts", "reflections"):
