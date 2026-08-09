@@ -145,7 +145,7 @@ class UserMemoryPlugin(BasePlugin):
         self._webui_token = str(cfg.get("webui_token", ""))
         self._webui_server: object | None = None
 
-        # Tools registered dynamically via ctx.llm_api (not via @register_tool)
+        # Tools registered dynamically via ctx.tool_mgr (not via @register_tool)
         # so we can pass them the memory_manager handle through closure.
         self._registered_memory_tool_names: list[str] = []
 
@@ -295,7 +295,7 @@ class UserMemoryPlugin(BasePlugin):
         # Unregister memory tools
         for name in self._registered_memory_tool_names:
             try:
-                self.ctx.llm_api.unregister_tool(name)
+                self.ctx.tool_mgr.unregister_tool(name)
             except Exception as e:
                 logger.warning(f"Failed to unregister tool '{name}': {e}")
         self._registered_memory_tool_names.clear()
@@ -303,14 +303,14 @@ class UserMemoryPlugin(BasePlugin):
         # Unregister skill tools
         for name in self._registered_skill_names:
             try:
-                self.ctx.llm_api.unregister_tool(name)
+                self.ctx.tool_mgr.unregister_tool(name)
             except Exception as e:
                 logger.warning(f"Failed to unregister tool '{name}': {e}")
         self._registered_skill_names.clear()
 
         if self._resource_tool_registered:
             try:
-                self.ctx.llm_api.unregister_tool("read_skill_resource")
+                self.ctx.tool_mgr.unregister_tool("read_skill_resource")
             except Exception as e:
                 logger.warning(f"Failed to unregister read_skill_resource: {e}")
             self._resource_tool_registered = False
@@ -358,7 +358,7 @@ class UserMemoryPlugin(BasePlugin):
         ]
         for tool_name, executor in bindings:
             schema = memory_tools.TOOL_SCHEMAS[tool_name]
-            self.ctx.llm_api.register_tool(
+            self.ctx.tool_mgr.register_tool(
                 name=tool_name,
                 description=schema["description"],
                 parameters=schema["params"],
@@ -376,7 +376,7 @@ class UserMemoryPlugin(BasePlugin):
         async def _skill_executor(event: KiraMessageBatchEvent, *_, **kwargs) -> str:
             return self._execute_skill(skill, event, **kwargs)
 
-        self.ctx.llm_api.register_tool(
+        self.ctx.tool_mgr.register_tool(
             name=skill.name,
             description=skill.tool_description,
             parameters=skill.parameters,
@@ -431,7 +431,7 @@ class UserMemoryPlugin(BasePlugin):
                 f"{content}\n</resource>"
             )
 
-        self.ctx.llm_api.register_tool(
+        self.ctx.tool_mgr.register_tool(
             name="read_skill_resource",
             description=(
                 "读取技能附带的资源文件（如 references/、resources/、scripts/、data/ "
@@ -455,7 +455,7 @@ class UserMemoryPlugin(BasePlugin):
         """Hot reload: unregister old skills, rediscover, re-register."""
         for name in self._registered_skill_names:
             try:
-                self.ctx.llm_api.unregister_tool(name)
+                self.ctx.tool_mgr.unregister_tool(name)
             except Exception as e:
                 logger.warning(f"Failed to unregister tool '{name}': {e}")
         self._registered_skill_names.clear()
@@ -473,7 +473,7 @@ class UserMemoryPlugin(BasePlugin):
             self._register_resource_tool()
         elif not any_with_resources and self._resource_tool_registered:
             try:
-                self.ctx.llm_api.unregister_tool("read_skill_resource")
+                self.ctx.tool_mgr.unregister_tool("read_skill_resource")
             except Exception as e:
                 logger.warning(f"Failed to unregister read_skill_resource: {e}")
             self._resource_tool_registered = False
