@@ -1,7 +1,7 @@
 # KiraOS 插件文档
 
 > **插件 ID**: `kira_plugin_kiraos`
-> **版本**: 3.0.0
+> **版本**: 3.0.1
 > **作者**: LyaQanYi
 > **兼容**: KiraAI v2.x (dev branch)
 
