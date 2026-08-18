@@ -1,1 +1,118 @@
+# ===== Python =====
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== 测试 / 覆盖率 =====
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# ===== 类型检查 / lint =====
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ===== 虚拟环境 =====
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ===== Jupyter =====
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# ===== 操作系统 =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+*.tmp
+*.bak
+*.orig
+
+# ===== 本地配置 / 密钥 =====
+*.local
+.env.local
+.env.*.local
+secrets.json
+config.local.*
+
+# ===== 插件运行时数据 =====
+# 记忆数据根是宿主的 get_data_path()/memory，正常不在仓库内。
+# 但开发时常把插件符号链接进 KiraAI/data/plugins/，或直接在插件目录里
+# 起宿主（get_data_path() 默认是 cwd/data）——那样 data/ 和 SQLite 索引
+# 就会落在仓库里。一次 `git add -A` 就会把真实用户的记忆提交到公开仓库。
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

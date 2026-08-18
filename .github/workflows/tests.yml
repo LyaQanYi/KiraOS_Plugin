@@ -1,0 +1,56 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 exercises the `tomli` backport path, 3.11+ the stdlib `tomllib`
+        # path (see requirements.txt). KiraAI's README targets 3.10, its
+        # Dockerfile ships 3.11.
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-asyncio
+
+      # tests/conftest.py stubs the KiraAI host surface and registers the
+      # repo as `plugins.KiraOS_Plugin` using a __path__ derived from
+      # __file__, so the suite is hermetic — no KiraAI checkout, and the
+      # checkout directory may be named anything.
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Syntax-only gate. The six hand-merged memory/ modules are large, and a
+      # stray merge artifact should fail loudly here rather than at plugin load
+      # time inside KiraAI — where a raised initialize() leaves zero tools
+      # registered and reads to the user as "memory stopped working".
+      - name: Byte-compile every module
+        run: python -m compileall -q . -x '(\.git|vendor)'

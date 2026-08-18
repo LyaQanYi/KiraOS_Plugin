@@ -16,3 +16,12 @@ tomli>=1.2.0; python_version < "3.11"
 # to a character-level tokenizer if missing), but Chinese recall quality
 # drops noticeably without it.
 jieba>=0.42.1
+
+# Memory WebUI (web_server.py). Imported unconditionally at module top level,
+# but web_server itself is only imported when `webui_port > 0`, so these are
+# unused on a default install. Declared explicitly rather than relying on the
+# host: KiraAI happens to ship fastapi + uvicorn today, and if that ever
+# changes the ImportError surfaces inside initialize() — which aborts plugin
+# registration entirely and takes every memory tool down with it.
+starlette>=0.37.0
+uvicorn>=0.30.0
