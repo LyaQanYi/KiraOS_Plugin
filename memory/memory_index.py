@@ -218,16 +218,30 @@ class MemoryIndex:
             self._vec_available = False
             logger.debug(f"sqlite-vec not available, using FTS5 only: {e}")
 
+    def _ensure_conn(self) -> sqlite3.Connection:
+        """返回可用连接，必要时重连。调用方必须已持有 `_conn_lock`。
+
+        `close()` 会把 `_conn` 置 None。插件禁用→重新启用会重跑一遍
+        `initialize()`，而 WebUI / 后台任务可能还捏着同一个 MemoryIndex 实例，
+        于是 close 之后仍会有请求打进来。没有这个懒重连的话，那些请求会撞上
+        `AttributeError: 'NoneType' object has no attribute 'cursor'`——一个
+        本来只是「连接已关」的状态被暴露成崩溃。
+        """
+        if self._conn is None:
+            self._init_db()
+        return self._conn
+
     @contextmanager
     def _transaction(self):
         """写事务上下文管理器；持 `_conn_lock` 全程串行化。"""
         with self._conn_lock:
-            cur = self._conn.cursor()
+            conn = self._ensure_conn()
+            cur = conn.cursor()
             try:
                 yield cur
-                self._conn.commit()
+                conn.commit()
             except Exception:
-                self._conn.rollback()
+                conn.rollback()
                 raise
             finally:
                 cur.close()
@@ -244,7 +258,7 @@ class MemoryIndex:
         threadsafety=1 限制）。
         """
         with self._conn_lock:
-            yield self._conn
+            yield self._ensure_conn()
 
     # ==========================================
     # 内容哈希
@@ -1069,6 +1083,41 @@ class MemoryIndex:
                 logger.warning(f"Failed to parse JSON {fpath}: {e}")
 
         # 先 TRUNCATE 主表和 FTS 影子表，避免「真相源已删但索引残留」的僵尸行。
+        #
+        # 但 TRUNCATE 之前要先把现有的运行时 meta 抓一份快照。TOML 里的
+        # `[meta]` 只在写盘那一刻是新的，而 `access_count` / `last_accessed`
+        # 是每次召回在 SQLite 里累加的——直接清表再从 TOML 灌回去，会把两次
+        # 落盘之间的所有访问记录抹掉。快照优先级高于 TOML，TOML 只做兜底
+        # （索引库被删或旧数据还没带 [meta] 时）。
+        prior_meta = self._snapshot_runtime_meta()
+        if prior_meta:
+            for rec in records:
+                key = (
+                    rec.get("entity_type", ""),
+                    rec.get("entity_id", ""),
+                    rec.get("folder", "facts"),
+                    rec.get("base_dir", ""),
+                    rec.get("id", ""),
+                )
+                snap = prior_meta.get(key)
+                if not snap:
+                    continue
+                # 创建时间取两者中更早的：TOML 可能是手工恢复的旧备份，
+                # 快照可能是上次重建时用 time.time() 兜底写进去的。
+                toml_ts = rec.get("timestamp")
+                snap_ts = snap["timestamp"]
+                if toml_ts:
+                    rec["timestamp"] = min(float(toml_ts), snap_ts) if snap_ts else float(toml_ts)
+                elif snap_ts:
+                    rec["timestamp"] = snap_ts
+                # 访问数据取更大的那个（单调递增，不会因为一次重建倒退）。
+                rec["access_count"] = max(
+                    int(rec.get("access_count", 0) or 0), snap["access_count"]
+                )
+                rec["last_accessed"] = max(
+                    float(rec.get("last_accessed", 0) or 0), snap["last_accessed"]
+                )
+
         with self._transaction() as cur:
             cur.execute("DELETE FROM memories")
             cur.execute("DELETE FROM memories_fts")
@@ -1086,6 +1135,36 @@ class MemoryIndex:
             )
         else:
             logger.info("Rebuilt index — 0 records (archive/ excluded)")
+
+    def _snapshot_runtime_meta(self) -> Dict[Tuple[str, str, str, str, str], Dict[str, Any]]:
+        """抓一份现有索引的运行时 meta，供 rebuild 清表后回填。
+
+        键是 memories 表的复合主键 (entity_type, entity_id, folder, base_dir, id)。
+        表不存在（首次初始化）时返回空 dict——调用方按「没有先前状态」处理。
+        """
+        snapshot: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+        try:
+            with self._transaction() as cur:
+                cur.execute(
+                    "SELECT entity_type, entity_id, folder, base_dir, id, "
+                    "timestamp, last_accessed, access_count FROM memories"
+                )
+                for row in cur.fetchall():
+                    key = (
+                        row[0] or "",
+                        row[1] or "",
+                        row[2] or "facts",
+                        row[3] or "",
+                        row[4] or "",
+                    )
+                    snapshot[key] = {
+                        "timestamp": float(row[5] or 0),
+                        "last_accessed": float(row[6] or 0),
+                        "access_count": int(row[7] or 0),
+                    }
+        except sqlite3.Error as e:
+            logger.debug(f"No prior runtime meta to preserve: {e}")
+        return snapshot
 
     @staticmethod
     def _parse_path(

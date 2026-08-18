@@ -124,6 +124,19 @@ class MemoryManager:
         await self.tree_store.rebuild_index()
         logger.info("Memory index rebuilt from TOML files (startup sync)")
 
+    def close(self) -> None:
+        """释放持有的资源（目前是 SQLite 句柄）。
+
+        插件 `terminate()` 里只把 `memory_manager` 置 None 的话，SQLite 连接
+        要等 GC 才关。禁用→重新启用插件会重跑 initialize()，于是可能出现两个
+        连接同时开着；Windows 上还会让打开的 db 文件阻止数据目录被删除。
+        在 drain 掉后台海马体任务之后调用（那些任务还要写 TOML + 索引）。
+        """
+        try:
+            self.tree_store.close()
+        except Exception as e:
+            logger.warning(f"MemoryManager close failed: {e}")
+
     def set_llm_client(self, llm_client):
         """延迟设置 LLM 客户端。
 
@@ -440,6 +453,17 @@ class MemoryManager:
 
     def _buffer_for_hippocampus(self, session: str, new_chunk):
         """将新对话缓冲到待处理队列"""
+        # 非会话类 session（系统消息等）不该进海马体：它没有对应的用户/群实体。
+        # 必须在**入队前**就挡掉——`_hippocampus_process` 的兜底 except 会把整批
+        # chunks 放回队首重试，所以放进去再抛异常等于让这批消息永远重试、
+        # pending 队列只增不减。
+        if not self._is_conversational_session(session):
+            logger.debug(
+                "Skipping hippocampus buffering for non-conversational session %s",
+                session,
+            )
+            return
+
         chunks_to_process = None
         with self._hippocampus_lock:
             if session not in self._pending_conversations:
@@ -810,8 +834,14 @@ class MemoryManager:
         """从 session ID 解析实体信息
 
         session 格式: adapter:type:id
-        - 私聊: adapter:pm:user_id → (adapter:user_id, "user")
+        - 私聊: adapter:dm:user_id → (adapter:user_id, "user")
         - 群聊: adapter:gm:group_id → (adapter:group_id, "group")
+
+        只接受会话类型白名单。宿主的 `MessageType` 还有 `sm`（系统消息，
+        core/chat/message_utils.py:34），之前的实现把「非 gm」一律当私聊，
+        于是系统消息会凭空造出一个 user 实体、在 entities/ 下留下一个不对应
+        任何真人的目录。宿主自己的内置插件也是按 {"dm","gm"} 白名单处理的
+        （core/plugin/builtin_plugins/session_tools/main.py:91）。
         """
         parts = session.split(":", maxsplit=2)
         if len(parts) != 3:
@@ -823,4 +853,17 @@ class MemoryManager:
 
         if session_type == "gm":
             return f"{adapter}:{session_id}", ENTITY_GROUP
-        return f"{adapter}:{session_id}", ENTITY_USER
+        if session_type == "dm":
+            return f"{adapter}:{session_id}", ENTITY_USER
+        raise ValueError(
+            f"Non-conversational session type {session_type!r}: {session}"
+        )
+
+    @classmethod
+    def _is_conversational_session(cls, session: str) -> bool:
+        """这个 session 能不能落成一个记忆实体。"""
+        try:
+            cls._parse_entity_from_session(session)
+            return True
+        except ValueError:
+            return False

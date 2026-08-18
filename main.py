@@ -315,6 +315,17 @@ class UserMemoryPlugin(BasePlugin):
                 logger.warning(f"Failed to unregister read_skill_resource: {e}")
             self._resource_tool_registered = False
 
+        # Close the SQLite handle deterministically. Dropping the reference
+        # leaves it to GC, so a disable→re-enable cycle (which reruns
+        # initialize()) can briefly hold two connections, and on Windows the
+        # open db file blocks removal of the data directory. Ordered after the
+        # background-task drain above, since those tasks still write the index.
+        if self.memory_manager is not None:
+            try:
+                self.memory_manager.close()
+            except Exception as e:
+                logger.warning(f"Failed to close memory manager: {e}")
+
         self.memory_manager = None
         logger.info("KiraOS plugin terminated")
 

@@ -160,8 +160,41 @@ class Memory:
 
     # === 序列化 ===
 
+    # 运行时 meta 里真正需要跨进程存活的三个字段。`meta` 还冗余存了
+    # importance / tags / source，但那些在 TOML 顶层已有权威副本，重复写入只会
+    # 让手工编辑的人改了一处、另一处不同步。
+    _DURABLE_META_KEYS = ("timestamp", "last_accessed", "access_count")
+
+    def _durable_meta(self) -> dict:
+        """从 `self.meta` 里摘出要落 TOML 的运行时字段，并做类型收口。
+
+        `meta` 可能来自 SQLite、旧 JSON、或用户手改的 TOML，字段类型不一定
+        干净。tomli_w 遇到 None 会直接抛异常、把整条记忆写失败，所以这里统一
+        转成数字；转不动就整个键不写，让读取侧回退到默认值。
+        """
+        out: dict = {}
+        for key in self._DURABLE_META_KEYS:
+            if key not in self.meta:
+                continue
+            value = self.meta[key]
+            if value is None:
+                continue
+            try:
+                out[key] = int(value) if key == "access_count" else float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def to_toml_dict(self) -> dict:
-        """序列化为 TOML 文件格式（人类可读，无运行时 meta）"""
+        """序列化为 TOML 文件格式（人类可读）。
+
+        含 `[meta]` 运行时元数据。这不是冗余：`async_init()` 每次启动都会
+        `DELETE FROM memories` 然后从 TOML 全量重建索引，所以任何只存在于
+        SQLite 里的字段每次重启都会归零——`timestamp` 变成 now、
+        `access_count` 变成 0。结果是「归档 30 天未访问的记忆」这类基于时间
+        的遗忘永远不会触发，记忆年龄永远是 0。把这三个字段一并落盘，重建才
+        是无损的。
+        """
         d = {
             "id": self.id,
             "type": self.type,
@@ -171,10 +204,13 @@ class Memory:
         }
         if self.source:
             d["source"] = self.source
+        meta = self._durable_meta()
+        if meta:
+            d["meta"] = meta
         return d
 
     def to_full_dict(self) -> dict:
-        """序列化为完整格式（含运行时 meta，用于归档/API）"""
+        """序列化为完整格式（含全部运行时 meta，用于归档/API）"""
         d = self.to_toml_dict()
         d["meta"] = self.meta
         return d
@@ -207,6 +243,15 @@ class Memory:
         if not isinstance(source, dict):
             source = {}
 
+        # runtime_meta（SQLite，实时）优先；没有就回退到 TOML 自己的 [meta]。
+        # 后者是灾难恢复路径：索引库被删/损坏时，TOML 仍带着创建时间和访问
+        # 计数，重建出来的索引不会把所有记忆的年龄清零。
+        if runtime_meta:
+            meta = runtime_meta
+        else:
+            embedded = data.get("meta", {})
+            meta = embedded if isinstance(embedded, dict) else {}
+
         return cls(
             id=data.get("id", ""),
             type=data.get("type", "fact"),
@@ -214,7 +259,7 @@ class Memory:
             importance=importance,
             tags=tags,
             source=source,
-            meta=runtime_meta or {},
+            meta=meta,
             **location_kwargs,
         )
 
@@ -267,6 +312,18 @@ class TomlTreeStore:
         logger.info("TomlTreeStore initialized (TOML files + SQLite index)")
 
     _LOCK_CAP = 256
+
+    def close(self) -> None:
+        """释放底层 SQLite 句柄。
+
+        Windows 上一个打开的 db 文件会阻止目录删除（PermissionError），而且
+        插件禁用→重新启用会走一遍完整的 initialize()，靠 GC 回收句柄的话前
+        一个连接可能还没关。拥有 store 的调用方应当确定性地关掉它。
+        """
+        try:
+            self.index.close()
+        except Exception as e:
+            logger.warning(f"TomlTreeStore close failed: {e}")
 
     # memory_id 会被拼成 `f"{memory_id}.toml"` 写入磁盘，必须先拒绝任何包含
     # 路径分隔符、`..` 段、或绝对路径的值。否则一个 `../../secrets` 的请求
