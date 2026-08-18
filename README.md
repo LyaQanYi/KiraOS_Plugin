@@ -34,6 +34,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 - [配置项](#配置项)
 - [数据存储](#数据存储)
 - [从 v2 迁移](#从-v2-迁移)
+- [从 Hippocampus Memory 插件迁移](#从-hippocampus-memory-插件迁移)
 - [故障排除](#故障排除)
 
 ---
