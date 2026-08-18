@@ -1,7 +1,7 @@
 # KiraOS 插件文档
 
 > **插件 ID**: `kira_plugin_kiraos`
-> **版本**: 3.0.1
+> **版本**: 4.0.0
 > **作者**: LyaQanYi
 > **兼容**: KiraAI v2.x (dev branch)
 
@@ -11,6 +11,8 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 |------|------|------|
 | **双脑记忆 (Dual-Brain Memory)** | 大脑 | 快/慢两套循环：FTS5 实时检索 + 后台海马体异步提取、反思、画像更新；TOML 文件作真相源，SQLite 作可重建索引 |
 | **技能路由 (Skill Router)** | 程序加载器 | 渐进式工具发现——启动时加载轻量 manifest，运行时按需注入完整指令 |
+
+> **v4 统一公告**：原独立的 `kira_plugin_hippocampus_memory`（海马体记忆插件）已完全合并至本插件。所有功能保留，数据自动迁移。详见 [从 Hippocampus Memory 插件迁移](#从-hippocampus-memory-插件迁移)。
 
 > v3 相对 v2.x 的核心变化：把简陋的"两张 SQLite 表 + 单用户画像"换成了完整的双脑记忆系统（TOML 真相源 + SQLite 索引 + 后台海马体）。详见 [从 v2 迁移](#从-v2-迁移)。
 
@@ -385,6 +387,59 @@ v3 第一次启动时（`auto_migrate_legacy_db: true`，默认开），插件�
 - ❌ 旧工具 `memory_update` / `memory_query` / `memory_clear` / `consolidate_memory` 已全部移除
 - ✅ 新工具 `memory_add` / `memory_search` / `memory_update_entry` / `memory_remove` / `profile_view` / `profile_update`
 - 注入到 system prompt 的 `memory` 段格式不同，但 LLM 一般不需要关心结构
+
+## 从 Hippocampus Memory 插件迁移
+
+> **v4.0.0 新增**：统一了原独立的 `kira_plugin_hippocampus_memory`（海马体记忆插件）所有功能。
+
+v4 第一次启动时（`auto_migrate_legacy_db: true`，默认开），插件会自动：
+
+1. 检测 `data/plugin_data/kira_plugin_hippocampus_memory/memory/` 是否存在
+2. 读取旧插件的 SQLite 索引（`memory_index.db`），提取所有记忆的运行时 meta（`timestamp` / `last_accessed` / `access_count`）
+3. 逐实体迁移：
+   - **Entity profiles** (`profile.json`) → union merge：traits / facts / aliases 去重合并，interaction_count 累加，最新 last_interaction 保留
+   - **Facts & reflections** (`.toml` 文件) → 内容哈希去重：相同内容不重复导入，保留最早的 timestamp
+   - **Global facts** → 迁移到统一的 `global/facts/` 命名空间
+4. 在当前实例的 plugin manager 里标记 `kira_plugin_hippocampus_memory` 为 disabled（防止双喂）
+5. 落盘 `data/memory/.hippocampus_migrated` 标记（包含迁移统计：实体数、facts 数、reflections 数）
+
+**迁移后 Hippocampus 插件会发生什么？**
+- 旧数据保留在 `data/plugin_data/kira_plugin_hippocampus_memory/` 不变（rollback 用）
+- 插件在当前 KiraAI 实例里被自动禁用（可在 WebUI 插件管理里看到）
+- 后续启动检测到迁移标记后不会重复迁移
+
+**迁移是幂等的**：即使中途失败、或用户手动删了标记文件重跑，内容哈希去重机制会防止重复导入。
+
+**Hippocampus 独有功能的迁移状态**：
+- ✅ **TOML + SQLite 双存储** — 完全一致
+- ✅ **FTS5 全文检索** + optional `sqlite-vec` — 完全一致
+- ✅ **海马体后台提取** + SHA-256 / FTS5 / LLM 三级去重 — 完全一致
+- ✅ **升维反思** (dimensional reflection) — 完全一致
+- ✅ **实体画像** (user/group/channel) + alias 追踪 — 完全一致
+- ✅ **衰减遗忘** — 完全一致
+- ✅ **三级人设演进** (persona evolution) — 完全一致，Tier 3 默认关闭
+- ✅ **Group-chat 双路由** — 完全一致
+- ✅ **`jieba` 中文分词** + 优雅降级 — 完全一致
+
+迁移逻辑在 [memory/migration_hippocampus.py](memory/migration_hippocampus.py)。如果不希望自动迁移，把 `auto_migrate_legacy_db` 设为 `false`。
+
+**如何确认迁移成功？**
+```bash
+cat data/memory/.hippocampus_migrated
+```
+文件内容示例：
+```json
+{
+  "migrated": true,
+  "timestamp": 1723968123.456,
+  "entities": 3,
+  "facts": 47,
+  "reflections": 12,
+  "global_facts": 5
+}
+```
+
+迁移后可通过 Memory WebUI 或 `memory_search` 工具确认数据已就位。原 Hippocampus 插件目录可在确认无误后手动删除。
 
 ---
 

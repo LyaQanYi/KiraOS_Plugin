@@ -103,14 +103,78 @@
         }
     },
     "auto_migrate_legacy_db": {
-        "name": "Auto-migrate v2 SQLite",
+        "name": "Auto-migrate v2 SQLite + hippocampus plugin",
         "type": "switch",
         "default": true,
-        "hint": "On first run, automatically migrate any existing v2 kiraos.db (user_profiles + event_logs) into the new TOML structure. The old file is backed up to kiraos.db.bak_<timestamp>.",
+        "hint": "On first run, automatically migrate any existing v2 kiraos.db (user_profiles + event_logs) and kira_plugin_hippocampus_memory data into the unified TOML structure. The old kiraos.db is backed up to kiraos.db.bak_<timestamp>; hippocampus data remains untouched (read-only import) and the plugin is auto-disabled.",
         "locales": {
             "zh": {
-                "name": "自动迁移 v2 SQLite",
-                "hint": "首次启动时自动把已存在的 v2 kiraos.db（user_profiles + event_logs 两张表）迁移到新的 TOML 结构。旧文件会备份为 kiraos.db.bak_<时间戳>。"
+                "name": "自动迁移 v2 SQLite + 海马体插件",
+                "hint": "首次启动时自动把已存在的 v2 kiraos.db（user_profiles + event_logs 两张表）和 kira_plugin_hippocampus_memory 的数据迁移到统一的 TOML 结构。旧 kiraos.db 会备份为 kiraos.db.bak_<时间戳>；海马体插件的数据保持不动（只读导入）且插件会被自动禁用。"
+            }
+        }
+    },
+    "max_recall_chars": {
+        "name": "Max recall block chars",
+        "type": "integer",
+        "default": 1500,
+        "minimum": 200,
+        "hint": "Truncate the injected recall block to N characters before injecting into the system prompt. Prevents excessive context pollution when many long memories are recalled.",
+        "locales": {
+            "zh": {
+                "name": "召回文本最大长度",
+                "hint": "注入到 system prompt 前截断召回块的字符数。防止召回过多长记忆时污染上下文。"
+            }
+        }
+    },
+    "reflection_threshold": {
+        "name": "Reflection trigger (facts per entity)",
+        "type": "integer",
+        "default": 5,
+        "minimum": 1,
+        "hint": "Generate a high-level reflection once an entity has accumulated at least this many facts. Reflections synthesize patterns across facts.",
+        "locales": {
+            "zh": {
+                "name": "升维反思阈值（每实体 fact 数）",
+                "hint": "每个实体累积到这么多条 fact 后生成一条高层 reflection。Reflection 会从 facts 中综合出模式和洞察。"
+            }
+        }
+    },
+    "profile_compact_threshold": {
+        "name": "Profile compact trigger (facts)",
+        "type": "integer",
+        "default": 12,
+        "minimum": 2,
+        "hint": "Compact a profile's facts list into tagged short bullets once it reaches this count. Prevents profile injection from bloating the system prompt. Values below 2 are clamped to 2 at runtime.",
+        "locales": {
+            "zh": {
+                "name": "画像压实阈值（条数）",
+                "hint": "画像 facts 列表达到此条数后，压实为带标签前缀的规范短句。防止画像注入膨胀 system prompt。小于 2 时运行时钳到 2。"
+            }
+        }
+    },
+    "profile_compact_max_chars": {
+        "name": "Profile compact trigger (total chars)",
+        "type": "integer",
+        "default": 1200,
+        "minimum": 200,
+        "hint": "Compact a profile's facts once their combined length exceeds this many characters (checked alongside the count threshold). Values below 200 are clamped to 200 at runtime.",
+        "locales": {
+            "zh": {
+                "name": "画像压实阈值（总字符数）",
+                "hint": "画像 facts 总字符数超过此值时也会触发压实（与条数阈值任一满足即触发）。小于 200 时运行时钳到 200。"
+            }
+        }
+    },
+    "enable_persona_evolution": {
+        "name": "Enable Tier-3 persona leap",
+        "type": "switch",
+        "default": false,
+        "hint": "Allow reflections to merge into the bot's core persona (destructive, changes the bot's character over time). Off by default — this is an advanced feature that fundamentally alters the bot's personality based on observed patterns.",
+        "locales": {
+            "zh": {
+                "name": "启用三级人设跃迁",
+                "hint": "允许 Reflection 合并到 Bot 的核心人设（破坏性，会随时间改变 Bot 性格）。默认关闭——这是高级特性，会根据观察到的模式从根本上改变 Bot 的人格。"
             }
         }
     },

@@ -23,6 +23,7 @@ from typing import Optional
 from core.logging_manager import get_logger
 from .toml_tree_store import TomlTreeStore, Memory
 from .memory_index import MemoryIndex
+from .llm_adapter import chat_text
 
 logger = get_logger("memory_extractor", "green")
 
@@ -138,9 +139,12 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的个人事实，输出空数组 []。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                return self._parse_json_array(resp.text_response)
+            resp = await asyncio.wait_for(
+                chat_text(self._llm_client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                return self._parse_json_array(resp)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
                 logger.warning("Personal fact extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
@@ -189,9 +193,12 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的群组事实，输出空数组 []。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                return self._parse_json_array(resp.text_response)
+            resp = await asyncio.wait_for(
+                chat_text(self._llm_client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                return self._parse_json_array(resp)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
                 logger.warning("Group fact extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
@@ -227,9 +234,12 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的事实，输出空数组 []。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                return self._parse_json_array(resp.text_response)
+            resp = await asyncio.wait_for(
+                chat_text(self._llm_client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                return self._parse_json_array(resp)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
                 logger.warning("Fact extraction timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
@@ -286,9 +296,12 @@ class MemoryExtractor:
 直接输出觉察内容或 NONE，不要有其他内容。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                text = resp.text_response.strip()
+            resp = await asyncio.wait_for(
+                chat_text(self._llm_client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                text = resp.strip()
                 if text.upper() == "NONE" or not text:
                     return []
                 # 先去掉项目符号 / markdown 前缀和 emphasis 字符，再做"我"开头的语义判断。
@@ -336,9 +349,12 @@ class MemoryExtractor:
 只输出标识符，不要有其他内容。"""
 
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                slug = resp.text_response.strip().lower()
+            resp = await asyncio.wait_for(
+                chat_text(self._llm_client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                slug = resp.strip().lower()
                 # 清理非法字符
                 slug = re.sub(r"[^a-z0-9_]", "_", slug)
                 slug = re.sub(r"_+", "_", slug).strip("_")
@@ -420,12 +436,12 @@ class MemoryExtractor:
 只输出选项文本，不要有其他内容。"""
 
         try:
-            if hasattr(client, "chat_fast"):
-                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            else:
-                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                result = resp.text_response.strip().strip('"').lower()
+            resp = await asyncio.wait_for(
+                chat_text(client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                result = resp.strip().strip('"').lower()
                 if result in ("duplicate", "update", "new"):
                     return result
         except Exception as e:
@@ -450,12 +466,12 @@ class MemoryExtractor:
 直接输出合并后的结果，不要有其他内容。"""
 
         try:
-            if hasattr(client, "chat_fast"):
-                resp = await asyncio.wait_for(client.chat_fast([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            else:
-                resp = await asyncio.wait_for(client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if resp and resp.text_response:
-                return resp.text_response.strip()
+            resp = await asyncio.wait_for(
+                chat_text(client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if resp:
+                return resp.strip()
         except Exception as e:
             logger.error(f"Merge facts error: {e}")
         return f"{existing_text}；{new_text}"
@@ -592,13 +608,16 @@ class MemoryExtractor:
 
         generated = []
         try:
-            resp = await asyncio.wait_for(self._llm_client.chat([{"role": "user", "content": prompt}]), timeout=self.llm_chat_timeout)
-            if not (resp and resp.text_response):
+            resp = await asyncio.wait_for(
+                chat_text(self._llm_client, prompt),
+                timeout=self.llm_chat_timeout
+            )
+            if not resp:
                 return []
 
             insights = [
                 line.strip()
-                for line in resp.text_response.strip().split("\n")
+                for line in resp.strip().split("\n")
                 if line.strip()
             ][:3]  # prompt 已经要求 1-3 条，超出的多余行会触发额外 search/merge/add
             # 的成本和噪声——硬截到 3 条与 prompt 契约对齐。

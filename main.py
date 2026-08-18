@@ -40,6 +40,8 @@ from .memory.memory_paths import (
     ENTITY_GROUP,
 )
 from .memory.migrations import migrate_legacy_db_if_needed
+from .memory.migration_hippocampus import migrate_hippocampus_if_needed
+from .memory.entity_profile import EntityProfileStore
 from . import tools as memory_tools
 from .skill_router import SkillRouter, SkillInfo
 
@@ -101,6 +103,12 @@ class UserMemoryPlugin(BasePlugin):
         self._hippocampus_threshold = int(cfg.get("hippocampus_threshold", 3))
         self._recall_top_k = int(cfg.get("recall_top_k", 5))
         self._max_memory_length = int(cfg.get("max_memory_length", 20))
+        self._max_recall_chars = int(cfg.get("max_recall_chars", 1500))
+        self._reflection_threshold = int(cfg.get("reflection_threshold", 5))
+        self._profile_compact_threshold = max(2, int(cfg.get("profile_compact_threshold", 12)))
+        self._profile_compact_max_chars = max(200, int(cfg.get("profile_compact_max_chars", 1200)))
+        self._enable_persona_evolution = bool(cfg.get("enable_persona_evolution", False))
+
         # 海马体每条 LLM 调用的超时（秒）；卡慢的 provider 调大、本地快模型可以调小。
         # schema 里声明的是 integer，min=5 / max=300——这里也走 int() 保持类型
         # 一致（"多少秒"的语义本就是整数）。
@@ -176,6 +184,23 @@ class UserMemoryPlugin(BasePlugin):
             llm_chat_timeout=self._llm_chat_timeout,
         )
         await self.memory_manager.async_init()
+
+        # ── Hippocampus plugin migration (after manager init) ──────
+        if self._auto_migrate:
+            try:
+                from .memory.entity_profile import EntityProfileStore
+                profile_store = EntityProfileStore()
+                stats = await migrate_hippocampus_if_needed(
+                    self.memory_manager.tree_store, profile_store, self.ctx
+                )
+                if stats["migrated"]:
+                    logger.info(
+                        f"Hippocampus plugin data migrated: {stats['entities']} entities, "
+                        f"{stats['facts']} facts, {stats['reflections']} reflections, "
+                        f"{stats['global_facts']} global facts"
+                    )
+            except Exception as e:
+                logger.error(f"Hippocampus migration failed (non-fatal): {e}", exc_info=True)
 
         # Wire in the host LLM as the hippocampus LLM client. The extractor
         # expects `await client.chat(messages_list)` returning `.text_response`
