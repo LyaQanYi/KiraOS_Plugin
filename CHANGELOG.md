@@ -24,13 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Unified interface for memory extractor to call LLM services
   - Decouples memory logic from KiraAI context management
   - Enables future multi-provider support
-- **Hippocampus migrator module** (`memory/hippocampus_migrator.py`)
-  - Two-phase migration: discovery → import
-  - Validates source data integrity before import
-  - Rollback-safe (original data untouched)
 - **Migration entry point** (`memory/migration_hippocampus.py`)
   - Orchestrates hippocampus → KiraOS data pipeline
   - Integrates with existing v2 → v3 migration flow
+  - **Failure-path safety**: if source memories exist but zero import successfully,
+    the hippocampus plugin is left **enabled** and the marker is **not** written, so
+    the next launch retries. Disabling the old plugin after a failed import would
+    read to the user as total data loss.
+- **Migration test suite** (`tests/test_hippocampus_migration.py`, 10 tests)
+  - Builds a real hippocampus tree on disk (TOML + `profile.json` + `memory_index.db`
+    using hippocampus's own schema) and asserts on what lands
+  - Covers: counts, retrievability via the normal API, aged-metadata preservation,
+    profile carry-over, idempotency, source-immutability, plugin auto-disable,
+    corrupt-TOML resilience, clean no-op on fresh installs, and the total-failure guard
 
 #### Changed
 
