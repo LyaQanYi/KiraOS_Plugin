@@ -70,12 +70,19 @@ class _MemoryLLMAdapter:
         self._default = default_client
         self._fast = fast_client or default_client
 
-    async def chat(self, messages: list):
-        req = LLMRequest(messages=list(messages))
+    @staticmethod
+    def _to_request(messages):
+        """Convert messages to LLMRequest if needed (idempotent)."""
+        if isinstance(messages, LLMRequest):
+            return messages
+        return LLMRequest(messages=list(messages))
+
+    async def chat(self, messages):
+        req = self._to_request(messages)
         return await self._default.chat(req)
 
-    async def chat_fast(self, messages: list):
-        req = LLMRequest(messages=list(messages))
+    async def chat_fast(self, messages):
+        req = self._to_request(messages)
         return await self._fast.chat(req)
 
 
@@ -124,6 +131,10 @@ class UserMemoryPlugin(BasePlugin):
         self._llm_chat_timeout = max(5, min(300, raw))
         self._auto_migrate = bool(cfg.get("auto_migrate_legacy_db", True))
         self._enable_decay = bool(cfg.get("enable_decay", True))
+
+        # Model selection for extraction (fast, cheap) vs reflection (strong, expensive)
+        self._extraction_model = cfg.get("extraction_model", None)
+        self._reflection_model = cfg.get("reflection_model", None)
 
         # Which sections of the profile/memory to inject into system prompt
         self._inject_profile = bool(cfg.get("inject_profile", True))
@@ -202,29 +213,50 @@ class UserMemoryPlugin(BasePlugin):
             except Exception as e:
                 logger.error(f"Hippocampus migration failed (non-fatal): {e}", exc_info=True)
 
-        # Wire in the host LLM as the hippocampus LLM client. The extractor
-        # expects `await client.chat(messages_list)` returning `.text_response`
-        # — KiraAI's LLMModelClient uses `.chat(LLMRequest)`, so we adapt.
-        try:
-            default_llm = self.ctx.get_default_llm_client()
-        except Exception as e:
-            default_llm = None
-            logger.warning(f"Could not resolve default LLM client: {e}")
-        try:
-            fast_llm = self.ctx.get_default_fast_llm_client()
-        except Exception:
-            fast_llm = None
+        # Wire LLM clients for hippocampus extraction (fast, cheap) vs reflection (slow, strong).
+        extraction_client = None
+        reflection_client = None
 
-        if default_llm is not None:
-            adapter = _MemoryLLMAdapter(default_llm, fast_llm)
-            self.memory_manager.set_llm_client(adapter)
+        # 1. Try user-configured extraction_model
+        if self._extraction_model:
+            extraction_client = self.ctx.get_llm_client(model_uuid=self._extraction_model)
+            if extraction_client:
+                logger.info(f"Extraction model: {self._extraction_model}")
+
+        # 2. Fall back to default fast LLM
+        if extraction_client is None:
+            try:
+                extraction_client = self.ctx.get_default_fast_llm_client()
+                logger.info("Extraction model: default fast LLM")
+            except Exception as e:
+                logger.warning(f"Could not resolve extraction LLM: {e}")
+
+        # 3. Try user-configured reflection_model
+        if self._reflection_model:
+            reflection_client = self.ctx.get_llm_client(model_uuid=self._reflection_model)
+            if reflection_client:
+                logger.info(f"Reflection model: {self._reflection_model}")
+
+        # 4. Fall back to default LLM
+        if reflection_client is None:
+            try:
+                reflection_client = self.ctx.get_default_llm_client()
+                logger.info("Reflection model: default LLM")
+            except Exception as e:
+                logger.warning(f"Could not resolve reflection LLM: {e}")
+
+        if extraction_client or reflection_client:
+            # Wrap both in adapters (handles the LLMRequest-vs-list shape mismatch)
+            extraction_adapter = _MemoryLLMAdapter(extraction_client) if extraction_client else None
+            reflection_adapter = _MemoryLLMAdapter(reflection_client) if reflection_client else None
+            self.memory_manager.set_llm_clients(extraction_adapter, reflection_adapter)
             logger.info(
-                f"Hippocampus LLM client wired (default={getattr(default_llm.model, 'model_id', '?')}, "
-                f"fast={getattr(fast_llm.model, 'model_id', '?') if fast_llm else 'same'})"
+                f"Hippocampus LLM clients wired (extraction={getattr(extraction_client.model, 'model_id', '?') if extraction_client else 'none'}, "
+                f"reflection={getattr(reflection_client.model, 'model_id', '?') if reflection_client else 'none'})"
             )
         else:
             logger.warning(
-                "No default LLM client available — hippocampus will skip fact extraction "
+                "No LLM clients available — hippocampus will skip fact extraction "
                 "(memory_add/search/profile_* tools still work via TOML+FTS5)"
             )
 
@@ -235,11 +267,19 @@ class UserMemoryPlugin(BasePlugin):
 
         # ── Discover & register skills ──────────────────────────────
         skills = self.skill_router.discover()
+        framework_enabled = self._get_framework_skill_toggles()
+
         any_with_resources = False
         for skill in skills:
+            # Plugin's own denylist
             if skill.name in self._disabled_skills:
-                logger.info(f"Skill '{skill.name}' is disabled, skipping registration")
+                logger.info(f"Skill '{skill.name}' disabled by plugin config, skipping registration")
                 continue
+            # Framework toggle (WebUI-managed)
+            if framework_enabled is not None and not framework_enabled.get(skill.name, True):
+                logger.info(f"Skill '{skill.name}' disabled in framework skills.json, skipping registration")
+                continue
+
             self._register_skill_tool(skill)
             if skill.has_resources():
                 any_with_resources = True
@@ -282,6 +322,36 @@ class UserMemoryPlugin(BasePlugin):
                 )
         except Exception as e:
             logger.warning(f"检查内置记忆插件状态时出错: {e}")
+
+    def _get_framework_skill_toggles(self) -> Optional[dict[str, bool]]:
+        """Read framework skill enable/disable state from WebUI-managed skills.json.
+
+        Returns {skill_name: bool} or None if unavailable.
+        Tries ctx.message_processor.skills_manager first (runtime state), falls back to
+        parsing data/config/skills.json directly (file state).
+        """
+        # Path 1: live SkillsManager instance (fastest, reflects runtime state)
+        try:
+            mgr = self.ctx.message_processor.skills_manager
+            if mgr is not None:
+                return mgr.get_skill_config_dict()
+        except AttributeError:
+            pass  # message_processor or skills_manager not available yet
+
+        # Path 2: read the JSON file directly (works even if framework changed structure)
+        try:
+            from core.utils.path_utils import get_config_path
+            skills_json = get_config_path() / "skills.json"
+            if not skills_json.exists():
+                return None
+            import json
+            with open(skills_json, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            # Filter out reserved keys like "_scope" (same logic as SkillsManager._build_enabled_dict)
+            return {k: v for k, v in raw.items() if not k.startswith("_")}
+        except Exception as e:
+            logger.warning(f"Could not read framework skill toggles: {e}")
+            return None
 
     async def terminate(self):
         if self._webui_server:

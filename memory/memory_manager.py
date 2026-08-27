@@ -89,10 +89,12 @@ class MemoryManager:
         self.profile_store = EntityProfileStore()
 
         # === 海马体 ===
-        self._llm_client = llm_client
+        self._extraction_client = llm_client  # lightweight: extraction, dedup, merge
+        self._reflection_client = llm_client  # heavyweight: reflections, profile compact
         self.extractor = MemoryExtractor(
             self.tree_store,
-            llm_client,
+            extraction_client=llm_client,
+            reflection_client=llm_client,
             llm_chat_timeout=llm_chat_timeout,
         )
         self.router = MemoryRouter()
@@ -138,17 +140,24 @@ class MemoryManager:
             logger.warning(f"MemoryManager close failed: {e}")
 
     def set_llm_client(self, llm_client):
-        """延迟设置 LLM 客户端。
+        """Delayed LLM client injection (legacy compat shim).
+
+        Use set_llm_clients() to wire separate extraction vs reflection models.
+        """
+        self.set_llm_clients(llm_client, llm_client)
+
+    def set_llm_clients(self, extraction_client, reflection_client):
+        """Delayed LLM client injection (separate extraction vs reflection models).
 
         启动窗口期（"插件起来 → LLM 还没注入 → 用户消息已攒到阈值"）里，
         `_hippocampus_process` 会把 chunks 还回 `_pending_conversations`
         队列。LLM 一就绪就要主动把这些已经超过阈值的会话拉起，否则它们
         会卡到下一次新消息到达才重新触发。
         """
-        self._llm_client = llm_client
-        self.extractor.set_llm_client(llm_client)
-        # 同时将 llm_client 作为 fast_llm 的后端（通过 chat_fast 方法自动选模型）
-        self.extractor.set_fast_llm_client(llm_client)
+        self._extraction_client = extraction_client
+        self._reflection_client = reflection_client
+        self.extractor.set_extraction_client(extraction_client)
+        self.extractor.set_reflection_client(reflection_client)
 
         # 主动 drain pending：扫一遍所有 session，已达阈值的立刻调度。
         # 在 hippocampus_lock 内取出 + 清空 pending，跟 _buffer_for_hippocampus
@@ -587,12 +596,12 @@ class MemoryManager:
 
         群聊走双路径（个人 + 群组分别提取），私聊走单路径。
         """
-        if not self._llm_client:
-            # LLM client 是延迟注入接口（set_llm_client）—— "插件刚启动 → 用户
+        if not self._extraction_client and not self._reflection_client:
+            # LLM client 是延迟注入接口（set_llm_clients）—— "插件刚启动 → 用户
             # 已发足够消息攒满阈值 → LLM 客户端还没注入" 是真实存在的窗口期。
             # 此时不能 silently return 把 chunks 吞掉，要把它们还回 pending
             # 队列，等下次触发或 LLM 注入后由后续 chunk 触发的任务一起消费。
-            logger.debug("LLM client not set, re-buffering %d chunks", len(chunks))
+            logger.debug("LLM clients not set, re-buffering %d chunks", len(chunks))
             with self._hippocampus_lock:
                 pending = self._pending_conversations.setdefault(session, [])
                 # 把这次的 chunks 放到队首，保持原始时间顺序。

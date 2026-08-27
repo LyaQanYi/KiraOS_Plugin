@@ -54,7 +54,8 @@ class MemoryExtractor:
     def __init__(
         self,
         tree_store: TomlTreeStore,
-        llm_client=None,
+        extraction_client=None,
+        reflection_client=None,
         *,
         llm_chat_timeout: float = _DEFAULT_LLM_CHAT_TIMEOUT,
     ):
@@ -63,8 +64,8 @@ class MemoryExtractor:
         # 每条 LLM 调用的超时；超过即被当成失败、走空提取兜底（不会丢 chunks，
         # 上游的 hippocampus_process 会 re-buffer 回 pending 等下次触发）。
         self.llm_chat_timeout: float = float(llm_chat_timeout)
-        self._llm_client = llm_client
-        self._fast_llm_client = None  # 轻量模型，用于去重/合并等低复杂度任务
+        self._extraction_client = extraction_client  # for extract_*, _check_conflict, merge_facts
+        self._reflection_client = reflection_client  # for generate_reflections, profile compact (future)
 
         # 升维阈值：facts 积累达到此数量时触发反思
         self.reflection_threshold = 5
@@ -83,17 +84,13 @@ class MemoryExtractor:
         # 避免模型把开头不完整的句子当成完整事实。
         return "[…earlier conversation truncated…]\n" + text[-cls.MAX_CONVERSATION_CHARS:]
 
-    def set_llm_client(self, llm_client):
-        self._llm_client = llm_client
+    def set_extraction_client(self, client):
+        """Set the LLM client for extraction, dedup, and merge operations."""
+        self._extraction_client = client
 
-    def set_fast_llm_client(self, fast_llm_client):
-        """设置轻量 LLM 客户端，用于去重/合并（回退到 _llm_client）"""
-        self._fast_llm_client = fast_llm_client
-
-    @property
-    def _fast_or_default(self):
-        """获取快速 LLM 客户端，未设置则回退到主 LLM"""
-        return self._fast_llm_client or self._llm_client
+    def set_reflection_client(self, client):
+        """Set the LLM client for reflection generation and profile compaction."""
+        self._reflection_client = client
 
     # ==========================================
     # 事实提取（双路径）
@@ -109,7 +106,7 @@ class MemoryExtractor:
             [{"content": "...", "importance": 7, "tags": [...],
               "speaker_id": "12345", "subject": "昵称", "semantic_id": "..."}, ...]
         """
-        if not self._llm_client:
+        if not self._extraction_client:
             return []
         conversation_text = self._truncate_conversation(conversation_text)
 
@@ -140,7 +137,7 @@ class MemoryExtractor:
 
         try:
             resp = await asyncio.wait_for(
-                chat_text(self._llm_client, prompt),
+                chat_text(self._extraction_client, prompt),
                 timeout=self.llm_chat_timeout
             )
             if resp:
@@ -162,7 +159,7 @@ class MemoryExtractor:
             [{"content": "...", "importance": 7, "tags": [...],
               "subject": "group", "semantic_id": "..."}, ...]
         """
-        if not self._llm_client:
+        if not self._extraction_client:
             return []
         conversation_text = self._truncate_conversation(conversation_text)
 
@@ -194,7 +191,7 @@ class MemoryExtractor:
 
         try:
             resp = await asyncio.wait_for(
-                chat_text(self._llm_client, prompt),
+                chat_text(self._extraction_client, prompt),
                 timeout=self.llm_chat_timeout
             )
             if resp:
@@ -211,7 +208,7 @@ class MemoryExtractor:
 
         私聊场景只有一个用户，不需要双路径，走单次提取即可。
         """
-        if not self._llm_client:
+        if not self._extraction_client:
             return []
         conversation_text = self._truncate_conversation(conversation_text)
 
@@ -235,7 +232,7 @@ class MemoryExtractor:
 
         try:
             resp = await asyncio.wait_for(
-                chat_text(self._llm_client, prompt),
+                chat_text(self._extraction_client, prompt),
                 timeout=self.llm_chat_timeout
             )
             if resp:
@@ -267,7 +264,7 @@ class MemoryExtractor:
         Returns:
             觉察文本列表（通常 0-2 条，大部分情况为空）
         """
-        if not self._llm_client:
+        if not self._extraction_client:
             return []
         conversation_text = self._truncate_conversation(conversation_text)
 
@@ -297,7 +294,7 @@ class MemoryExtractor:
 
         try:
             resp = await asyncio.wait_for(
-                chat_text(self._llm_client, prompt),
+                chat_text(self._extraction_client, prompt),
                 timeout=self.llm_chat_timeout
             )
             if resp:
@@ -338,7 +335,7 @@ class MemoryExtractor:
 
         回退策略：文本前缀 + hash
         """
-        if not self._llm_client:
+        if not self._extraction_client:
             return ""
 
         prompt = f"""为以下记忆内容生成一个简短的 snake_case 文件名标识符（英文，无空格，不超过 30 字符）。
@@ -350,7 +347,7 @@ class MemoryExtractor:
 
         try:
             resp = await asyncio.wait_for(
-                chat_text(self._llm_client, prompt),
+                chat_text(self._extraction_client, prompt),
                 timeout=self.llm_chat_timeout
             )
             if resp:
@@ -419,7 +416,7 @@ class MemoryExtractor:
 
     async def _check_conflict(self, new_content: str, existing_content: str) -> str:
         """用 LLM 判断新旧记忆的关系（使用快速模型）"""
-        client = self._fast_or_default
+        client = self._extraction_client
         if not client:
             return "new"
 
@@ -454,7 +451,7 @@ class MemoryExtractor:
 
     async def merge_facts(self, existing_text: str, new_text: str) -> str:
         """LLM 合并两条事实为一条（使用快速模型）"""
-        client = self._fast_or_default
+        client = self._extraction_client
         if not client:
             return f"{existing_text}；{new_text}"
 
@@ -567,7 +564,7 @@ class MemoryExtractor:
         Returns:
             生成的 reflection 文本列表
         """
-        if not self._llm_client:
+        if not self._reflection_client:
             return []
 
         facts = await self.tree_store.get_all_memories(
@@ -609,7 +606,7 @@ class MemoryExtractor:
         generated = []
         try:
             resp = await asyncio.wait_for(
-                chat_text(self._llm_client, prompt),
+                chat_text(self._reflection_client, prompt),
                 timeout=self.llm_chat_timeout
             )
             if not resp:
