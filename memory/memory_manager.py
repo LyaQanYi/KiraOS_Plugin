@@ -596,12 +596,14 @@ class MemoryManager:
 
         群聊走双路径（个人 + 群组分别提取），私聊走单路径。
         """
-        if not self._extraction_client and not self._reflection_client:
+        if not self._extraction_client:
             # LLM client 是延迟注入接口（set_llm_clients）—— "插件刚启动 → 用户
             # 已发足够消息攒满阈值 → LLM 客户端还没注入" 是真实存在的窗口期。
             # 此时不能 silently return 把 chunks 吞掉，要把它们还回 pending
             # 队列，等下次触发或 LLM 注入后由后续 chunk 触发的任务一起消费。
-            logger.debug("LLM clients not set, re-buffering %d chunks", len(chunks))
+            # 注意：只检查 extraction_client，因为事实提取是必须的；reflection_client
+            # 可以独立缺失，反思生成会安全返回空列表。
+            logger.debug("Extraction client not set, re-buffering %d chunks", len(chunks))
             with self._hippocampus_lock:
                 pending = self._pending_conversations.setdefault(session, [])
                 # 把这次的 chunks 放到队首，保持原始时间顺序。

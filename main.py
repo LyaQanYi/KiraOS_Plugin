@@ -219,9 +219,12 @@ class UserMemoryPlugin(BasePlugin):
 
         # 1. Try user-configured extraction_model
         if self._extraction_model:
-            extraction_client = self.ctx.get_llm_client(model_uuid=self._extraction_model)
-            if extraction_client:
-                logger.info(f"Extraction model: {self._extraction_model}")
+            try:
+                extraction_client = self.ctx.get_llm_client(model_uuid=self._extraction_model)
+                if extraction_client:
+                    logger.info(f"Extraction model: {self._extraction_model}")
+            except Exception as e:
+                logger.warning(f"Failed to resolve extraction model '{self._extraction_model}': {e}")
 
         # 2. Fall back to default fast LLM
         if extraction_client is None:
@@ -233,9 +236,12 @@ class UserMemoryPlugin(BasePlugin):
 
         # 3. Try user-configured reflection_model
         if self._reflection_model:
-            reflection_client = self.ctx.get_llm_client(model_uuid=self._reflection_model)
-            if reflection_client:
-                logger.info(f"Reflection model: {self._reflection_model}")
+            try:
+                reflection_client = self.ctx.get_llm_client(model_uuid=self._reflection_model)
+                if reflection_client:
+                    logger.info(f"Reflection model: {self._reflection_model}")
+            except Exception as e:
+                logger.warning(f"Failed to resolve reflection model '{self._reflection_model}': {e}")
 
         # 4. Fall back to default LLM
         if reflection_client is None:

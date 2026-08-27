@@ -57,6 +57,7 @@ class MemoryExtractor:
         extraction_client=None,
         reflection_client=None,
         *,
+        llm_client=None,  # Backward compatibility
         llm_chat_timeout: float = _DEFAULT_LLM_CHAT_TIMEOUT,
     ):
         self.tree_store = tree_store
@@ -64,6 +65,12 @@ class MemoryExtractor:
         # 每条 LLM 调用的超时；超过即被当成失败、走空提取兜底（不会丢 chunks，
         # 上游的 hippocampus_process 会 re-buffer 回 pending 等下次触发）。
         self.llm_chat_timeout: float = float(llm_chat_timeout)
+
+        # Backward compatibility: if llm_client is provided, use it for both
+        if llm_client is not None:
+            extraction_client = extraction_client or llm_client
+            reflection_client = reflection_client or llm_client
+
         self._extraction_client = extraction_client  # for extract_*, _check_conflict, merge_facts
         self._reflection_client = reflection_client  # for generate_reflections, profile compact (future)
 
@@ -91,6 +98,15 @@ class MemoryExtractor:
     def set_reflection_client(self, client):
         """Set the LLM client for reflection generation and profile compaction."""
         self._reflection_client = client
+
+    def set_llm_client(self, client):
+        """Backward compatibility: set both extraction and reflection to the same client."""
+        self._extraction_client = client
+        self._reflection_client = client
+
+    def set_fast_llm_client(self, client):
+        """Backward compatibility: set extraction client (fast operations)."""
+        self._extraction_client = client
 
     # ==========================================
     # 事实提取（双路径）
