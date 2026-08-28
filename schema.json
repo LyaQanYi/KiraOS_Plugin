@@ -27,6 +27,32 @@
             }
         }
     },
+    "extraction_model": {
+        "name": "Extraction Model",
+        "type": "model_select",
+        "model_type": "llm",
+        "default": null,
+        "hint": "Model used for fact extraction, conflict detection, and merge operations. Leave empty to use the default fast LLM.",
+        "locales": {
+            "zh": {
+                "name": "提取模型",
+                "hint": "用于事实提取、去重冲突判定、合并操作的模型 ID。留空使用默认快速 LLM。"
+            }
+        }
+    },
+    "reflection_model": {
+        "name": "Reflection Model",
+        "type": "model_select",
+        "model_type": "llm",
+        "default": null,
+        "hint": "Model used for high-level reflection generation and profile compaction. Leave empty to use the default LLM.",
+        "locales": {
+            "zh": {
+                "name": "反思模型",
+                "hint": "用于升维反思生成、画像压实的模型 ID。留空使用默认 LLM。"
+            }
+        }
+    },
     "recall_top_k": {
         "name": "Recall top-K",
         "type": "integer",
