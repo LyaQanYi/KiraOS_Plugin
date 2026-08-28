@@ -272,7 +272,11 @@ async def memory_add(
                 return f"Memory already exists (duplicate detected), skipped"
             if decision == "update" and matched:
                 # 合并步骤需要 LLM；没有 LLM 时退化为"保留新文本+旧文本拼接"。
-                if extractor._llm_client is not None:
+                # After the client split, merge uses the extraction client (the one
+                # that did the dedup in the first place). Fallback to _llm_client for
+                # backward compat with test stubs that haven't migrated yet.
+                client = getattr(extractor, "_extraction_client", None) or getattr(extractor, "_llm_client", None)
+                if client is not None:
                     merged_text = await extractor.merge_facts(matched.text, text)
                 else:
                     merged_text = f"{matched.text}；{text}"
