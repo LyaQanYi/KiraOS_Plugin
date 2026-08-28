@@ -251,6 +251,14 @@ class UserMemoryPlugin(BasePlugin):
             except Exception as e:
                 logger.warning(f"Could not resolve reflection LLM: {e}")
 
+        # 5. Extraction is mandatory for the hippocampus loop — without it every
+        # batch gets re-buffered forever. Fall back to the reflection client so a
+        # host with no fast LLM configured still extracts (matches the pre-split
+        # adapter, which fell back from a missing fast client to the default one).
+        if extraction_client is None and reflection_client is not None:
+            logger.warning("No fast LLM available — using reflection LLM for extraction")
+            extraction_client = reflection_client
+
         if extraction_client or reflection_client:
             # Wrap both in adapters (handles the LLMRequest-vs-list shape mismatch)
             extraction_adapter = _MemoryLLMAdapter(extraction_client) if extraction_client else None
@@ -273,19 +281,8 @@ class UserMemoryPlugin(BasePlugin):
 
         # ── Discover & register skills ──────────────────────────────
         skills = self.skill_router.discover()
-        framework_enabled = self._get_framework_skill_toggles()
-
         any_with_resources = False
-        for skill in skills:
-            # Plugin's own denylist
-            if skill.name in self._disabled_skills:
-                logger.info(f"Skill '{skill.name}' disabled by plugin config, skipping registration")
-                continue
-            # Framework toggle (WebUI-managed)
-            if framework_enabled is not None and not framework_enabled.get(skill.name, True):
-                logger.info(f"Skill '{skill.name}' disabled in framework skills.json, skipping registration")
-                continue
-
+        for skill in self._filter_enabled_skills(skills):
             self._register_skill_tool(skill)
             if skill.has_resources():
                 any_with_resources = True
@@ -328,6 +325,24 @@ class UserMemoryPlugin(BasePlugin):
                 )
         except Exception as e:
             logger.warning(f"检查内置记忆插件状态时出错: {e}")
+
+    def _filter_enabled_skills(self, skills: list[SkillInfo]) -> list[SkillInfo]:
+        """Skills that pass both the plugin denylist and the framework WebUI toggle.
+
+        Used by initial registration and hot reload alike — a skill disabled in the
+        WebUI must stay unregistered across reloads, not come back until restart.
+        """
+        framework_enabled = self._get_framework_skill_toggles()
+        enabled = []
+        for skill in skills:
+            if skill.name in self._disabled_skills:
+                logger.info(f"Skill '{skill.name}' disabled by plugin config, skipping registration")
+                continue
+            if framework_enabled is not None and not framework_enabled.get(skill.name, True):
+                logger.info(f"Skill '{skill.name}' disabled in framework skills.json, skipping registration")
+                continue
+            enabled.append(skill)
+        return enabled
 
     def _get_framework_skill_toggles(self) -> Optional[dict[str, bool]]:
         """Read framework skill enable/disable state from WebUI-managed skills.json.
@@ -574,11 +589,10 @@ class UserMemoryPlugin(BasePlugin):
 
         skills = self.skill_router.reload()
         any_with_resources = False
-        for skill in skills:
-            if skill.name not in self._disabled_skills:
-                self._register_skill_tool(skill)
-                if skill.has_resources():
-                    any_with_resources = True
+        for skill in self._filter_enabled_skills(skills):
+            self._register_skill_tool(skill)
+            if skill.has_resources():
+                any_with_resources = True
         self._command_map = self.skill_router.get_commands(enabled_only=set(self._registered_skill_names))
 
         if any_with_resources and not self._resource_tool_registered:

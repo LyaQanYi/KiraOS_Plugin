@@ -66,10 +66,15 @@ class MemoryExtractor:
         # 上游的 hippocampus_process 会 re-buffer 回 pending 等下次触发）。
         self.llm_chat_timeout: float = float(llm_chat_timeout)
 
-        # Backward compatibility: if llm_client is provided, use it for both
+        # Backward compatibility: the pre-split signature was
+        # `MemoryExtractor(tree_store, llm_client)`, where one client served both
+        # roles. A lone second argument (positional or via the llm_client kwarg)
+        # keeps that meaning — otherwise reflection would silently go unwired.
         if llm_client is not None:
             extraction_client = extraction_client or llm_client
             reflection_client = reflection_client or llm_client
+        elif extraction_client is not None and reflection_client is None:
+            reflection_client = extraction_client
 
         self._extraction_client = extraction_client  # for extract_*, _check_conflict, merge_facts
         self._reflection_client = reflection_client  # for generate_reflections, profile compact (future)
