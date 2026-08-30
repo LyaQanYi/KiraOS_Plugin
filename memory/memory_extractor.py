@@ -532,10 +532,10 @@ class MemoryExtractor:
             matched.importance = max(importance, matched.importance)
             matched.meta["last_accessed"] = time.time()
 
-            # 合并 tags
+            # 合并 tags（丢掉 LLM 可能吐出的 null / 非字符串项）
             existing_tags = set(matched.tags)
             existing_tags.update(tags)
-            matched.tags = list(existing_tags)
+            matched.tags = sorted(t for t in existing_tags if isinstance(t, str) and t.strip())
 
             if await self.tree_store.update_memory(matched):
                 logger.info(f"Memory merged: id={matched.id}")

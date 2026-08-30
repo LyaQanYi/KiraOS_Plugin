@@ -327,13 +327,16 @@ class MemoryIndex:
         if not last_accessed:
             last_accessed = now
 
-        tags_json = json.dumps(tags or [], ensure_ascii=False)
+        # 标签规整：LLM 提取出的数组里可能混进 null / 数字，直接喂给
+        # json.dumps 能过，但 " ".join 会抛 TypeError 把整条写入打掉。
+        tags = [t for t in (tags or []) if isinstance(t, str) and t.strip()]
+        tags_json = json.dumps(tags, ensure_ascii=False)
         source_json = json.dumps(source or {}, ensure_ascii=False)
         chash = self.content_hash(raw_text)
 
         # jieba 分词后存入 FTS（确保中文可检索）
         segmented_text = self._segment_for_fts(raw_text)
-        tags_flat = " ".join(tags or [])
+        tags_flat = " ".join(tags)
 
         with self._transaction() as cur:
             cur.execute("""
@@ -925,6 +928,7 @@ class MemoryIndex:
                 folder = rec.get("folder", "facts")
                 base_dir = rec.get("base_dir", "")
                 tags = rec.get("tags", [])
+                tags = [t for t in (tags or []) if isinstance(t, str) and t.strip()]
                 tags_json = json.dumps(tags, ensure_ascii=False)
                 source_json = json.dumps(rec.get("source", {}), ensure_ascii=False)
                 raw_text = rec.get("raw_text", "")

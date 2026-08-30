@@ -987,9 +987,14 @@ class TomlTreeStore:
 
     @classmethod
     def _sync_write_toml(cls, memory: Memory):
-        """写入 TOML 文件（人类可读内容，无运行时 meta）；原子替换。"""
+        """写入 TOML 文件（人类可读内容，无运行时 meta）；原子替换。
+
+        走 `_clean_for_toml` 剥掉 None —— LLM 提取出的 tags/source 里混进
+        `null` 时，`tomli_w.dumps` 会抛 "Object of type 'NoneType' is not TOML
+        serializable"，让整条 update_memory 返回 False（合并静默失败）。
+        """
         fpath = memory.file_path
-        data = memory.to_toml_dict()
+        data = _clean_for_toml(memory.to_toml_dict())
         cls._atomic_write_bytes(fpath, tomli_w.dumps(data).encode("utf-8"))
 
     @staticmethod

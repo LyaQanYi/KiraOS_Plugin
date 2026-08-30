@@ -169,6 +169,40 @@ def test_content_hash_dedup(store):
     _run(run())
 
 
+def test_update_memory_survives_null_tags_from_llm(store):
+    """A null in the tags array must not break the merge write path.
+
+    The hippocampus merge path unions LLM-extracted tags into the matched
+    memory. An LLM that emits `null` inside that array used to blow up both
+    writers -- tomli_w on the TOML side, `" ".join` on the index side -- so
+    update_memory returned False and the merge was silently lost.
+    """
+    async def run():
+        mem = await store.add_memory(
+            content_text="周武住在杭州",
+            memory_type="fact",
+            importance=6,
+            tags=["location"],
+            entity_id="qq:769690776",
+            entity_type="user",
+            folder="facts",
+        )
+
+        mem.text = "周武住在杭州，最近搬到了西湖区"
+        mem.tags = ["location", None, "", "city"]
+
+        assert await store.update_memory(mem) is True
+
+        reread = await store.get_memory(
+            mem.id, "qq:769690776", "user", "facts"
+        )
+        assert reread is not None
+        assert reread.text == "周武住在杭州，最近搬到了西湖区"
+        assert None not in reread.tags
+
+    _run(run())
+
+
 def test_content_hash_is_namespaced_per_entity(store):
     """The same sentence about two different people is two memories."""
     async def run():
