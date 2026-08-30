@@ -189,7 +189,7 @@ def test_update_memory_survives_null_tags_from_llm(store):
         )
 
         mem.text = "周武住在杭州，最近搬到了西湖区"
-        mem.tags = ["location", None, "", "city"]
+        mem.tags = ["location", None, "", "  ", 42, "city"]
 
         assert await store.update_memory(mem) is True
 
@@ -198,7 +198,45 @@ def test_update_memory_survives_null_tags_from_llm(store):
         )
         assert reread is not None
         assert reread.text == "周武住在杭州，最近搬到了西湖区"
-        assert None not in reread.tags
+        # 规整只过滤、不排序，原有顺序保留。
+        assert reread.tags == ["location", "city"]
+
+    _run(run())
+
+
+def test_toml_and_index_agree_on_normalized_tags(store):
+    """The TOML file and the SQLite index must store the same tag set.
+
+    `_clean_for_toml` only drops None, so an empty-string tag used to survive
+    into the TOML while `MemoryIndex.upsert()` filtered it out. That left the
+    two writers disagreeing about one memory's tags, and rebuilding the index
+    from the TOML shifted the set a second time.
+    """
+    async def run():
+        mem = await store.add_memory(
+            content_text="周武喜欢西湖",
+            memory_type="fact",
+            importance=6,
+            tags=["place"],
+            entity_id="qq:769690776",
+            entity_type="user",
+            folder="facts",
+        )
+
+        mem.tags = ["place", "", None, "lake"]
+        assert await store.update_memory(mem) is True
+
+        raw = TomlTreeStore._sync_read_toml(mem.file_path)
+        assert raw["tags"] == ["place", "lake"]
+
+        indexed = store.index.get_meta(
+            mem.id,
+            entity_id="qq:769690776",
+            entity_type="user",
+            folder="facts",
+        )
+        assert indexed is not None
+        assert sorted(indexed["tags"]) == ["lake", "place"]
 
     _run(run())
 

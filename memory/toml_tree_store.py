@@ -45,7 +45,7 @@ from .memory_paths import (
     get_entity_folder,
     ensure_entity_dirs,
 )
-from .memory_index import MemoryIndex
+from .memory_index import MemoryIndex, normalize_tags
 
 logger = get_logger("kiraos_toml_tree_store", "green")
 
@@ -989,12 +989,19 @@ class TomlTreeStore:
     def _sync_write_toml(cls, memory: Memory):
         """写入 TOML 文件（人类可读内容，无运行时 meta）；原子替换。
 
-        走 `_clean_for_toml` 剥掉 None —— LLM 提取出的 tags/source 里混进
-        `null` 时，`tomli_w.dumps` 会抛 "Object of type 'NoneType' is not TOML
+        tags 走 `normalize_tags` —— 和 `MemoryIndex.upsert()` 共用同一份规则。
+        只靠 `_clean_for_toml` 剥 None 的话，`""` / 纯空白 tag 会留在 TOML 里
+        而索引侧会丢掉，同一次 update_memory 在两边存出不同的 tag 集合，读取
+        或重建索引后结果还会再变一次。
+
+        `_clean_for_toml` 仍然保留：它负责 source 等其它字段里的 None，
+        `tomli_w.dumps` 遇到 None 会抛 "Object of type 'NoneType' is not TOML
         serializable"，让整条 update_memory 返回 False（合并静默失败）。
         """
         fpath = memory.file_path
-        data = _clean_for_toml(memory.to_toml_dict())
+        data = memory.to_toml_dict()
+        data["tags"] = normalize_tags(data.get("tags"))
+        data = _clean_for_toml(data)
         cls._atomic_write_bytes(fpath, tomli_w.dumps(data).encode("utf-8"))
 
     @staticmethod
