@@ -379,7 +379,10 @@ class MemoryExtractor:
                 if slug and len(slug) <= 40:
                     return slug
         except Exception as e:
-            logger.debug(f"Semantic ID generation failed: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Semantic ID generation timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
+            else:
+                logger.debug(f"Semantic ID generation failed: {type(e).__name__}: {e}")
         return ""
 
     # ==========================================
@@ -463,7 +466,10 @@ class MemoryExtractor:
                 if result in ("duplicate", "update", "new"):
                     return result
         except Exception as e:
-            logger.error(f"Conflict check error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Conflict check timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
+            else:
+                logger.error("Conflict check error: %s: %s", type(e).__name__, e)
         return "new"
 
     # ==========================================
@@ -491,7 +497,10 @@ class MemoryExtractor:
             if resp:
                 return resp.strip()
         except Exception as e:
-            logger.error(f"Merge facts error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Merge facts timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
+            else:
+                logger.error("Merge facts error: %s: %s", type(e).__name__, e)
         return f"{existing_text}；{new_text}"
 
     # ==========================================
@@ -692,7 +701,10 @@ class MemoryExtractor:
                 )
 
         except Exception as e:
-            logger.error(f"Reflection generation error: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Reflection generation timed out after %ds; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
+            else:
+                logger.error("Reflection generation error: %s: %s", type(e).__name__, e)
 
         return generated
 
