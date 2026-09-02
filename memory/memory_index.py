@@ -30,6 +30,28 @@ from .memory_paths import get_index_db_path, _path_segment_to_id
 
 logger = get_logger("kiraos_memory_index", "green")
 
+
+def normalize_tags(tags) -> list[str]:
+    """把任意来源的 tags 规整为 list[str]（去掉 null / 非字符串 / 空白项）。
+
+    三个写入路径共用这一份规则，避免 TOML 与 SQLite 各写一套导致同一条
+    memory 在两侧存出不同的 tag 集合：
+
+    - `MemoryIndex.upsert()` —— LLM 提取出的数组可能混进 `null`/数字，
+      `json.dumps` 能过但 `" ".join` 会抛 TypeError 打掉整条写入。
+    - `MemoryIndex.rebuild_from_filesystem()` —— 直接吃手工编辑过的 TOML
+      原值，不经过 `Memory.from_toml_dict()` 的类型回退。
+    - `TomlTreeStore._sync_write_toml()` —— 只剥 None 的话 `""` 会留在
+      TOML 里，而索引侧会丢掉它，重建索引后 tag 集合再次漂移。
+
+    非 list 容器（字符串会被逐字符迭代、dict 会被迭代成 key）整体视为空，
+    这类值本身就是坏数据，逐字符拆开只会写进更多垃圾 tag。
+    """
+    if not isinstance(tags, list):
+        return []
+    return [t for t in tags if isinstance(t, str) and t.strip()]
+
+
 # jieba 是中文分词的最佳选择，但不应该作为插件加载的硬依赖。
 # 没装的话，降级为按字符切分 + ASCII whitespace —— FTS5 仍可工作，
 # 只是中文查准率会差一些。运行时会打一次明显的 warning 提醒。
@@ -327,13 +349,14 @@ class MemoryIndex:
         if not last_accessed:
             last_accessed = now
 
-        tags_json = json.dumps(tags or [], ensure_ascii=False)
+        tags = normalize_tags(tags)
+        tags_json = json.dumps(tags, ensure_ascii=False)
         source_json = json.dumps(source or {}, ensure_ascii=False)
         chash = self.content_hash(raw_text)
 
         # jieba 分词后存入 FTS（确保中文可检索）
         segmented_text = self._segment_for_fts(raw_text)
-        tags_flat = " ".join(tags or [])
+        tags_flat = " ".join(tags)
 
         with self._transaction() as cur:
             cur.execute("""
@@ -924,7 +947,7 @@ class MemoryIndex:
                 entity_type = rec.get("entity_type", "")
                 folder = rec.get("folder", "facts")
                 base_dir = rec.get("base_dir", "")
-                tags = rec.get("tags", [])
+                tags = normalize_tags(rec.get("tags", []))
                 tags_json = json.dumps(tags, ensure_ascii=False)
                 source_json = json.dumps(rec.get("source", {}), ensure_ascii=False)
                 raw_text = rec.get("raw_text", "")

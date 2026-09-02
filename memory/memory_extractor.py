@@ -22,7 +22,7 @@ from typing import Optional
 
 from core.logging_manager import get_logger
 from .toml_tree_store import TomlTreeStore, Memory
-from .memory_index import MemoryIndex
+from .memory_index import MemoryIndex, normalize_tags
 from .llm_adapter import chat_text
 
 logger = get_logger("memory_extractor", "green")
@@ -532,10 +532,13 @@ class MemoryExtractor:
             matched.importance = max(importance, matched.importance)
             matched.meta["last_accessed"] = time.time()
 
-            # 合并 tags
-            existing_tags = set(matched.tags)
-            existing_tags.update(tags)
-            matched.tags = list(existing_tags)
+            # 合并 tags —— 两边都先规整再做集合运算。`set()` 吃到 TOML 里
+            # 手工写进去的 dict/list 会抛 unhashable TypeError，而这个循环
+            # 外面只有 hippocampus_process 的一个大 try，异常会把本批剩余
+            # facts 连同升维、画像更新一起吞掉，不是只丢一个 tag。
+            existing_tags = set(normalize_tags(matched.tags))
+            existing_tags.update(normalize_tags(tags))
+            matched.tags = sorted(existing_tags)
 
             if await self.tree_store.update_memory(matched):
                 logger.info(f"Memory merged: id={matched.id}")
