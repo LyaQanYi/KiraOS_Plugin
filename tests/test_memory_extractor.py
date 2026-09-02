@@ -32,7 +32,11 @@ from plugins.KiraOS_Plugin.memory.toml_tree_store import TomlTreeStore
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class FakeLLMClient:
@@ -177,3 +181,93 @@ def test_every_llm_path_degrades_when_no_client_is_wired(extractor):
     assert _run(extractor.generate_semantic_id("内容")) == ""
     assert _run(extractor._check_conflict("新", "旧")) == "new"
     assert _run(extractor.merge_facts("旧文本", "新文本")) == "旧文本；新文本"
+
+
+# ── provider exceptions reach handlers and name the operation ────────────────
+
+class ProviderBoom:
+    """Simulates provider API failures (500, rate limit, auth, network)."""
+    async def chat(self, req):
+        raise RuntimeError("provider 500: upstream unavailable")
+
+
+def test_extraction_provider_error_names_the_operation(extractor, caplog):
+    """Personal fact extraction logs operation name on provider failure."""
+    extractor.set_extraction_client(ProviderBoom())
+
+    with caplog.at_level(logging.ERROR):
+        result = _run(extractor.extract_personal_facts("对话"))
+
+    assert result == []
+    assert "Personal fact extraction error: RuntimeError" in caplog.text
+    assert "provider 500" in caplog.text
+
+
+def test_group_extraction_provider_error_names_the_operation(extractor, caplog):
+    """Group fact extraction logs operation name on provider failure."""
+    extractor.set_extraction_client(ProviderBoom())
+
+    with caplog.at_level(logging.ERROR):
+        result = _run(extractor.extract_group_facts("对话"))
+
+    assert result == []
+    assert "Group fact extraction error: RuntimeError" in caplog.text
+    assert "provider 500" in caplog.text
+
+
+def test_dedup_provider_error_names_the_operation(extractor, caplog):
+    """Conflict check logs operation name on provider failure."""
+    extractor.set_extraction_client(ProviderBoom())
+
+    with caplog.at_level(logging.ERROR):
+        result = _run(extractor._check_conflict("新", "旧"))
+
+    assert result == "new"
+    assert "Conflict check error: RuntimeError" in caplog.text
+    assert "provider 500" in caplog.text
+
+
+def test_merge_provider_error_names_the_operation(extractor, caplog):
+    """Merge facts logs operation name on provider failure."""
+    extractor.set_extraction_client(ProviderBoom())
+
+    with caplog.at_level(logging.ERROR):
+        result = _run(extractor.merge_facts("旧", "新"))
+
+    assert result == "旧；新"
+    assert "Merge facts error: RuntimeError" in caplog.text
+    assert "provider 500" in caplog.text
+
+
+def test_reflection_provider_error_names_the_operation(extractor, caplog):
+    """Reflection generation logs operation name on provider failure."""
+    # Insert 5 facts (threshold) so generate_reflections actually calls the LLM
+    for i in range(5):
+        _run(extractor.tree_store.add_memory(
+            content_text=f"周武喜欢事实{i}",
+            memory_type="fact",
+            importance=5,
+            semantic_id=f"fact_{i}",
+            entity_id="qq:1",
+            entity_type="user"
+        ))
+    extractor.set_reflection_client(ProviderBoom())
+
+    with caplog.at_level(logging.ERROR):
+        result = _run(extractor.generate_reflections("qq:1", "user"))
+
+    assert result == []
+    assert "Reflection generation error: RuntimeError" in caplog.text
+    assert "provider 500" in caplog.text
+
+
+def test_semantic_id_provider_error_falls_back_silently(extractor, caplog):
+    """Semantic ID generation degrades to empty (caller derives hash id)."""
+    extractor.set_extraction_client(ProviderBoom())
+
+    with caplog.at_level(logging.DEBUG):
+        result = _run(extractor.generate_semantic_id("内容"))
+
+    assert result == ""
+    assert "Semantic ID generation failed: RuntimeError" in caplog.text
+    assert "provider 500" in caplog.text

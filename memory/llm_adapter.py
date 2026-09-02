@@ -26,7 +26,12 @@ async def chat_text(
 ) -> str:
     """Call an LLMModelClient with a single user prompt, return the text response.
 
-    Returns empty string on failure.
+    Returns `""` when no client is wired. Provider exceptions propagate to the
+    caller: every call site sits inside an `asyncio.wait_for(...)` with its own
+    `except` that names the operation ("Merge facts", "Reflection generation",
+    ...) and degrades accordingly. Swallowing them here collapsed all eight
+    operations into one anonymous `chat_text failed:` line and made those
+    handlers' non-timeout branches unreachable.
     """
     if client is None:
         logger.warning("chat_text called with client=None")
@@ -38,11 +43,7 @@ async def chat_text(
     messages.append({"role": "user", "content": prompt})
 
     req = LLMRequest(messages=messages)
-    try:
-        resp = await client.chat(req)
-    except Exception as e:
-        logger.error(f"chat_text failed: {e}")
-        return ""
+    resp = await client.chat(req)
 
     text = getattr(resp, "text_response", "") or ""
     return text.strip()
