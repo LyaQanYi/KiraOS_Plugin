@@ -52,7 +52,7 @@ from .memory_paths import (
     ENTITY_GROUP,
     ENTITY_CHANNEL,
 )
-from .entity_profile import EntityProfileStore
+from .entity_profile import EntityProfile, EntityProfileStore
 from .memory_index import MemoryIndex, normalize_tags
 from .toml_tree_store import TomlTreeStore
 
@@ -115,7 +115,10 @@ async def migrate_hippocampus_if_needed(
     profiles: Dict[str, dict] = manifest["profiles"]
 
     hippo_meta = _HippoMeta(hippo_root)
-    deleted_entities = _load_deleted_entities(manifest["since"])
+    deleted_entities = _load_deleted_entities(manifest["since"]) | {
+        tuple(e) for e in manifest["deleted_entities"]
+    }
+    manifest["deleted_entities"] = sorted(list(e) for e in deleted_entities)
 
     # === 1. Entity profiles ===
     for profile_json, entity_type, entity_id in _iter_profiles(hippo_root):
@@ -161,13 +164,17 @@ async def migrate_hippocampus_if_needed(
 
     # === 4. Failure gate ===
     # Re-runs report already-reconciled memories as up_to_date, not as failures.
-    # Only "source has memories, nothing was ever reconciled, and this run hit
-    # errors" means the data did not land — then keep the old plugin enabled
-    # and write no manifest, so the next launch retries from scratch.
+    # Only "source has data, nothing was ever reconciled, and this run hit
+    # errors or unreadable files" means the data did not land — then keep the
+    # old plugin enabled and write no manifest, so the next launch retries.
     owned = sum(1 for r in processed.values() if r.get("state") in _OK_STATES)
     owned_profiles = sum(1 for r in profiles.values() if r.get("state") != _ST_INVALID)
     landed = owned if total_memories else owned_profiles
-    if counts["errors"] and landed == 0:
+    invalid = any(
+        r.get("state") == _ST_INVALID
+        for r in (*processed.values(), *profiles.values())
+    )
+    if landed == 0 and (counts["errors"] or invalid):
         logger.error(
             f"Hippocampus reconcile could not import any of {total_memories} source "
             "memories (or profiles) — leaving the hippocampus plugin ENABLED and NOT writing the "
@@ -216,6 +223,9 @@ def _new_manifest(*, plugin_disabled: bool, since: Optional[float] = None) -> di
         "plugin_disabled": plugin_disabled,
         "processed": {},  # rel path → per-memory record
         "profiles": {},  # rel path → per-profile record
+        # [entity_type, entity_id] deleted from the WebUI. Kept here so the
+        # tombstone outlives the archive dir it was first seen in.
+        "deleted_entities": [],
     }
 
 
@@ -227,38 +237,57 @@ def _load_manifest(marker_path: Path) -> Optional[dict]:
     Neither recorded which files were imported, so every source file is
     reconciled again — matching against what is already in KiraOS rather than
     re-adding it.
+
+    Raises if the marker exists but cannot be read or understood. Treating it
+    as a 4.0.x marker would drop every tombstone and `since`, and the rewrite
+    at the end of the run would make that permanent; the caller skips this
+    launch's reconcile instead and the marker is left as it is.
     """
     if not marker_path.exists():
         return None
     try:
         content = marker_path.read_text(encoding="utf-8").strip()
         mtime = marker_path.stat().st_mtime
-    except Exception as e:
-        logger.warning(f"Unreadable {marker_path}, treating as 4.0.x marker: {e}")
-        content, mtime = "{}", time.time()
+    except (OSError, UnicodeDecodeError) as e:
+        raise RuntimeError(f"cannot read hippocampus manifest {marker_path}: {e}") from e
 
     if not content:
         return _new_manifest(plugin_disabled=False)
 
     try:
         data = json.loads(content)
-    except Exception:
-        data = None
-    if isinstance(data, dict) and data.get("version") == _MANIFEST_VERSION:
-        manifest = _new_manifest(plugin_disabled=bool(data.get("plugin_disabled")))
-        since = data.get("since")
-        manifest["since"] = since if _is_number(since) else None
-        for key in ("processed", "profiles"):
-            records = data.get(key)
-            if isinstance(records, dict):
-                manifest[key] = {
-                    k: v for k, v in records.items()
-                    if isinstance(k, str) and isinstance(v, dict)
-                }
-        return manifest
+    except ValueError as e:
+        # 4.0.x only ever wrote "" or a JSON stats dict, so this is a damaged v2.
+        raise RuntimeError(f"corrupt hippocampus manifest {marker_path}: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unrecognised hippocampus manifest {marker_path}")
 
-    # 4.0.x stats marker: an import ran at `mtime` and the plugin was disabled.
-    return _new_manifest(plugin_disabled=True, since=mtime)
+    if "version" not in data:
+        # 4.0.x stats marker: an import ran at `mtime` and the plugin was disabled.
+        return _new_manifest(plugin_disabled=True, since=mtime)
+    if data["version"] != _MANIFEST_VERSION:
+        raise RuntimeError(
+            f"unsupported hippocampus manifest version {data['version']!r} in {marker_path}"
+        )
+
+    manifest = _new_manifest(plugin_disabled=bool(data.get("plugin_disabled")))
+    since = data.get("since")
+    manifest["since"] = since if _is_number(since) else None
+    for key in ("processed", "profiles"):
+        records = data.get(key)
+        if isinstance(records, dict):
+            manifest[key] = {
+                k: v for k, v in records.items()
+                if isinstance(k, str) and isinstance(v, dict)
+            }
+    entities = data.get("deleted_entities")
+    if isinstance(entities, list):
+        manifest["deleted_entities"] = [
+            [e[0], e[1]] for e in entities
+            if isinstance(e, list) and len(e) == 2
+            and all(isinstance(x, str) for x in e)
+        ]
+    return manifest
 
 
 def _write_manifest(marker_path: Path, manifest: dict) -> None:
@@ -640,10 +669,11 @@ async def _reconcile_profile(
     Re-merged whenever the source file changes. Raises (→ retried next launch)
     if the merged profile could not be saved.
     """
-    if (entity_type, entity_id) in deleted:
-        return False
     raw = profile_json.read_bytes()
     file_hash = _file_hash(raw)
+    if (entity_type, entity_id) in deleted:
+        profiles[rel] = {"hash": file_hash, "state": _ST_ENTITY_DELETED}
+        return False
     if profiles.get(rel, {}).get("hash") == file_hash:
         return False
     try:
@@ -656,10 +686,14 @@ async def _reconcile_profile(
         return False
 
     # `get_profile` hands back an in-memory default when the KiraOS file exists
-    # but cannot be parsed; saving that would wipe the user's profile.
+    # but cannot be loaded; saving that would wipe the user's profile. Check it
+    # the same way `get_profile` loads it, and raise (→ retried next launch).
     target = Path(get_entity_profile_path(entity_id, entity_type))
     if target.exists():
-        json.loads(target.read_text(encoding="utf-8"))
+        existing = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            raise ValueError(f"KiraOS profile {target} is not a JSON object")
+        EntityProfile.from_dict(existing)
 
     # Not `update_profile`: it stamps `last_interaction = now`, which would make
     # every migrated entity look active today.
@@ -795,10 +829,12 @@ async def _reconcile_memory(
         return _SKIPPED, record
     raw = path.read_bytes()
     file_hash = _file_hash(raw)
-    if record and record.get("hash") == file_hash:
-        return (_UP_TO_DATE if state in _OK_STATES else _SKIPPED), record
+    # Before the unchanged-file shortcut: an entity deleted after its import
+    # tombstones every file of it, changed or not.
     if entity_type and (entity_type, entity_id) in deleted:
         return _SKIPPED, {"state": _ST_ENTITY_DELETED, "hash": file_hash}
+    if record and record.get("hash") == file_hash:
+        return (_UP_TO_DATE if state in _OK_STATES else _SKIPPED), record
     src = _read_source(path, folder, raw)
     if src is None:
         return _SKIPPED, {"state": _ST_INVALID, "hash": file_hash}
@@ -813,18 +849,25 @@ async def _reconcile_memory(
             gone = _ST_ARCHIVED if _archived(ns, src) else _ST_DELETED
             return _SKIPPED, {**record, "state": gone, "hash": file_hash}
         changed = False
-        if (MemoryIndex.content_hash(mem.text) == record.get("text_hash")
-                and mem.text != src.text):
-            # Untouched in KiraOS since the import: take the hippocampus edit.
-            # Otherwise KiraOS's own edit wins and only meta is merged.
+        # `text_hash` is the text we last wrote. Untouched in KiraOS since then:
+        # take the hippocampus edit. Otherwise KiraOS's own edit wins, only meta
+        # is merged, and the baseline is kept so later source edits lose too.
+        untouched = MemoryIndex.content_hash(mem.text) == record.get("text_hash")
+        if untouched and mem.text != src.text:
             mem.text, mem.type, mem.importance = src.text, src.type, src.importance
             mem.tags = _union(mem.tags, src.tags)
+            if isinstance(mem.meta, dict):
+                mem.meta["importance"] = mem.importance
+                mem.meta["tags"] = mem.tags
             changed = True
         merged = _merged_meta((mem.timestamp, mem.last_accessed, mem.access_count), meta)
+        new_record = _record(_ST_MERGED, src, mem)
+        if not untouched:
+            new_record["text_hash"] = record.get("text_hash")
         if not changed and merged is None:
-            return _UP_TO_DATE, _record(_ST_MERGED, src, mem)
+            return _UP_TO_DATE, new_record
         await _write(tree_store, mem, merged)
-        return _ST_MERGED, _record(_ST_MERGED, src, mem)
+        return _ST_MERGED, new_record
 
     # Not recorded yet: first run, an upgrade from the 4.0.x one-shot import,
     # or a file that appeared in hippocampus after an earlier run.

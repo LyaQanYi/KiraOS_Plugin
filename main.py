@@ -193,6 +193,8 @@ class UserMemoryPlugin(BasePlugin):
             max_memory_length=self._max_memory_length,
             hippocampus_threshold=self._hippocampus_threshold,
             llm_chat_timeout=self._llm_chat_timeout,
+            profile_compact_threshold=self._profile_compact_threshold,
+            profile_compact_max_chars=self._profile_compact_max_chars,
         )
         await self.memory_manager.async_init()
 

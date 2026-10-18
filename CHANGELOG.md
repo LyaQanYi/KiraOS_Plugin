@@ -24,11 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memories are added, without duplicates. A plugin the user re-enabled is not disabled again.
 - **Nothing deleted in KiraOS comes back.** Memories deleted or archived in KiraOS after an import,
   and entities deleted from the WebUI, are recorded as tombstones and never re-imported, even if
-  the hippocampus file changes later.
+  the hippocampus file changes later. Deleted entities are kept in the manifest
+  (`deleted_entities`), so the tombstone survives purging `archive/_full_entities/`, and every file
+  of the entity is tombstoned, changed or not. One exception: a 4.0.x import whose KiraOS TOML was
+  removed by hand (WebUI and `memory_remove` archive instead) is re-imported on upgrade, because the
+  4.0.x marker has no per-file record.
 - Hippocampus edits to an already-imported memory are applied only if KiraOS hasn't edited it
-  since. Otherwise KiraOS's text wins and only meta is merged.
+  since. Otherwise KiraOS's text wins and only meta is merged, on that and every later source edit.
+  An accepted edit also updates `importance` / `tags` in the runtime meta.
 - Profiles are re-merged when the hippocampus `profile.json` changes. A KiraOS profile file that
-  can't be parsed is never overwritten.
+  can't be parsed or loaded (e.g. no `entity_id`) is never overwritten.
+- A manifest that can't be read, isn't valid JSON or has an unknown version is left untouched and
+  this launch's reconcile is skipped, instead of being replaced by an empty one that loses every
+  tombstone.
+- If source data exists but nothing landed because every file was unreadable, the hippocampus
+  plugin stays enabled and no manifest is written (previously only store errors counted).
 - Meta is still found when the data root has moved (hippocampus `file_path` is absolute).
 - The hippocampus tree stays byte-identical. Its index is opened with SQLite `immutable` when
   there is no live WAL, so no `-shm` / `-wal` files are created next to it.
@@ -38,6 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these memories never decayed. It now uses the logical namespace, covers `facts` and
   `reflections`, and archives (instead of hard-deleting) like the entity scopes, so a forgotten
   memory is recoverable and the migration doesn't re-import it.
+- **Merged memories no longer grow without bound.** In a LoCoMo run a few generic memories
+  (e.g. "群聊氛围友善") grew to 10-17KB because every merge kept "all useful information" and
+  the fallback concatenated without a limit. Ported from kira_plugin_hippocampus_memory:
+  - `merge_facts` asks for a single statement under 40 characters and clips the result to
+    `_MERGE_MAX_CHARS` (200). The `；` fallback keeps the newest text and stays within the cap.
+  - A new reflection is now checked with `_check_conflict` before touching an existing one.
+    `duplicate` keeps the old reflection, `new` writes a separate one, and only `update` merges.
+    Previously any FTS hit was merged unconditionally.
+  - Merged tags are capped at `_MERGE_MAX_TAGS` (20). Each merge used to add the new tags to the
+    old set with no limit; the same LoCoMo run had a memory with 136 tags. New tags win the
+    budget, and a memory already over the cap is trimmed on its next merge.
+- **Profile compaction now runs.** `profile_compact_threshold` and `profile_compact_max_chars`
+  were already in the schema but nothing read them. A profile whose facts reach the count or
+  character threshold is now compacted by the reflection model into at most 11 tagged short
+  facts (`[基本信息]`, `[性格]`, ...), after each fact write and in `run_forgetting_cycle`.
+  Untagged or empty LLM output leaves the profile unchanged. Facts added concurrently are kept,
+  and a fact removed meanwhile aborts the write. The sweep never creates `profile.json`.
 
 ### Changed
 
@@ -48,14 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hippocampus `archive/` is copied incrementally into KiraOS `archive/hippocampus/` and never
   overwrites existing files.
 - The startup log now includes `global_self`, `skills` and `merged` counts.
-- Migration tests: 14 → 29, covering the 4.0.x upgrade paths, tombstones, slug collisions,
+- Migration tests: 14 → 36, covering the 4.0.x upgrade paths, tombstones, slug collisions,
   cross-entity same text, legacy JSON, entity skills and a relocated data root.
+- New `tests/test_memory_growth_bounds.py` (18 tests) for the merge cap, reflection gating and
+  profile compaction.
 
 ### Behavior change
 
 - Because of the decay fix, stale low-importance `global/self` memories become eligible for
   archiving for the first time, once `run_forgetting_cycle` is triggered. Archived files go to
-  `archive/global_self__{folder}__{id}.toml` and can be restored.
+  `archive/global_self__{folder}__{id}.toml` and can be restored. Memories with
+  `memory_type = "reflection"` are still never archived by decay anywhere: their +0.2 type bonus
+  alone reaches `THRESHOLD_DELETE` (same scoring as hippocampus; unchanged).
 
 ## [4.0.0] - 2026-08-18
 

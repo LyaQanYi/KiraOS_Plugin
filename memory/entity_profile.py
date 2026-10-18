@@ -246,6 +246,40 @@ class EntityProfileStore:
                 profile.facts.append(fact)
                 await self.save_profile(profile)
 
+    async def apply_compacted_facts(
+        self,
+        entity_id: str,
+        entity_type: str,
+        snapshot: list,
+        compacted: list[str],
+    ) -> Optional[EntityProfile]:
+        """原子地写入压实结果，并保留 snapshot 之后并发追加的 facts。
+
+        压实的 LLM 调用可能耗时，期间海马体或 WebUI 可能改动这个画像。整个
+        re-read → merge → save 持有该实体的锁，与 ``add_fact`` /
+        ``update_fact`` 互斥，堵住「re-read 之后、save 之前又有写入」的空窗。
+
+        若画像文件不存在或无法解析，或 snapshot 中任一条在当前 facts 里已
+        缺失（并发删除或原位替换），放弃本次压实并返回 ``None``，避免旧摘要
+        复活过期事实，也绝不覆盖一份读不出来的画像。
+        """
+        fpath = get_entity_profile_path(entity_id, entity_type)
+        async with await self._get_entity_lock(entity_id, entity_type):
+            if not os.path.exists(fpath):
+                return None
+            try:
+                data = await asyncio.to_thread(self._sync_read, fpath)
+                profile = EntityProfile.from_dict(data)
+            except Exception as e:
+                logger.error(f"apply_compacted_facts: unreadable profile {fpath}: {e}")
+                return None
+            if any(f not in profile.facts for f in snapshot):
+                return None
+            appended = [f for f in profile.facts if f not in snapshot]
+            profile.facts = list(compacted) + [f for f in appended if f not in compacted]
+            ok = await self.save_profile(profile)
+            return profile if ok else None
+
     async def update_fact(
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER
     ):

@@ -184,7 +184,7 @@ KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时
 
 写入一条新记忆。会自动做两级去重：
 1. **SHA-256 哈希**：内容完全一致直接跳过
-2. **FTS5 + LLM**：语义近似的会被合并（旧记忆 text 被新文本扩充）
+2. **FTS5 + LLM**：语义近似的会被合并为一条更短的陈述（上限 200 字，不会越合并越长）
 
 `memory_type` 取 `fact`（默认，落在 `facts/`）或 `reflection`（落在 `reflections/`）。
 
@@ -404,14 +404,17 @@ v3 第一次启动时（`auto_migrate_legacy_db: true`，默认开），插件�
 4. 首次成功后在 plugin manager 里禁用 `kira_plugin_hippocampus_memory`（防止双喂），只禁用一次。之后你手动重新启用不会被再次关掉，它新写的记忆会在下次启动时并入
 5. 处理记录写进 `data/memory/.hippocampus_migrated`（v2 manifest，逐文件记录状态）
 
-**不会被导回来的东西**：迁移后在 KiraOS 里删除或归档的记忆、在 WebUI 里删除的实体。即使旧插件那边的文件后来变了，也不会复活。
+**不会被导回来的东西**：迁移后在 KiraOS 里删除或归档的记忆、在 WebUI 里删除的实体（实体级记录在 manifest 里，清空 `archive/` 后也不会复活）。即使旧插件那边的文件后来变了，也不会导回来。KiraOS 里改过的记忆，之后旧插件那边再怎么改都以 KiraOS 的文本为准。
+
+例外：从 4.0.x 升级时，旧 marker 没有逐文件记录。如果你在 4.0.x 期间**手动删掉**了 `data/memory/` 下某条导入记忆的 TOML 文件（而不是用 WebUI / `memory_remove`，它们走归档），升级后它会被重新导入。
 
 **从 4.0.0 / 4.0.1-beta.1 升级**：旧版的一次性迁移漏掉了 `global/self`、skills、跨实体同文本的记忆，很多记忆的 meta 也被重置成了"刚创建"。升级后第一次启动会自动补齐并修复，不需要手动操作。
 
 **迁移后 Hippocampus 插件会发生什么？**
 - 旧数据保留在 `data/plugin_data/kira_plugin_hippocampus_memory/` 不变（只读，rollback 用）
 - 插件在当前 KiraAI 实例里被自动禁用（可在 WebUI 插件管理里看到）
-- 如果一条记忆都没能导入，旧插件保持启用、不写 manifest，下次启动重试
+- 如果一条记忆都没能导入（写入失败或源文件全部无法解析），旧插件保持启用、不写 manifest，下次启动重试
+- manifest 损坏或版本不认识时，本次启动跳过对账并在日志里报错，manifest 原样保留，不会被空的覆盖掉
 
 **Hippocampus 独有功能的迁移状态**：
 - ✅ **TOML + SQLite 双存储** — 完全一致

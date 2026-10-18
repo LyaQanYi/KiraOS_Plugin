@@ -824,6 +824,105 @@ async def _co_test_relocated_data_root_meta_restored(migration_env):
     assert (time.time() - refl.timestamp) / 86400 > 25
 
 
+# ── PR #24 review regressions ────────────────────────────────────────────────
+
+
+async def _co_test_kiraos_edit_survives_repeated_source_edits(migration_env):
+    """A KiraOS edit must keep winning, not only on the first source edit."""
+    await _run(migration_env)
+    store = migration_env["store"]
+    mem = await store.get_memory("hates_css", _ENTITY_ID, _ENTITY_TYPE, "facts")
+    mem.text = "用户其实还是写了 CSS"
+    assert await store.update_memory(mem)
+
+    src = migration_env["hippo_root"] / "entities" / _ENTITY_DIR / "facts" / "hates_css.toml"
+    for text in ("第一次改", "第二次改", "第三次改"):
+        src.write_text(f'id="hates_css"\ntext="{text}"\nimportance=8\ntags=[]',
+                       encoding="utf-8")
+        result, _ = await _run(migration_env)
+        assert result["errors"] == 0
+        after = await store.get_memory("hates_css", _ENTITY_ID, _ENTITY_TYPE, "facts")
+        assert after.text == "用户其实还是写了 CSS", text
+
+
+async def _co_test_all_sources_unreadable_no_disable(migration_env):
+    """Every source file unreadable: nothing landed, so hippocampus stays
+    enabled and no manifest is written (retried next launch)."""
+    hippo = migration_env["hippo_root"]
+    for path in hippo.rglob("*.toml"):
+        path.write_text('id = "x"\ntext = "unterminated', encoding="utf-8")
+    (hippo / "entities" / _ENTITY_DIR / "profile.json").write_text("{nope", encoding="utf-8")
+
+    result, ctx = await _run(migration_env)
+    assert result["migrated"] is False
+    assert result.get("failed") is True
+    assert ctx.plugin_mgr.calls == []
+    assert not _marker(migration_env).exists()
+
+
+async def _co_test_entity_tombstone_is_entity_wide_and_persisted(migration_env):
+    """Unchanged files of a deleted entity are tombstoned too, and the entity
+    itself is remembered: once the archive dir is gone, a new source file or a
+    changed profile still does not recreate it."""
+    await _run(migration_env)
+    memory_root = migration_env["data_root"] / "memory"
+    archive = memory_root / "archive" / "_full_entities"
+    archive.mkdir(parents=True, exist_ok=True)
+    shutil.move(
+        str(memory_root / "entities" / _ENTITY_DIR),
+        str(archive / f"{_ENTITY_DIR}_{int(time.time())}"),
+    )
+
+    await _run(migration_env)  # source unchanged
+    manifest = _manifest(migration_env)
+    assert manifest["processed"][_HATES_CSS_REL]["state"] == "entity_deleted"
+    assert manifest["profiles"][f"entities/{_ENTITY_DIR}/profile.json"]["state"] == "entity_deleted"
+    assert [_ENTITY_TYPE, _ENTITY_ID] in manifest["deleted_entities"]
+
+    shutil.rmtree(archive)
+    hippo_ent = migration_env["hippo_root"] / "entities" / _ENTITY_DIR
+    _write_toml(hippo_ent / "facts" / "late_fact.toml", mem_id="late_fact", mem_type="fact",
+                text="归档清空后才出现的事实", importance=5, tags=[])
+    profile = json.loads((hippo_ent / "profile.json").read_text(encoding="utf-8"))
+    profile["facts"].append("新画像事实")
+    (hippo_ent / "profile.json").write_text(json.dumps(profile, ensure_ascii=False),
+                                            encoding="utf-8")
+
+    third, _ = await _run(migration_env)
+    assert third["facts"] == 0 and third["entities"] == 0
+    assert not (memory_root / "entities" / _ENTITY_DIR).exists()
+
+
+async def _co_test_unloadable_kiraos_profile_not_overwritten(migration_env):
+    """A KiraOS profile that is valid JSON but not loadable (no entity_id)
+    would come back from get_profile as an empty default; it must not be
+    saved over."""
+    target = migration_env["data_root"] / "memory" / "entities" / _ENTITY_DIR / "profile.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = json.dumps({"name": "手写", "facts": ["保留我"]}, ensure_ascii=False)
+    target.write_text(original, encoding="utf-8")
+
+    result, _ = await _run(migration_env)
+    assert result["errors"] >= 1
+    assert result["entities"] == 0
+    assert target.read_text(encoding="utf-8") == original
+
+
+async def _co_test_damaged_manifest_kept(migration_env, content):
+    """A damaged or unknown manifest raises (main.py logs it, non-fatal) and is
+    left as it is, instead of being replaced by an empty one that has lost
+    every tombstone."""
+    from plugins.KiraOS_Plugin.memory.migration_hippocampus import migrate_hippocampus_if_needed
+
+    await _run(migration_env)
+    _marker(migration_env).write_text(content, encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        await migrate_hippocampus_if_needed(
+            migration_env["store"], migration_env["profiles"], _StubCtx()
+        )
+    assert _marker(migration_env).read_text(encoding="utf-8") == content
+
+
 # === Sync wrappers ===
 
 def test_migration_reports_all_stats(migration_env):
@@ -940,3 +1039,24 @@ def test_entity_skills_folder_imported(migration_env):
 
 def test_relocated_data_root_meta_restored(migration_env):
     asyncio.run(_co_test_relocated_data_root_meta_restored(migration_env))
+
+
+def test_kiraos_edit_survives_repeated_source_edits(migration_env):
+    asyncio.run(_co_test_kiraos_edit_survives_repeated_source_edits(migration_env))
+
+
+def test_all_sources_unreadable_no_disable(migration_env):
+    asyncio.run(_co_test_all_sources_unreadable_no_disable(migration_env))
+
+
+def test_entity_tombstone_is_entity_wide_and_persisted(migration_env):
+    asyncio.run(_co_test_entity_tombstone_is_entity_wide_and_persisted(migration_env))
+
+
+def test_unloadable_kiraos_profile_not_overwritten(migration_env):
+    asyncio.run(_co_test_unloadable_kiraos_profile_not_overwritten(migration_env))
+
+
+@pytest.mark.parametrize("content", ["{broken", '{"version": 99, "processed": {}}', "[1, 2]"])
+def test_damaged_manifest_kept(migration_env, content):
+    asyncio.run(_co_test_damaged_manifest_kept(migration_env, content))

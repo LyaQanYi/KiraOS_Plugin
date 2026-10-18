@@ -41,6 +41,77 @@ _DEFAULT_LLM_CHAT_TIMEOUT = 30.0
 # 会把它们全杀掉。先剥掉这些前缀再做"以'我'开头"的语义检查。
 _LIST_PREFIX_RE = re.compile(r"^[\s\-\*\+\d\.\)、•>#]+\s*")
 
+# Backstop cap on a merged fact/reflection/profile-summary line. The merge
+# and compaction prompts already ask for short output, but a model that
+# ignores instructions (or the no-LLM fallback) must not be able to grow a
+# memory without bound: every later dedup/merge prompt re-sends that text.
+_MERGE_MAX_CHARS = 200
+
+# Cap on the number of tags after merge. Each merge adds the new tags to
+# the old set; without a limit, a memory can accumulate 100+ tags over many
+# updates. Most memories need far fewer.
+_MERGE_MAX_TAGS = 20
+
+# Profile compaction: default cap on compacted profile facts, and the tags
+# the LLM is asked to sort facts into. Mirrors kira_plugin_hippocampus_memory.
+_PROFILE_COMPACT_MAX_FACTS = 12
+_PROFILE_FACT_TAGS = ("身份", "性格", "技能兴趣", "互动习惯", "关系", "其他")
+
+
+def _merge_tags(existing_tags, new_tags) -> list[str]:
+    """Union of tags, capped at ``_MERGE_MAX_TAGS``.
+
+    New tags win the budget because they describe the freshest content of
+    the merged text; old tags fill whatever slots are left. A memory that
+    already exceeds the cap (written by an older version) is trimmed on its
+    next merge.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for tag in [*normalize_tags(new_tags), *normalize_tags(existing_tags)]:
+        if tag not in seen:
+            seen.add(tag)
+            merged.append(tag)
+        if len(merged) >= _MERGE_MAX_TAGS:
+            break
+    return sorted(merged)
+
+
+def _clip_merged(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) > _MERGE_MAX_CHARS:
+        text = text[: _MERGE_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def _merge_fallback(existing_text: str, new_text: str) -> str:
+    """Bounded no-LLM merge that always keeps the newer information.
+
+    The new text is kept whole (clipped to the cap); the existing text is
+    trimmed to whatever budget is left, so repeated fallbacks can't grow a
+    memory past ``_MERGE_MAX_CHARS``.
+    """
+    existing_text = (existing_text or "").strip()
+    new_text = _clip_merged(new_text)
+    if not existing_text:
+        return new_text
+    if not new_text:
+        return _clip_merged(existing_text)
+
+    separator = "；"
+    if len(existing_text) + len(separator) + len(new_text) <= _MERGE_MAX_CHARS:
+        return f"{existing_text}{separator}{new_text}"
+
+    existing_budget = _MERGE_MAX_CHARS - len(separator) - len(new_text)
+    if existing_budget <= 0:
+        return new_text
+    if len(existing_text) > existing_budget:
+        if existing_budget == 1:
+            existing_text = "…"
+        else:
+            existing_text = existing_text[: existing_budget - 1].rstrip() + "…"
+    return f"{existing_text}{separator}{new_text}"
+
 
 class MemoryExtractor:
     """海马体：事实提取 → 去重 → 合并 → 升维"""
@@ -477,15 +548,27 @@ class MemoryExtractor:
     # ==========================================
 
     async def merge_facts(self, existing_text: str, new_text: str) -> str:
-        """LLM 合并两条事实为一条（使用快速模型）"""
+        """LLM 合并两条事实为一条（使用快速模型）
+
+        合并结果必须是一条短陈述：旧版提示词要求「保留所有有用信息」，
+        泛化记忆（如「群聊氛围友善」）会在每次 update 时不断变长，而之后
+        每次去重/合并都会把这段长文本再塞进 prompt。提示词要求精简，代码
+        层再用 ``_clip_merged`` 硬截断兜底；LLM 不可用/失败时走有长度预算
+        的 ``_merge_fallback``，而不是无上限拼接。
+        """
         client = self._extraction_client
         if not client:
-            return f"{existing_text}；{new_text}"
+            return _merge_fallback(existing_text, new_text)
 
-        prompt = f"""将以下两条信息合并为一条，保留所有有用信息：
+        prompt = f"""将以下两条信息合并为一条更简短的陈述：
 
 已有信息: {existing_text}
 新信息: {new_text}
+
+规则：
+- 两者冲突时以新信息为准
+- 只保留关键事实，不要罗列细节，不要重复同义内容
+- 合并结果控制在 40 字以内
 
 直接输出合并后的结果，不要有其他内容。"""
 
@@ -494,14 +577,15 @@ class MemoryExtractor:
                 chat_text(client, prompt),
                 timeout=self.llm_chat_timeout
             )
-            if resp:
-                return resp.strip()
+            merged = (resp or "").strip()
+            if merged:
+                return _clip_merged(merged)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
                 logger.warning("Merge facts timed out after %gs; LLM provider may be slow or rate-limited", self.llm_chat_timeout)
             else:
                 logger.error("Merge facts error: %s: %s", type(e).__name__, e)
-        return f"{existing_text}；{new_text}"
+        return _merge_fallback(existing_text, new_text)
 
     # ==========================================
     # 去重并存储（完整流程）
@@ -545,9 +629,8 @@ class MemoryExtractor:
             # 手工写进去的 dict/list 会抛 unhashable TypeError，而这个循环
             # 外面只有 hippocampus_process 的一个大 try，异常会把本批剩余
             # facts 连同升维、画像更新一起吞掉，不是只丢一个 tag。
-            existing_tags = set(normalize_tags(matched.tags))
-            existing_tags.update(normalize_tags(tags))
-            matched.tags = sorted(existing_tags)
+            # 上限见 `_MERGE_MAX_TAGS`：新 tag 优先占位。
+            matched.tags = _merge_tags(matched.tags, tags)
 
             if await self.tree_store.update_memory(matched):
                 logger.info(f"Memory merged: id={matched.id}")
@@ -663,12 +746,22 @@ class MemoryExtractor:
                     update_access=False,
                 )
                 if existing:
-                    merged = await self.merge_facts(existing[0].text, insight)
-                    existing[0].text = merged
-                    existing[0].meta["last_accessed"] = time.time()
-                    await self.tree_store.update_memory(existing[0])
-                    logger.debug(f"Reflection merged with existing: {insight[:50]}...")
-                    continue
+                    # FTS almost always returns *some* reflection once an
+                    # entity has a few, so merging unconditionally funnels
+                    # every new insight into the same handful of entries.
+                    # Run the same duplicate/update/new check facts use.
+                    decision = await self._check_conflict(insight, existing[0].text)
+                    if decision == "duplicate":
+                        logger.debug(f"Duplicate reflection skipped: {insight[:50]}...")
+                        continue
+                    if decision == "update":
+                        merged = await self.merge_facts(existing[0].text, insight)
+                        existing[0].text = merged
+                        existing[0].meta["last_accessed"] = time.time()
+                        await self.tree_store.update_memory(existing[0])
+                        logger.debug(f"Reflection merged with existing: {insight[:50]}...")
+                        continue
+                    # "new" → fall through and store as a separate reflection.
 
                 # 生成语义 ID
                 sem_id = await self.generate_semantic_id(insight)
@@ -707,6 +800,82 @@ class MemoryExtractor:
                 logger.error("Reflection generation error: %s: %s", type(e).__name__, e)
 
         return generated
+
+    # ==========================================
+    # 画像压实（画像去重精简）
+    # ==========================================
+
+    async def summarize_profile_facts(
+        self,
+        facts: list[str],
+        traits: Optional[list[str]] = None,
+        max_facts: int = _PROFILE_COMPACT_MAX_FACTS,
+    ) -> list[str]:
+        """把冗长/重复的画像 facts 压实为带 "[标签]" 前缀的规范短句列表。
+
+        用于修复已经膨胀的存量画像（例如同一个习惯被反复用不同话描述好几遍）。
+        解析失败或空输出时返回 ``[]``——调用方（``memory_manager.compact_
+        profile``）必须据此保留原值，绝不能用空列表覆盖已有画像。
+
+        ``max_facts`` 由调用方按压实阈值动态传入（而非固定用模块常量），否则
+        压实后 facts 数量仍可能 ≥ 阈值，导致下一次写入立刻再次触发压实
+        （re-compaction loop）。
+        """
+        if not self._reflection_client or not facts:
+            return []
+        max_facts = max(1, max_facts)
+
+        facts_text = "\n".join(f"- {f}" for f in facts)
+        traits_text = f"\n已有特征标签: {', '.join(traits)}" if traits else ""
+        tags = "、".join(_PROFILE_FACT_TAGS)
+
+        prompt = f"""以下是关于同一个人的一份画像事实列表，其中可能有重复、同义
+或过于细碎的内容（比如同一个习惯被反复用不同话描述了好几次）。请把它们去重、
+合并、精简为规范的短句列表。
+
+规则：
+- 每条不超过 30 字，一条只说一件事
+- 同义/重复内容只保留一条最准确的表述，不要罗列发生了几次
+- 每条前面加一个 "[标签]" 前缀，标签从以下几类中选：{tags}
+- 按重要性排序，最多输出 {max_facts} 条
+- 不要编造原始列表里没有的信息
+
+原始事实列表:
+{facts_text}{traits_text}
+
+只输出结果，每行一条，格式为 "[标签] 内容"，不要有编号、不要有其他说明文字。"""
+
+        try:
+            text = await asyncio.wait_for(
+                chat_text(self._reflection_client, prompt),
+                timeout=self.llm_chat_timeout,
+            )
+            text = (text or "").strip()
+            if not text:
+                return []
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            cleaned = []
+            for ln in lines:
+                # 容错去掉模型可能加的项目符号/编号前缀。
+                ln = re.sub(r"^[-*\d.\s]+(?=\[)", "", ln).strip()
+                if not ln:
+                    continue
+                # 只接受「[允许的标签] 非空内容」这种规范格式；拒绝语、裸 JSON、
+                # 未打标签的文本等一律视为解析失败整体返回 []，而不是自动包装
+                # 成 "[其他]" 事实去覆盖原始画像（untagged LLM output accepted）。
+                match = re.fullmatch(r"\[([^\]\n]+)\]\s+(\S.*)", ln)
+                if match is None or match.group(1) not in _PROFILE_FACT_TAGS:
+                    return []
+                cleaned.append(_clip_merged(ln))
+            if not cleaned:
+                return []
+            return cleaned[:max_facts]
+        except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Profile summarize timed out after %gs", self.llm_chat_timeout)
+            else:
+                logger.error(f"Profile compaction summarize error: {e}")
+            return []
 
     # ==========================================
     # 工具方法

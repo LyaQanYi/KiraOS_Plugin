@@ -332,11 +332,16 @@ def test_full_cycle_archives_stale_global_self(store):
     g = dict(entity_id="", entity_type="", base_dir="global/self")
     long_ago = time.time() - 365 * 86400
 
+    # stale_ref is a fact-typed row in reflections/ (the folder is scanned);
+    # stale_insight is a real reflection, which the +0.2 type bonus keeps at or
+    # above THRESHOLD_DELETE, as in the entity scopes and in hippocampus.
     async def scenario():
-        for folder, mem_id in (("facts", "stale_fact"), ("reflections", "stale_ref"),
-                               ("facts", "fresh_fact")):
+        for folder, mem_id, mem_type in (
+            ("facts", "stale_fact", "fact"), ("reflections", "stale_ref", "fact"),
+            ("reflections", "stale_insight", "reflection"), ("facts", "fresh_fact", "fact"),
+        ):
             mem = await store.add_memory(
-                content_text=f"自我觉察 {mem_id}", memory_type="fact",
+                content_text=f"自我觉察 {mem_id}", memory_type=mem_type,
                 importance=1, semantic_id=mem_id, folder=folder, **g,
             )
             if mem_id.startswith("stale"):
@@ -356,3 +361,4 @@ def test_full_cycle_archives_stale_global_self(store):
         assert archived.is_file(), f"{mem_id} was deleted instead of archived"
 
     assert store.index.get_meta("fresh_fact", folder="facts", **g) is not None
+    assert store.index.get_meta("stale_insight", folder="reflections", **g) is not None
