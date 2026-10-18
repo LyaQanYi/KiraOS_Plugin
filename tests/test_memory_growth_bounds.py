@@ -209,6 +209,17 @@ def test_summarize_accepts_tagged_output_and_caps(store):
     assert got == [f"[其他] 事实{i}" for i in range(5)]
 
 
+def test_summarize_accepts_tag_without_space(store):
+    out = "[身份]小明是大三学生\n- [性格]  小明很外向"
+    ex = MemoryExtractor(store, reflection_client=_compact_client(out))
+    got = _run(ex.summarize_profile_facts(["a"]))
+    assert got == ["[身份] 小明是大三学生", "[性格] 小明很外向"]
+    # Unknown tag or a trailing explanation line still rejects the whole output.
+    for bad in ("[基本信息]小明", "[其他]事实\n以上为压实结果"):
+        ex = MemoryExtractor(store, reflection_client=_compact_client(bad))
+        assert _run(ex.summarize_profile_facts(["a"])) == []
+
+
 def test_apply_compacted_keeps_concurrent_appends(store):
     profiles = EntityProfileStore()
     for f in ["旧1", "旧2"]:

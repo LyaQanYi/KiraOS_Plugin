@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Profile compaction now runs.** `profile_compact_threshold` and `profile_compact_max_chars`
   were already in the schema but nothing read them. A profile whose facts reach the count or
   character threshold is now compacted by the reflection model into at most 11 tagged short
-  facts (`[基本信息]`, `[性格]`, ...), after each fact write and in `run_forgetting_cycle`.
+  facts (`[身份]`, `[性格]`, ...), after each fact write and in `run_forgetting_cycle`.
   Untagged or empty LLM output leaves the profile unchanged. Facts added concurrently are kept,
   and a fact removed meanwhile aborts the write. The sweep never creates `profile.json`.
 

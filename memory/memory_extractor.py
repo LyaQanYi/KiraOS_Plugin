@@ -863,10 +863,12 @@ class MemoryExtractor:
                 # 只接受「[允许的标签] 非空内容」这种规范格式；拒绝语、裸 JSON、
                 # 未打标签的文本等一律视为解析失败整体返回 []，而不是自动包装
                 # 成 "[其他]" 事实去覆盖原始画像（untagged LLM output accepted）。
-                match = re.fullmatch(r"\[([^\]\n]+)\]\s+(\S.*)", ln)
+                # "]" 后的空格可有可无（中文模型常写 "[身份]小明…"），统一规范成
+                # "[标签] 内容"。
+                match = re.fullmatch(r"\[([^\]\n]+)\]\s*(\S.*)", ln)
                 if match is None or match.group(1) not in _PROFILE_FACT_TAGS:
                     return []
-                cleaned.append(_clip_merged(ln))
+                cleaned.append(_clip_merged(f"[{match.group(1)}] {match.group(2)}"))
             if not cleaned:
                 return []
             return cleaned[:max_facts]
