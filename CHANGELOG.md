@@ -5,6 +5,58 @@ All notable changes to KiraOS Plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.1-beta.2] - 2026-10-18
+
+### Fixed
+
+- **Hippocampus migration rewritten as an idempotent reconcile** that runs on every launch
+  (`memory/migration_hippocampus.py`). The 4.0.x one-shot import had these defects, all fixed:
+  - `global/self/*`, `global/skills/*`, entity `skills/` and legacy JSON memories were never imported.
+  - A global content-hash dedup dropped a memory when another entity had the same text.
+  - Runtime meta was looked up under the wrong key, so many imports got `timestamp = now`,
+    `access_count = 0` and looked brand new to decay.
+  - The marker was written even when no hippocampus data existed yet, so data that appeared
+    later was never migrated.
+  - Re-runs that found everything already imported were reported as failures.
+- **Upgrading from 4.0.x repairs in place.** Existing imports are matched by id + content hash,
+  the `{id}_{hash8}` collision suffix, content hash within the namespace, or the
+  `hippocampus-import` tag. Lost meta is restored (earliest timestamp, largest counts) and missing
+  memories are added, without duplicates. A plugin the user re-enabled is not disabled again.
+- **Nothing deleted in KiraOS comes back.** Memories deleted or archived in KiraOS after an import,
+  and entities deleted from the WebUI, are recorded as tombstones and never re-imported, even if
+  the hippocampus file changes later.
+- Hippocampus edits to an already-imported memory are applied only if KiraOS hasn't edited it
+  since. Otherwise KiraOS's text wins and only meta is merged.
+- Profiles are re-merged when the hippocampus `profile.json` changes. A KiraOS profile file that
+  can't be parsed is never overwritten.
+- Meta is still found when the data root has moved (hippocampus `file_path` is absolute).
+- The hippocampus tree stays byte-identical. Its index is opened with SQLite `immutable` when
+  there is no live WAL, so no `-shm` / `-wal` files are created next to it.
+- `MemoryIndex.update_meta` now accepts `timestamp`.
+- **Decay now reaches `global/self`.** `MemoryDecayEngine.run_full_cycle` queried it with the
+  absolute `get_global_self_dir()` path, but the index stores the logical `"global/self"`, so
+  these memories never decayed. It now uses the logical namespace, covers `facts` and
+  `reflections`, and archives (instead of hard-deleting) like the entity scopes, so a forgotten
+  memory is recoverable and the migration doesn't re-import it.
+
+### Changed
+
+- The marker `data/memory/.hippocampus_migrated` is now a v2 manifest:
+  `{version, since, plugin_disabled, processed, profiles}`, with one record per source file
+  (`state`: `imported` / `merged` / `archived` / `deleted` / `entity_deleted` / `invalid`).
+  Old markers are upgraded automatically.
+- The hippocampus `archive/` is copied incrementally into KiraOS `archive/hippocampus/` and never
+  overwrites existing files.
+- The startup log now includes `global_self`, `skills` and `merged` counts.
+- Migration tests: 14 → 29, covering the 4.0.x upgrade paths, tombstones, slug collisions,
+  cross-entity same text, legacy JSON, entity skills and a relocated data root.
+
+### Behavior change
+
+- Because of the decay fix, stale low-importance `global/self` memories become eligible for
+  archiving for the first time, once `run_forgetting_cycle` is triggered. Archived files go to
+  `archive/global_self__{folder}__{id}.toml` and can be restored.
+
 ## [4.0.0] - 2026-08-18
 
 ### 🎯 Major: Unified Hippocampus Memory Plugin
