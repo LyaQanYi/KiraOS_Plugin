@@ -5,7 +5,7 @@ All notable changes to KiraOS Plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.0.1-beta.2] - 2026-10-19
+## [4.0.1] - 2026-10-19
 
 ### Fixed
 
@@ -212,7 +212,7 @@ Complete rewrite of memory subsystem from v2's "two SQLite tables + single profi
 
 v2.x used simple SQLite tables (`user_profiles`, `event_logs`) with limited per-user memory. See git history for details.
 
-[4.0.1-beta.2]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v4.0.1-beta.1...v4.0.1-beta.2
+[4.0.1]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v4.0.1-beta.1...v4.0.1
 [4.0.0]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v3.0.1...v4.0.0
 [3.0.1]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v2.x...v3.0.0
