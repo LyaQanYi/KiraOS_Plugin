@@ -470,7 +470,7 @@ class MemoryIndex:
     ):
         """部分更新 meta 字段（按复合主键单行）。"""
         allowed = {
-            "importance", "last_accessed", "access_count",
+            "importance", "timestamp", "last_accessed", "access_count",
             "tags", "source", "raw_text", "content_hash", "file_path",
         }
         updates = []

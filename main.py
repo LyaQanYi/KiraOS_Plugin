@@ -193,6 +193,8 @@ class UserMemoryPlugin(BasePlugin):
             max_memory_length=self._max_memory_length,
             hippocampus_threshold=self._hippocampus_threshold,
             llm_chat_timeout=self._llm_chat_timeout,
+            profile_compact_threshold=self._profile_compact_threshold,
+            profile_compact_max_chars=self._profile_compact_max_chars,
         )
         await self.memory_manager.async_init()
 
@@ -204,11 +206,25 @@ class UserMemoryPlugin(BasePlugin):
                 stats = await migrate_hippocampus_if_needed(
                     self.memory_manager.tree_store, profile_store, self.ctx
                 )
-                if stats["migrated"]:
+                # Reconcile runs on every launch; the module logs the details
+                # itself, so only surface runs that actually changed something.
+                if stats.get("failed"):
+                    logger.error(
+                        "Hippocampus migration imported nothing; the hippocampus "
+                        "plugin stays enabled and will be retried next launch"
+                    )
+                elif stats["migrated"] and any(
+                    stats.get(k) for k in (
+                        "entities", "facts", "reflections", "global_facts",
+                        "global_self", "skills", "merged",
+                    )
+                ):
                     logger.info(
-                        f"Hippocampus plugin data migrated: {stats['entities']} entities, "
+                        f"Hippocampus plugin data reconciled: {stats['entities']} profiles, "
                         f"{stats['facts']} facts, {stats['reflections']} reflections, "
-                        f"{stats['global_facts']} global facts"
+                        f"{stats['global_facts']} global facts, {stats['global_self']} "
+                        f"global/self, {stats['skills']} skills imported; "
+                        f"{stats['merged']} existing memories updated"
                     )
             except Exception as e:
                 logger.error(f"Hippocampus migration failed (non-fatal): {e}", exc_info=True)

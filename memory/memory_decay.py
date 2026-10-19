@@ -189,11 +189,12 @@ class MemoryDecayEngine:
                         f"Forgetting cycle error for {entity_type}:{entity_id}/{folder}: {e}"
                     )
 
-        # 全局域
-        from .memory_paths import get_global_self_dir
-        global_self = get_global_self_dir()
+        # 全局域。索引里的 base_dir 是逻辑命名空间 "global/self"（见
+        # `MemoryIndex._parse_path`）；传 `get_global_self_dir()` 的绝对路径
+        # 永远匹配不上。
+        global_self = "global/self"
 
-        for subfolder in ("facts",):
+        for subfolder in ("facts", "reflections"):
             try:
                 metas = self.index.list_memories(
                     base_dir=global_self, folder=subfolder
@@ -202,12 +203,19 @@ class MemoryDecayEngine:
                 for meta in metas:
                     score = self.calculate_retention_score(meta, now)
                     if score < self.THRESHOLD_DELETE:
-                        await self.tree_store.delete_memory(
+                        # 与实体域一致走归档而非物理删除：可恢复，迁移也能
+                        # 据归档文件识别出"已在 KiraOS 遗忘"而不再导回。
+                        # entity 字段取自索引行本身——全局行是 ""，而
+                        # archive_memory 默认 entity_type="user"，按默认值
+                        # 删不到这一行，会留下孤儿索引。
+                        if await self.tree_store.archive_memory(
                             memory_id=meta["id"],
+                            entity_id=meta.get("entity_id", ""),
+                            entity_type=meta.get("entity_type", ""),
                             base_dir=global_self,
                             folder=subfolder,
-                        )
-                        total_deleted += 1
+                        ):
+                            total_deleted += 1
             except Exception as e:
                 logger.error(f"Forgetting cycle error for global/self/{subfolder}: {e}")
 

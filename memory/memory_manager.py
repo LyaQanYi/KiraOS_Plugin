@@ -22,17 +22,24 @@ from .session import Session
 from .memory_index import MemoryIndex
 from .toml_tree_store import TomlTreeStore, Memory
 from .entity_profile import EntityProfileStore, EntityProfile
-from .memory_extractor import MemoryExtractor
+from .memory_extractor import MemoryExtractor, _MERGE_MAX_CHARS
 from .memory_router import MemoryRouter
 from .memory_paths import (
     ensure_directory_structure,
     list_all_entities,
     get_chat_memory_path,
+    get_entity_profile_path,
     ENTITY_USER,
     ENTITY_GROUP,
 )
 
 logger = get_logger("kiraos_memory_manager", "green")
+
+# Profile compaction triggers: compact when a profile holds this many facts,
+# or its facts total more than this many characters (same defaults as
+# kira_plugin_hippocampus_memory).
+_PROFILE_COMPACT_THRESHOLD = 12
+_PROFILE_COMPACT_MAX_CHARS = 1200
 
 
 def _mask_id(value) -> str:
@@ -66,8 +73,13 @@ class MemoryManager:
         llm_client=None,
         hippocampus_threshold: int = 3,
         llm_chat_timeout: float = 30.0,
+        profile_compact_threshold: int = _PROFILE_COMPACT_THRESHOLD,
+        profile_compact_max_chars: int = _PROFILE_COMPACT_MAX_CHARS,
     ):
         self.max_memory_length = int(max_memory_length)
+        # Same clamps as the schema minimums (main.py clamps too).
+        self.profile_compact_threshold = max(2, int(profile_compact_threshold))
+        self.profile_compact_max_chars = max(200, int(profile_compact_max_chars))
         self.chat_memory_path = get_chat_memory_path()
 
         self.memory_lock = AsyncLock()
@@ -752,11 +764,116 @@ class MemoryManager:
 
         宪章 §4.3 优先级分层：importance >= 7 的事实写入 profile
         """
+        wrote = False
         for fact in facts:
             content = fact.get("content", "")
             importance = fact.get("importance", 5)
             if importance >= 7 and content:
                 await self.profile_store.add_fact(entity_id, content, entity_type)
+                wrote = True
+
+        # Compact right after a write so an active entity's profile can't keep
+        # growing; inactive entities are covered by the sweep in
+        # run_forgetting_cycle. Compaction failures must not break extraction.
+        if wrote:
+            try:
+                await self.compact_profile(entity_id, entity_type)
+            except Exception as e:
+                logger.debug(
+                    f"Post-write profile compaction failed for "
+                    f"{entity_type}:{entity_id}: {e}"
+                )
+
+    # ==========================================
+    # 画像压实
+    # ==========================================
+
+    def _profile_needs_compaction(self, profile: EntityProfile) -> bool:
+        if len(profile.facts) >= self.profile_compact_threshold:
+            return True
+        # Strict ``>`` so a single fact at the clip length can't re-trigger.
+        return sum(len(f) for f in profile.facts) > self.profile_compact_max_chars
+
+    async def compact_profile(
+        self,
+        entity_id: str,
+        entity_type: str = ENTITY_USER,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """LLM 压实画像 facts：超过阈值时把冗余/重复的长列表收拢成带 "[标签]"
+        前缀的规范短句。解析失败或空输出时保留原值。
+
+        落盘走 ``apply_compacted_facts``：在 per-entity 锁内重新读、合并
+        snapshot 之后新出现的 facts 再写入，与 ``add_fact`` 互斥。
+
+        Returns: 是否真的执行了压实。
+        """
+        if self.extractor is None or self.extractor._reflection_client is None:
+            return False
+        try:
+            profile = await self.profile_store.get_profile(entity_id, entity_type)
+        except Exception as e:
+            logger.debug(f"compact_profile: profile read failed: {type(e).__name__}")
+            return False
+
+        if not profile.facts:
+            return False
+        if not force and not self._profile_needs_compaction(profile):
+            return False
+
+        snapshot = list(profile.facts)
+        # Output cap stays below both triggers, otherwise the compacted
+        # profile would immediately qualify for compaction again.
+        max_facts = min(
+            self.profile_compact_threshold - 1,
+            max(1, self.profile_compact_max_chars // _MERGE_MAX_CHARS),
+        )
+
+        new_facts = await self.extractor.summarize_profile_facts(
+            profile.facts, profile.traits, max_facts=max_facts
+        )
+        if not new_facts:
+            logger.warning(
+                f"compact_profile: empty/unparseable summary for "
+                f"{entity_type}:{entity_id}, keeping original facts"
+            )
+            return False
+
+        updated = await self.profile_store.apply_compacted_facts(
+            entity_id, entity_type, snapshot, new_facts
+        )
+        if updated is None:
+            logger.warning(
+                f"compact_profile: persist skipped for {entity_type}:{entity_id} "
+                "(concurrent mutation or I/O); will retry later"
+            )
+            return False
+
+        logger.info(
+            f"Profile compacted for {entity_type}:{entity_id}: "
+            f"{len(snapshot)} → {len(updated.facts)} facts"
+        )
+        return True
+
+    async def _compact_all_profiles(self) -> int:
+        """遍历所有实体，超阈值则压实。
+
+        写入触发的压实覆盖不到不再互动的实体（例如升级前就已膨胀的画像），
+        这里复用遗忘周期做兜底扫描。
+        """
+        compacted = 0
+        for entity_id, entity_type in list_all_entities():
+            # get_profile() creates a default profile.json when missing; the
+            # sweep must not write files into entity dirs that have none.
+            if not os.path.exists(get_entity_profile_path(entity_id, entity_type)):
+                continue
+            try:
+                if await self.compact_profile(entity_id, entity_type):
+                    compacted += 1
+            except Exception as e:
+                logger.debug(f"Profile sweep failed for {entity_type}:{entity_id}: {e}")
+        return compacted
 
     # ==========================================
     # 遗忘周期（由外部调度器定时调用）
@@ -777,6 +894,13 @@ class MemoryManager:
             logger.info(
                 f"Forgetting cycle: removed={removed}, downgraded={downgraded}"
             )
+
+        try:
+            compacted = await self._compact_all_profiles()
+            if compacted:
+                logger.info(f"Forgetting cycle: compacted {compacted} bloated profile(s)")
+        except Exception as e:
+            logger.warning(f"Profile compaction sweep failed: {e}")
 
     # ==========================================
     # 工具方法

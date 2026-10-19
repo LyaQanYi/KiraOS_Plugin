@@ -184,7 +184,7 @@ KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时
 
 写入一条新记忆。会自动做两级去重：
 1. **SHA-256 哈希**：内容完全一致直接跳过
-2. **FTS5 + LLM**：语义近似的会被合并（旧记忆 text 被新文本扩充）
+2. **FTS5 + LLM**：语义近似的会被合并为一条更短的陈述（上限 200 字，不会越合并越长）
 
 `memory_type` 取 `fact`（默认，落在 `facts/`）或 `reflection`（落在 `reflections/`）。
 
@@ -393,23 +393,28 @@ v3 第一次启动时（`auto_migrate_legacy_db: true`，默认开），插件�
 
 > **v4.0.0 新增**：统一了原独立的 `kira_plugin_hippocampus_memory`（海马体记忆插件）所有功能。
 
-v4 第一次启动时（`auto_migrate_legacy_db: true`，默认开），插件会自动：
+每次启动时（`auto_migrate_legacy_db: true`，默认开），插件会对账一次 `data/plugin_data/kira_plugin_hippocampus_memory/memory/`，只处理新增或有变化的文件：
 
-1. 检测 `data/plugin_data/kira_plugin_hippocampus_memory/memory/` 是否存在
-2. 读取旧插件的 SQLite 索引（`memory_index.db`），提取所有记忆的运行时 meta（`timestamp` / `last_accessed` / `access_count`）
-3. 逐实体迁移：
-   - **Entity profiles** (`profile.json`) → union merge：traits / facts / aliases 去重合并，interaction_count 累加，最新 last_interaction 保留
-   - **Facts & reflections** (`.toml` 文件) → 内容哈希去重：相同内容不重复导入，保留最早的 timestamp
-   - **Global facts** → 迁移到统一的 `global/facts/` 命名空间
-4. 在当前实例的 plugin manager 里标记 `kira_plugin_hippocampus_memory` 为 disabled（防止双喂）
-5. 落盘 `data/memory/.hippocampus_migrated` 标记（包含迁移统计：实体数、facts 数、reflections 数）
+1. **记忆**：`entities/*/{facts,reflections,skills}`、`global/facts`、`global/self/*`、`global/skills/*`，以及旧版 JSON 记忆，按原命名空间写入 KiraOS
+   - 运行时 meta（`timestamp` / `last_accessed` / `access_count`）从旧插件的 `memory_index.db`（只读打开）、TOML 内嵌 meta 和 `source.time` 恢复，取最早的创建时间、最大的计数
+   - KiraOS 里已有的副本（包括 4.0.x 导入的）原地修复 meta，不会重复导入；同 id 不同内容的记忆以 `{id}_{hash8}` 共存
+   - 新导入的记忆带 `hippocampus-import` 标签
+2. **画像** (`profile.json`)：union merge，traits / facts / aliases 去重合并，interaction_count 取最大，冲突字段以 `last_interaction` 较新的一方为准
+3. **归档**：旧插件 `archive/` 增量复制到 `data/memory/archive/hippocampus/`，不覆盖已有文件
+4. 首次成功后在 plugin manager 里禁用 `kira_plugin_hippocampus_memory`（防止双喂），只禁用一次。之后你手动重新启用不会被再次关掉，它新写的记忆会在下次启动时并入
+5. 处理记录写进 `data/memory/.hippocampus_migrated`（v2 manifest，逐文件记录状态）
+
+**不会被导回来的东西**：迁移后在 KiraOS 里删除或归档的记忆、在 WebUI 里删除的实体（实体级记录在 manifest 里，清空 `archive/` 后也不会复活）。即使旧插件那边的文件后来变了，也不会导回来。KiraOS 里改过的记忆，之后旧插件那边再怎么改都以 KiraOS 的文本为准。
+
+例外：从 4.0.x 升级时，旧 marker 没有逐文件记录。如果你在 4.0.x 期间**手动删掉**了 `data/memory/` 下某条导入记忆的 TOML 文件（而不是用 WebUI / `memory_remove`，它们走归档），升级后它会被重新导入。
+
+**从 4.0.0 / 4.0.1-beta.1 升级**：旧版的一次性迁移漏掉了 `global/self`、skills、跨实体同文本的记忆，很多记忆的 meta 也被重置成了"刚创建"。升级后第一次启动会自动补齐并修复，不需要手动操作。
 
 **迁移后 Hippocampus 插件会发生什么？**
-- 旧数据保留在 `data/plugin_data/kira_plugin_hippocampus_memory/` 不变（rollback 用）
+- 旧数据保留在 `data/plugin_data/kira_plugin_hippocampus_memory/` 不变（只读，rollback 用）
 - 插件在当前 KiraAI 实例里被自动禁用（可在 WebUI 插件管理里看到）
-- 后续启动检测到迁移标记后不会重复迁移
-
-**迁移是幂等的**：即使中途失败、或用户手动删了标记文件重跑，内容哈希去重机制会防止重复导入。
+- 如果一条记忆都没能导入（写入失败或源文件全部无法解析），旧插件保持启用、不写 manifest，下次启动重试
+- manifest 损坏或版本不认识时，本次启动跳过对账并在日志里报错，manifest 原样保留，不会被空的覆盖掉
 
 **Hippocampus 独有功能的迁移状态**：
 - ✅ **TOML + SQLite 双存储** — 完全一致
@@ -425,18 +430,25 @@ v4 第一次启动时（`auto_migrate_legacy_db: true`，默认开），插件�
 迁移逻辑在 [memory/migration_hippocampus.py](memory/migration_hippocampus.py)。如果不希望自动迁移，把 `auto_migrate_legacy_db` 设为 `false`。
 
 **如何确认迁移成功？**
+
+启动日志里搜 `Hippocampus reconcile`，会列出本次导入 / 更新 / 跳过的数量。逐文件状态在 manifest 里：
 ```bash
 cat data/memory/.hippocampus_migrated
 ```
 文件内容示例：
 ```json
 {
-  "migrated": true,
-  "timestamp": 1723968123.456,
-  "entities": 3,
-  "facts": 47,
-  "reflections": 12,
-  "global_facts": 5
+  "version": 2,
+  "since": 1760774400.0,
+  "plugin_disabled": true,
+  "processed": {
+    "entities/user_telegram%3A12345/facts/hates_css.toml": {
+      "state": "imported", "hash": "…", "id": "hates_css", "text_hash": "…"
+    }
+  },
+  "profiles": {
+    "entities/user_telegram%3A12345/profile.json": {"hash": "…"}
+  }
 }
 ```
 

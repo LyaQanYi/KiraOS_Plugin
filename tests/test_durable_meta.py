@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 import pytest
 
@@ -316,3 +317,48 @@ def test_aged_memory_stays_aged_across_restart(store):
         f"a year-old, never-accessed, importance-1 memory scored {score_after:.3f}, "
         f"which is above the {MemoryDecayEngine.THRESHOLD_DELETE} archive threshold"
     )
+
+
+# ── 5. global/self is in decay's reach ───────────────────────────────────────
+
+def test_full_cycle_archives_stale_global_self(store):
+    """`run_full_cycle` used to scan global/self with the absolute
+    `get_global_self_dir()` path, while the index stores the logical
+    `"global/self"` — so it matched nothing and these memories never decayed.
+    """
+    from plugins.KiraOS_Plugin.memory.memory_decay import MemoryDecayEngine
+    from plugins.KiraOS_Plugin.memory.memory_paths import get_archive_dir
+
+    g = dict(entity_id="", entity_type="", base_dir="global/self")
+    long_ago = time.time() - 365 * 86400
+
+    # stale_ref is a fact-typed row in reflections/ (the folder is scanned);
+    # stale_insight is a real reflection, which the +0.2 type bonus keeps at or
+    # above THRESHOLD_DELETE, as in the entity scopes and in hippocampus.
+    async def scenario():
+        for folder, mem_id, mem_type in (
+            ("facts", "stale_fact", "fact"), ("reflections", "stale_ref", "fact"),
+            ("reflections", "stale_insight", "reflection"), ("facts", "fresh_fact", "fact"),
+        ):
+            mem = await store.add_memory(
+                content_text=f"自我觉察 {mem_id}", memory_type=mem_type,
+                importance=1, semantic_id=mem_id, folder=folder, **g,
+            )
+            if mem_id.startswith("stale"):
+                mem.meta["timestamp"] = long_ago
+                mem.meta["last_accessed"] = long_ago
+                await store.update_memory(mem)
+        return await MemoryDecayEngine(store).run_full_cycle()
+
+    deleted, _ = asyncio.run(scenario())
+    assert deleted == 2
+
+    for folder, mem_id in (("facts", "stale_fact"), ("reflections", "stale_ref")):
+        assert store.index.get_meta(mem_id, folder=folder, **g) is None, (
+            f"{mem_id} left an orphan index row after archiving"
+        )
+        archived = Path(get_archive_dir()) / f"global_self__{folder}__{mem_id}.toml"
+        assert archived.is_file(), f"{mem_id} was deleted instead of archived"
+
+    assert store.index.get_meta("fresh_fact", folder="facts", **g) is not None
+    assert store.index.get_meta("stale_insight", folder="reflections", **g) is not None
