@@ -5,7 +5,7 @@ All notable changes to KiraOS Plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.0.1-beta.2] - 2026-10-18
+## [4.0.1-beta.2] - 2026-10-19
 
 ### Fixed
 
@@ -65,11 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   facts (`[身份]`, `[性格]`, ...), after each fact write and in `run_forgetting_cycle`.
   Untagged or empty LLM output leaves the profile unchanged. Facts added concurrently are kept,
   and a fact removed meanwhile aborts the write. The sweep never creates `profile.json`.
+- **Merges no longer fail when the LLM emits `null` tags** (#22). A `null` in the extracted
+  `tags` broke both the TOML write and the index upsert, so `update_memory` returned `False` and
+  the merge was dropped with `Failed to merge memory <id>`. At extraction, number and boolean
+  tags are converted to strings and only `null`, objects, arrays and blank tags are dropped.
+  `_sync_write_toml` cleans `None` like its sibling writer, and the TOML writer and the index
+  (upsert and rebuild) share `normalize_tags`, which keeps only non-blank string tags.
+- **LLM timeouts and provider errors are now named in the log** (#23). `asyncio.TimeoutError`
+  has an empty message, so `merge_facts`, `_check_conflict`, `generate_semantic_id` and
+  `generate_reflections` logged a bare `Merge facts error:`. They now log
+  `... timed out after Ns` (fractional timeouts shown with `%g`), and other errors include the
+  exception type. `chat_text` no longer swallows provider exceptions, so each operation logs its
+  own name instead of one anonymous `chat_text failed:` line. Fallback behaviour is unchanged.
 
 ### Changed
 
 - The marker `data/memory/.hippocampus_migrated` is now a v2 manifest:
-  `{version, since, plugin_disabled, processed, profiles}`, with one record per source file
+  `{version, since, plugin_disabled, processed, profiles, deleted_entities}`, with one record per source file
   (`state`: `imported` / `merged` / `archived` / `deleted` / `entity_deleted` / `invalid`).
   Old markers are upgraded automatically.
 - The hippocampus `archive/` is copied incrementally into KiraOS `archive/hippocampus/` and never
@@ -77,7 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The startup log now includes `global_self`, `skills` and `merged` counts.
 - Migration tests: 14 → 36, covering the 4.0.x upgrade paths, tombstones, slug collisions,
   cross-entity same text, legacy JSON, entity skills and a relocated data root.
-- New `tests/test_memory_growth_bounds.py` (18 tests) for the merge cap, reflection gating and
+- New `tests/test_memory_growth_bounds.py` (21 tests) for the merge cap, reflection gating and
   profile compaction.
 
 ### Behavior change
@@ -200,6 +212,7 @@ Complete rewrite of memory subsystem from v2's "two SQLite tables + single profi
 
 v2.x used simple SQLite tables (`user_profiles`, `event_logs`) with limited per-user memory. See git history for details.
 
+[4.0.1-beta.2]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v4.0.1-beta.1...v4.0.1-beta.2
 [4.0.0]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v3.0.1...v4.0.0
 [3.0.1]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/LyaQanYi/KiraOS_Plugin/compare/v2.x...v3.0.0
