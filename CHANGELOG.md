@@ -67,9 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a fact removed meanwhile aborts the write. The sweep never creates `profile.json`.
 - **Merges no longer fail when the LLM emits `null` tags** (#22). A `null` in the extracted
   `tags` broke both the TOML write and the index upsert, so `update_memory` returned `False` and
-  the merge was dropped with `Failed to merge memory <id>`. Non-string tags are now filtered at
-  the source, `_sync_write_toml` cleans `None` like its sibling writer, and the index ignores
-  non-string tags on upsert and rebuild.
+  the merge was dropped with `Failed to merge memory <id>`. At extraction, number and boolean
+  tags are converted to strings and only `null`, objects, arrays and blank tags are dropped.
+  `_sync_write_toml` cleans `None` like its sibling writer, and the TOML writer and the index
+  (upsert and rebuild) share `normalize_tags`, which keeps only non-blank string tags.
 - **LLM timeouts and provider errors are now named in the log** (#23). `asyncio.TimeoutError`
   has an empty message, so `merge_facts`, `_check_conflict`, `generate_semantic_id` and
   `generate_reflections` logged a bare `Merge facts error:`. They now log
