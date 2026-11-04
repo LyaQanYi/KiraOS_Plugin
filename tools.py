@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime
 from typing import Optional
 
 from core.logging_manager import get_logger
 
 from .memory import MemoryManager
+from .memory.identity import resolve_entity_id
 from .memory.memory_paths import ENTITY_USER, ENTITY_GROUP
 
 logger = get_logger("kiraos_memory_tools", "green")
@@ -68,6 +70,8 @@ TOOL_SCHEMAS: dict = {
         "description": (
             "在长期记忆中搜索相关条目。省略 entity_id 时默认搜索当前发言者；"
             "也可以用逗号分隔传入多个 entity_id 做并行多用户搜索。"
+            "entity_type=global 时搜索全局知识库（黑话/常识等）。"
+            "可选 folder/since/until/tags 过滤；复杂问题可换关键词和时间范围多次调用。"
         ),
         "params": {
             "type": "object",
@@ -79,8 +83,26 @@ TOOL_SCHEMAS: dict = {
                 },
                 "entity_type": {
                     "type": "string",
-                    "description": "实体类型",
-                    "enum": ["user", "group", "channel"],
+                    "description": "实体类型；global 表示全局知识库",
+                    "enum": ["user", "group", "channel", "global"],
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "限定目录：all=全部，facts=事实，reflections=洞察，episodes=事件",
+                    "enum": ["all", "facts", "reflections", "episodes"],
+                },
+                "since": {
+                    "type": "string",
+                    "description": "只返回该日期之后创建的记忆，格式 YYYY-MM-DD 或 ISO 时间（可选）",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "只返回该日期之前创建的记忆，格式 YYYY-MM-DD 或 ISO 时间（可选）",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "只返回同时带有这些标签的记忆（可选）",
                 },
                 "k": {
                     "type": "number",
@@ -106,7 +128,7 @@ TOOL_SCHEMAS: dict = {
                 "folder": {
                     "type": "string",
                     "description": "所在目录，默认 facts",
-                    "enum": ["facts", "reflections"],
+                    "enum": ["facts", "reflections", "episodes"],
                 },
                 "importance": {
                     "type": "number",
@@ -131,7 +153,7 @@ TOOL_SCHEMAS: dict = {
                 "folder": {
                     "type": "string",
                     "description": "所在目录，默认 facts",
-                    "enum": ["facts", "reflections"],
+                    "enum": ["facts", "reflections", "episodes"],
                 },
             },
             "required": ["memory_id"],
@@ -189,30 +211,102 @@ TOOL_SCHEMAS: dict = {
 _TYPE_LABELS = {
     "fact": "事实",
     "reflection": "洞察",
+    "episode": "事件",
     "episodic": "事件",
     "summary": "摘要",
 }
 
 
+def _adapter_name(event) -> str:
+    """Return the adapter instance name used as the entity-id prefix."""
+    try:
+        return event.adapter.name if event and event.adapter else ""
+    except AttributeError:
+        return ""
+
+
+def _canonical_entity_id(event, value, *, explicit: bool = False) -> str:
+    """Prefix a bare platform id with the adapter name.
+
+    KiraOS entity ids are "{adapter}:{platform_id}" (for example qq:123456),
+    while KiraAI events and LLM tool arguments often carry the bare platform
+    id. Already-prefixed values are returned unchanged so ids handed back
+    from memory_search round-trip without an extra prefix.
+
+    explicit=True marks a value supplied by the LLM/operator. A value that
+    already contains a colon is treated as a fully-qualified entity id and is
+    preserved, which lets a WebChat session query imported qq: memories (and
+    any other adapter's entities) instead of rewriting the prefix.
+    """
+    raw = "" if value is None else str(value)
+    if not raw or raw == "unknown":
+        return raw
+    if explicit and ":" in raw:
+        return raw
+    adapter = _adapter_name(event)
+    if adapter and not raw.startswith(f"{adapter}:"):
+        return f"{adapter}:{raw}"
+    return raw
+
+
 def _primary_user_id(event) -> str:
-    """从 event 取出主发言者的 user_id"""
+    """从 event 取出主发言者的 canonical user_id"""
     try:
         if event and event.messages:
             last = event.messages[-1]
             if last.sender and last.sender.user_id:
-                return str(last.sender.user_id)
+                return resolve_entity_id(
+                    _canonical_entity_id(event, last.sender.user_id),
+                    ENTITY_USER,
+                )
     except AttributeError:
         pass
     return ""
 
 
+def _session_group_id(event) -> str:
+    """群会话的 canonical group entity id；私聊返回空串。"""
+    sess = getattr(event, "session", None)
+    if sess is None or getattr(sess, "session_type", "") != "gm":
+        return ""
+    sid = getattr(sess, "session_id", "")
+    if not sid:
+        return ""
+    return _canonical_entity_id(event, sid)
+
+
 def _resolve_entity(event, entity_id: str, entity_type: str) -> tuple[str, str]:
-    """缺省 entity_id 时回退到当前发言者；entity_type 为空时默认 user"""
-    if not entity_type:
-        entity_type = ENTITY_USER
+    """缺省 entity_id 时回退到当前发言者/当前群；entity_type 为空时默认 user"""
+    etype = (entity_type or "").strip().lower()
+    if etype not in (ENTITY_USER, ENTITY_GROUP, "channel", "global"):
+        etype = ENTITY_USER
+    if etype == "global":
+        return "", "global"
     if not entity_id:
-        entity_id = _primary_user_id(event)
-    return entity_id, entity_type
+        if etype == ENTITY_GROUP:
+            return _session_group_id(event), etype
+        return _primary_user_id(event), ENTITY_USER
+    resolved = _canonical_entity_id(event, entity_id, explicit=True)
+    if etype == ENTITY_USER:
+        resolved = resolve_entity_id(resolved, ENTITY_USER)
+    return resolved, etype
+
+
+def _parse_time_arg(value) -> Optional[float]:
+    """Parse YYYY-MM-DD or ISO time for memory_search filters."""
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 10:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid time {value!r}; expected YYYY-MM-DD or ISO") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.timestamp()
 
 
 def _format_memories(memories, entity_id: str = "") -> str:
@@ -308,6 +402,10 @@ async def memory_search(
     entity_id: str = "",
     entity_type: str = "user",
     k: int = 5,
+    folder: str = "all",
+    since: str = "",
+    until: str = "",
+    tags: list = None,
 ) -> str:
     if not manager or not hasattr(manager, "recall"):
         return "Memory system not available"
@@ -319,12 +417,62 @@ async def memory_search(
     except (TypeError, ValueError):
         k = 5
 
+    try:
+        since_ts = _parse_time_arg(since)
+        until_ts = _parse_time_arg(until)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if since_ts is not None and until_ts is not None and since_ts > until_ts:
+        return "Error: since must not be later than until"
+    filter_tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
+
+    folder_key = (folder or "all").strip().lower()
+    if folder_key not in ("all", "facts", "reflections", "episodes"):
+        return "Error: folder must be one of all/facts/reflections/episodes"
+    search_folders = None if folder_key == "all" else [folder_key]
+
+    normalized_type = (entity_type or ENTITY_USER).strip().lower()
+    if normalized_type == "global":
+        # 全局命名空间（黑话/常识等），entity_id 由调用方忽略。
+        memories = await manager.recall(
+            query,
+            entity_id="",
+            entity_type="",
+            k=k,
+            folders=["facts"],
+            base_dir="global",
+            since=since_ts,
+            until=until_ts,
+            tags=filter_tags or None,
+        )
+        return _format_memories(memories) or "No relevant memories found"
+
     # 拆分多 entity（逗号分隔）
     if entity_id and "," in entity_id:
-        names = [n.strip() for n in entity_id.split(",") if n.strip()]
+        names = [
+            (
+                resolve_entity_id(
+                    _canonical_entity_id(event, n.strip(), explicit=True),
+                    entity_type or ENTITY_USER,
+                )
+                if (entity_type or ENTITY_USER) == ENTITY_USER
+                else _canonical_entity_id(event, n.strip(), explicit=True)
+            )
+            for n in entity_id.split(",")
+            if n.strip()
+        ]
         if len(names) > 1:
             tasks = [
-                manager.recall(query, entity_id=n, entity_type=entity_type or ENTITY_USER, k=k)
+                manager.recall(
+                    query,
+                    entity_id=n,
+                    entity_type=entity_type or ENTITY_USER,
+                    k=k,
+                    folders=search_folders,
+                    since=since_ts,
+                    until=until_ts,
+                    tags=filter_tags or None,
+                )
                 for n in names
             ]
             all_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -343,7 +491,14 @@ async def memory_search(
         return "Error: cannot determine entity_id"
 
     memories = await manager.recall(
-        query, entity_id=entity_id, entity_type=entity_type, k=k
+        query,
+        entity_id=entity_id,
+        entity_type=entity_type,
+        k=k,
+        folders=search_folders,
+        since=since_ts,
+        until=until_ts,
+        tags=filter_tags or None,
     )
     return _format_memories(memories) or "No relevant memories found"
 

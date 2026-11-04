@@ -41,6 +41,7 @@ from starlette.routing import Route
 from core.logging_manager import get_logger
 
 from .memory import MemoryManager
+from .memory.identity import resolve_entity_id
 from .memory.memory_paths import (
     get_entities_dir,
     get_entity_dir,
@@ -151,6 +152,7 @@ def _resolve_path_params(
     elif folder is not None and not _validate_folder(folder):
         return JSONResponse({"error": "invalid folder"}, status_code=400), None, None, None
 
+    entity_id = resolve_entity_id(entity_id, entity_type)
     return None, entity_type, entity_id, folder
 
 
@@ -271,6 +273,12 @@ async def api_get_entity(request: Request) -> JSONResponse:
             entity_id=entity_id, entity_type=entity_type, folder="reflections"
         )
     ]
+    episodes = [
+        _memory_to_dict(m)
+        for m in await manager.tree_store.get_all_memories(
+            entity_id=entity_id, entity_type=entity_type, folder="episodes"
+        )
+    ]
 
     return JSONResponse({
         "entity_id": entity_id,
@@ -278,6 +286,7 @@ async def api_get_entity(request: Request) -> JSONResponse:
         "profile": profile.to_dict(),
         "facts": facts,
         "reflections": reflections,
+        "episodes": episodes,
     })
 
 
@@ -544,6 +553,8 @@ async def api_search(request: Request) -> JSONResponse:
     if raw_etype and raw_etype not in VALID_ENTITY_TYPES:
         return JSONResponse({"error": "invalid entity_type"}, status_code=400)
     entity_type = raw_etype  # "" or a valid type
+    if entity_id and (not entity_type or entity_type == ENTITY_USER):
+        entity_id = resolve_entity_id(entity_id, ENTITY_USER)
     try:
         k = max(1, min(50, int(request.query_params.get("k", 10))))
     except (TypeError, ValueError):

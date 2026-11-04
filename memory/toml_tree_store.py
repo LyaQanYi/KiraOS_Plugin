@@ -45,6 +45,7 @@ from .memory_paths import (
     get_entity_folder,
     ensure_entity_dirs,
 )
+from .identity import resolve_entity_id
 from .memory_index import MemoryIndex, normalize_tags
 
 logger = get_logger("kiraos_toml_tree_store", "green")
@@ -405,6 +406,7 @@ class TomlTreeStore:
         Args:
             semantic_id: 语义化 ID（如 "hates_css"），空则自动生成
         """
+        entity_id = resolve_entity_id(entity_id, entity_type)
         now = time.time()
         mem_id = semantic_id if semantic_id else self._generate_fallback_id(content_text)
         # semantic_id 来自外部（LLM 输出 / API caller），下游会拼成
@@ -505,6 +507,7 @@ class TomlTreeStore:
 
     async def update_memory(self, memory: Memory) -> bool:
         """更新记忆（TOML 文件内容 + 索引 meta）"""
+        memory._entity_id = resolve_entity_id(memory._entity_id, memory._entity_type)
         lock_key = self._cache_key(
             memory._entity_id, memory._entity_type, memory._folder, memory._base_dir
         )
@@ -546,6 +549,7 @@ class TomlTreeStore:
     ) -> Optional[Memory]:
         """精确获取一条记忆（TOML 文件内容 + 索引 meta）"""
         memory_id = self._validate_memory_id(memory_id)
+        entity_id = resolve_entity_id(entity_id, entity_type)
         d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
         fpath = os.path.join(d, f"{memory_id}.toml")
 
@@ -612,6 +616,7 @@ class TomlTreeStore:
     ) -> bool:
         """物理删除一条记忆（文件 + 索引）"""
         memory_id = self._validate_memory_id(memory_id)
+        entity_id = resolve_entity_id(entity_id, entity_type)
         d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
         fpath = os.path.join(d, f"{memory_id}.toml")
 
@@ -653,6 +658,7 @@ class TomlTreeStore:
         from .memory_paths import get_archive_dir, _id_to_path_segment
 
         memory_id = self._validate_memory_id(memory_id)
+        entity_id = resolve_entity_id(entity_id, entity_type)
         lock_key = self._cache_key(entity_id, entity_type, folder, base_dir)
         async with self._get_lock(lock_key):
             memory = await self.get_memory(
@@ -712,6 +718,7 @@ class TomlTreeStore:
         base_dir: str = "",
     ) -> List[Memory]:
         """获取指定目录下所有记忆"""
+        entity_id = resolve_entity_id(entity_id, entity_type)
         d = self._resolve_dir(entity_id, entity_type, folder, base_dir)
         if not os.path.exists(d):
             return []
@@ -787,8 +794,25 @@ class TomlTreeStore:
         k: int = 5,
         update_access: bool = False,
         query_embedding: list = None,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        tags: Optional[list] = None,
+        memory_type: str = "",
     ) -> List[Memory]:
-        """混合检索（FTS5 + 可选向量）"""
+        """混合检索（FTS5 + 可选向量）
+
+        since/until/tags/memory_type are optional post-filters used by the
+        memory_search tool for "deep" multi-step recall. When any is set the
+        index is over-fetched so filtering doesn't starve the result list.
+        """
+        entity_id = resolve_entity_id(entity_id, entity_type)
+        filtered = (
+            since is not None
+            or until is not None
+            or bool(tags)
+            or bool(memory_type)
+        )
+        fetch_k = min(200, max(k * 3, k + 10)) if filtered else k
         results = await asyncio.to_thread(
             self.index.hybrid_search,
             query=query,
@@ -797,14 +821,28 @@ class TomlTreeStore:
             entity_type=entity_type,
             folder=folder,
             base_dir=base_dir,
-            k=k,
+            k=fetch_k,
         )
 
         if not results:
             return []
 
+        required_tags = set(normalize_tags(tags or []))
         memories = []
         for r in results:
+            if memory_type and r.get("memory_type") != memory_type:
+                continue
+            row_ts = float(r.get("timestamp") or 0)
+            if since is not None and row_ts < float(since):
+                continue
+            if until is not None and row_ts > float(until):
+                continue
+            if required_tags:
+                row_tags = set(normalize_tags(r.get("tags") or []))
+                if not required_tags.issubset(row_tags):
+                    continue
+            if len(memories) >= k:
+                break
             mem = Memory(
                 id=r["id"],
                 type=r.get("memory_type", "fact"),
@@ -885,8 +923,18 @@ class TomlTreeStore:
         folders: list = None,
         k: int = 5,
         query_embedding: list = None,
+        base_dir: str = "",
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        tags: Optional[list] = None,
+        memory_type: str = "",
     ) -> List[Memory]:
-        """跨多个目录检索，合并排序"""
+        """跨多个目录检索，合并排序
+
+        base_dir 用于全局命名空间检索（"global" / "global/self"）：此时
+        entity_id/entity_type 为空，过滤由索引层的 base_dir 条件完成。
+        """
+        entity_id = resolve_entity_id(entity_id, entity_type)
         if folders is None:
             folders = ["facts", "reflections"]
 
@@ -897,8 +945,13 @@ class TomlTreeStore:
                 entity_id=entity_id,
                 entity_type=entity_type,
                 folder=folder,
+                base_dir=base_dir,
                 k=k,
                 query_embedding=query_embedding,
+                since=since,
+                until=until,
+                tags=tags,
+                memory_type=memory_type,
             )
             all_results.extend(results)
 
@@ -926,6 +979,70 @@ class TomlTreeStore:
         """从文件系统重建 SQLite 索引（灾难恢复）"""
         await asyncio.to_thread(self.index.rebuild_index_from_files, get_memory_root())
         logger.info("Index rebuilt from files")
+
+    @staticmethod
+    def _count_memory_files(root: str) -> int:
+        """Count TOML files the startup rebuild would scan (archive excluded)."""
+        count = 0
+        root = os.path.abspath(root)
+        archive = os.path.join(root, "archive")
+        for dirpath, dirnames, filenames in os.walk(root):
+            if os.path.abspath(dirpath) == archive:
+                dirnames[:] = []
+                continue
+            count += sum(1 for name in filenames if name.endswith(".toml"))
+        return count
+
+    async def ensure_index_fresh(self, *, force: bool = False) -> dict:
+        """Rebuild the SQLite index only when it is actually out of sync.
+
+        A full rebuild of 20k+ TOML files tokenizes every text with jieba and
+        takes tens of seconds. KiraOS used to do that on every plugin load and
+        every WebUI config save (KiraAI re-initializes the plugin after a config
+        update), which made the UI appear frozen. The index is written
+        synchronously by add/update/delete/archive, so a matching row count is a
+        safe, cheap freshness signal: a missing/deleted TOML changes the file
+        count, and a crash between TOML and index writes leaves the counts
+        different. Text-only manual edits still need force=True (exposed as the
+        force_rebuild_index config switch).
+        """
+        root = get_memory_root()
+        if force:
+            await self.rebuild_index()
+            return {"rebuilt": True, "reason": "forced"}
+
+        db_path = self.index.db_path
+        if not os.path.exists(db_path):
+            await self.rebuild_index()
+            return {"rebuilt": True, "reason": "index_missing"}
+
+        try:
+            index_count = await asyncio.to_thread(self.index.count_all)
+        except Exception as exc:
+            logger.warning("Cannot read memory index count: %s; rebuilding", exc)
+            await self.rebuild_index()
+            return {"rebuilt": True, "reason": "index_unreadable"}
+
+        file_count = await asyncio.to_thread(self._count_memory_files, root)
+        if index_count == file_count:
+            logger.info(
+                "Memory index is up to date (%d entries); skipping full rebuild",
+                index_count,
+            )
+            return {"rebuilt": False, "files": file_count, "index": index_count}
+
+        logger.info(
+            "Memory index count mismatch (index=%d files=%d); rebuilding",
+            index_count,
+            file_count,
+        )
+        await self.rebuild_index()
+        return {
+            "rebuilt": True,
+            "reason": "count_mismatch",
+            "files": file_count,
+            "index": index_count,
+        }
 
     async def ensure_indexed(self, memory: Memory):
         """确保单条记忆在索引中（用于旧文件迁移）"""

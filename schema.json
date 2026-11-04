@@ -116,6 +116,156 @@
             }
         }
     },
+    "inject_group_memory": {
+        "name": "Inject group memory",
+        "type": "switch",
+        "default": true,
+        "hint": "In group chats, inject the group profile plus top-K facts/reflections stored under the group entity. Imported chat summaries and group knowledge stay invisible to the LLM when this is off.",
+        "locales": {
+            "zh": {
+                "name": "注入群聊记忆",
+                "hint": "群聊时注入群画像，以及该群实体下 top-K 的 facts/reflections。关闭后，导入的群聊摘要和群知识不会进入 system prompt（只存不读）。"
+            }
+        }
+    },
+    "inject_global_facts": {
+        "name": "Inject global knowledge",
+        "type": "switch",
+        "default": true,
+        "hint": "Inject top-K facts from the global namespace (global/facts), such as imported jargon or shared knowledge. Off means those memories are stored but never recalled into the prompt.",
+        "locales": {
+            "zh": {
+                "name": "注入全局知识",
+                "hint": "每轮注入 global/facts 命名空间下 top-K 的事实，例如导入的黑话/共享常识。关闭后这些记忆只存不读。"
+            }
+        }
+    },
+    "identity_aliases": {
+        "name": "Cross-adapter identity aliases",
+        "type": "list",
+        "default": [],
+        "hint": "Map adapter-scoped user entity ids to one canonical user, one entry per alias, in the form alias=canonical. Example: [\"webchat:admin=qq:1000000001\", \"telegram:123=qq:1000000001\"]. Data written under an alias is merged into the canonical entity on the next plugin start; only user entities are affected.",
+        "locales": {
+            "zh": {
+                "name": "跨 adapter 身份关联",
+                "hint": "把不同 adapter 下的同一个用户实体映射到同一个 canonical 用户，一行一个，格式 alias=canonical。例如：[\"webchat:admin=qq:1000000001\", \"telegram:123=qq:1000000001\"]。启动时会把 alias 下已有的画像/记忆合并进 canonical 实体；只影响 user 实体，不影响群/频道。"
+            }
+        }
+    },
+    "enable_episode_memory": {
+        "name": "Enable episode memory",
+        "type": "switch",
+        "default": true,
+        "hint": "Buffer every conversational message per session and periodically summarize the window into one episode memory (theme/summary/keywords) under entities/{user|group}/episodes. This is the QanMoCore chat_history-style event layer; it costs one extraction LLM call per flushed window.",
+        "locales": {
+            "zh": {
+                "name": "启用事件记忆",
+                "hint": "按会话缓冲所有聊天消息，定期用提取 LLM 总结成一条事件记忆（主题/概括/关键词），写入 entities/{user|group}/episodes。对应 QanMoCore chat_history 的事件层，每个窗口会多一次 LLM 调用。"
+            }
+        }
+    },
+    "episode_threshold": {
+        "name": "Episode message threshold",
+        "type": "integer",
+        "default": 40,
+        "minimum": 5,
+        "maximum": 200,
+        "hint": "Flush an episode after this many buffered messages (also flushes after episode_window_minutes).",
+        "locales": {
+            "zh": {
+                "name": "事件触发消息数",
+                "hint": "一个会话缓冲达到多少条消息后触发事件总结（同时也会按时间窗口触发）。"
+            }
+        }
+    },
+    "episode_window_minutes": {
+        "name": "Episode time window (minutes)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 240,
+        "hint": "Flush an episode when the oldest buffered message is older than this many minutes, even if the message threshold was not reached.",
+        "locales": {
+            "zh": {
+                "name": "事件时间窗口（分钟）",
+                "hint": "缓冲中最旧消息超过这么多分钟时也会触发事件总结，即使消息数没到阈值。"
+            }
+        }
+    },
+    "episode_require_bot": {
+        "name": "Only summarize chats the bot joined",
+        "type": "switch",
+        "default": true,
+        "hint": "Skip an episode window when the bot never spoke in it. Mirrors QanMoCore's bot-participation gate and avoids paying for summaries of every group.",
+        "locales": {
+            "zh": {
+                "name": "只总结 bot 参与的对话",
+                "hint": "窗口内没有 bot 发言时丢弃，不生成事件记忆。对应 QanMoCore 的 bot 参与门控，避免为每个群都付费总结。"
+            }
+        }
+    },
+    "inject_episodes": {
+        "name": "Inject episode memories",
+        "type": "switch",
+        "default": true,
+        "hint": "Include episodes/ in user/group recall (top-K) and allow memory_search folder=episodes.",
+        "locales": {
+            "zh": {
+                "name": "注入事件记忆",
+                "hint": "把 episodes/ 目录纳入用户/群聊的 top-K 召回，并允许 memory_search 选择 episodes 目录。"
+            }
+        }
+    },
+    "persist_hippocampus_pending": {
+        "name": "Persist hippocampus pending queue",
+        "type": "switch",
+        "default": true,
+        "hint": "Write pre-hippocampus chunks to a hidden .hippocampus_pending file and restore them on restart. Prevents losing up to hippocampus_threshold turns per session.",
+        "locales": {
+            "zh": {
+                "name": "持久化海马体待处理队列",
+                "hint": "把尚未达到阈值的对话块写入隐藏文件 .hippocampus_pending，重启后恢复，避免每个会话丢掉最多 hippocampus_threshold 轮对话。"
+            }
+        }
+    },
+    "inject_recent_recall": {
+        "name": "Inject recent recall",
+        "type": "switch",
+        "default": true,
+        "hint": "Keep the last successful recall block per session for recall_cache_ttl seconds and inject it as [最近回忆] on later turns, mirroring QanMoCore thinking_back answer reuse.",
+        "locales": {
+            "zh": {
+                "name": "注入最近回忆",
+                "hint": "按会话缓存最近一次成功召回的内容，在 TTL 内作为 [最近回忆] 注入后续轮次，对应 QanMoCore thinking_back 的答案复用。"
+            }
+        }
+    },
+    "recall_cache_ttl": {
+        "name": "Recent recall TTL (seconds)",
+        "type": "integer",
+        "default": 600,
+        "minimum": 0,
+        "maximum": 86400,
+        "hint": "How long a cached recall block stays eligible for [最近回忆]. 0 disables the cache.",
+        "locales": {
+            "zh": {
+                "name": "最近回忆缓存时长（秒）",
+                "hint": "缓存召回内容可被作为 [最近回忆] 复用的时长，0 表示关闭。"
+            }
+        }
+    },
+    "force_rebuild_index": {
+        "name": "Force index rebuild on startup",
+        "type": "switch",
+        "default": false,
+        "hint": "Rebuild memory_index.db from all TOML files on every plugin load. Leave off: startup only rebuilds when the index row count and TOML file count differ (or the index is missing/unreadable), which keeps WebUI config saves fast. Turn on once after manually editing TOML files, then turn it off again.",
+        "locales": {
+            "zh": {
+                "name": "启动时强制重建索引",
+                "hint": "每次插件加载都从全部 TOML 重建 memory_index.db。默认关闭：启动时只有索引行数和 TOML 文件数不一致（或索引缺失/损坏）才重建，这样 WebUI 保存配置不会卡住。手动改过 TOML 后可以临时开启一次，再关掉。"
+            }
+        }
+    },
     "enable_decay": {
         "name": "Enable forgetting (decay)",
         "type": "switch",
@@ -145,11 +295,11 @@
         "type": "integer",
         "default": 1500,
         "minimum": 200,
-        "hint": "Truncate the injected recall block to N characters before injecting into the system prompt. Prevents excessive context pollution when many long memories are recalled.",
+        "hint": "Total character budget for recalled memories injected into the system prompt. The budget is split evenly across active scopes (user / group / global) so one long scope cannot crowd the others out. Profiles are rendered outside this budget.",
         "locales": {
             "zh": {
                 "name": "召回文本最大长度",
-                "hint": "注入到 system prompt 前截断召回块的字符数。防止召回过多长记忆时污染上下文。"
+                "hint": "注入到 system prompt 的召回段总字符预算，在 user / group / global 各作用域之间均分，避免某一类长记忆挤掉其它类。画像段不计入此预算。"
             }
         }
     },

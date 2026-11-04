@@ -25,6 +25,8 @@ KiraOS Plugin — Combines two OS-level capabilities:
 """
 
 import asyncio
+import os
+import time
 from typing import Optional
 
 from core.plugin import BasePlugin, logger, on, Priority, register_tool
@@ -34,8 +36,11 @@ from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, Kir
 from core.utils.path_utils import get_data_path
 
 from .memory import MemoryManager
+from .memory import identity as identity_map
+from .memory.identity_migration import reconcile_identity_aliases
 from .memory.memory_paths import (
     set_data_root,
+    get_entity_profile_path,
     ENTITY_USER,
     ENTITY_GROUP,
 )
@@ -140,6 +145,37 @@ class UserMemoryPlugin(BasePlugin):
         self._inject_profile = bool(cfg.get("inject_profile", True))
         self._inject_facts = bool(cfg.get("inject_facts", True))
         self._inject_reflections = bool(cfg.get("inject_reflections", True))
+        # Group-level memories and the global knowledge namespace are stored
+        # under `group`/`global`; without these switches they would be written
+        # but never reach the LLM. Both are opt-out so existing installs keep
+        # working if they prefer the old, user-only prompt.
+        self._inject_group_memory = bool(cfg.get("inject_group_memory", True))
+        self._inject_global_facts = bool(cfg.get("inject_global_facts", True))
+        # Episode (event) memory: summarize whole conversation windows, not
+        # only the current speaker's facts.
+        self._enable_episode_memory = bool(cfg.get("enable_episode_memory", True))
+        self._episode_threshold = max(5, min(200, int(cfg.get("episode_threshold", 40))))
+        self._episode_window_minutes = max(1, int(cfg.get("episode_window_minutes", 30)))
+        self._episode_require_bot = bool(cfg.get("episode_require_bot", True))
+        self._inject_episodes = bool(cfg.get("inject_episodes", True))
+        # Runtime state persistence / recent-recall cache.
+        self._persist_hippocampus_pending = bool(cfg.get("persist_hippocampus_pending", True))
+        self._inject_recent_recall = bool(cfg.get("inject_recent_recall", True))
+        try:
+            self._recall_cache_ttl = max(0, int(cfg.get("recall_cache_ttl", 600)))
+        except (TypeError, ValueError):
+            self._recall_cache_ttl = 600
+        self._force_rebuild_index = bool(cfg.get("force_rebuild_index", False))
+        # Cross-adapter identity aliases, e.g. ["webchat:admin=qq:1000000001"].
+        # Parsed/validated in initialize() before the manager is constructed.
+        self._identity_aliases = list(cfg.get("identity_aliases", []) or [])
+
+        # Serializes initialize/terminate. KiraAI re-initializes a plugin after
+        # every WebUI config save; without this lock a terminate can run while
+        # an in-flight initialize is still using self.memory_manager, which
+        # produced "NoneType has no attribute tree_store" and left the plugin
+        # half-initialized.
+        self._lifecycle_lock = asyncio.Lock()
 
         # The handle to the dual-brain manager. Set in initialize().
         self.memory_manager: Optional[MemoryManager] = None
@@ -173,10 +209,32 @@ class UserMemoryPlugin(BasePlugin):
     # ════════════════════════════════════════════════════════════════
 
     async def initialize(self):
+        async with self._lifecycle_lock:
+            try:
+                await self._initialize_unlocked()
+            except BaseException:
+                # KiraAI's init_plugin failure path only unregisters plugin
+                # components; it does not call terminate(). Clean up here so a
+                # half-initialized manager/SQLite handle/WebUI server cannot
+                # leak into the next config save.
+                try:
+                    await self._terminate_unlocked()
+                except Exception as cleanup_error:
+                    logger.warning(f"Cleanup after failed initialize failed: {cleanup_error}")
+                raise
+
+    async def _initialize_unlocked(self):
+        if self.memory_manager is not None:
+            try:
+                self.memory_manager.close()
+            except Exception as e:
+                logger.warning(f"Closing previous memory manager failed: {e}")
+            self.memory_manager = None
         await self._disable_builtin_memory()
 
-        # ── Memory: data root + legacy migration + manager ─────────
+        # ── Memory: data root + identity aliases + legacy migration ─
         set_data_root(self._data_root)
+        identity_map.set_aliases(self._identity_aliases)
 
         if self._auto_migrate:
             legacy_db_path = self._data_root / "kiraos.db"
@@ -195,7 +253,34 @@ class UserMemoryPlugin(BasePlugin):
             llm_chat_timeout=self._llm_chat_timeout,
             profile_compact_threshold=self._profile_compact_threshold,
             profile_compact_max_chars=self._profile_compact_max_chars,
+            enable_episode_memory=self._enable_episode_memory,
+            episode_threshold=self._episode_threshold,
+            episode_window_minutes=self._episode_window_minutes,
+            episode_require_bot=self._episode_require_bot,
+            persist_hippocampus_pending=self._persist_hippocampus_pending,
+            recall_cache_ttl=self._recall_cache_ttl,
+            force_rebuild_index=self._force_rebuild_index,
         )
+
+        # Fold user entities written under an alias (e.g. webchat:admin)
+        # into their canonical entity before async_init() rebuilds the index.
+        try:
+            reconciled = await reconcile_identity_aliases(
+                self.memory_manager.profile_store
+            )
+            if any(
+                reconciled.get(key)
+                for key in (
+                    "aliases",
+                    "profiles_merged",
+                    "files_moved",
+                    "duplicates_removed",
+                )
+            ):
+                logger.info(f"Identity aliases reconciled: {reconciled}")
+        except Exception as e:
+            logger.error(f"Identity alias reconcile failed (non-fatal): {e}", exc_info=True)
+
         await self.memory_manager.async_init()
 
         # ── Hippocampus plugin migration (after manager init) ──────
@@ -391,6 +476,10 @@ class UserMemoryPlugin(BasePlugin):
             return None
 
     async def terminate(self):
+        async with self._lifecycle_lock:
+            await self._terminate_unlocked()
+
+    async def _terminate_unlocked(self):
         if self._webui_server:
             try:
                 await self._webui_server.stop()
@@ -654,16 +743,82 @@ class UserMemoryPlugin(BasePlugin):
         logger.info(f"Slash command '{cmd}' matched skill '{skill.name}'")
 
     # ════════════════════════════════════════════════════════════════
+    #  Episode Buffer — record every conversational message
+    # ════════════════════════════════════════════════════════════════
+
+    @on.im_message(priority=Priority.LOW)
+    async def record_episode_incoming(self, event: KiraMessageEvent):
+        """Record every incoming conversational message into the episode window.
+
+        The hippocampus feed only sees messages that triggered a reply; episode
+        memory needs the surrounding group conversation too. This hook does not
+        alter routing (it never calls event.stop/trigger), so it is safe to run
+        for every message.
+        """
+        if not self.memory_manager or not self._enable_episode_memory:
+            return
+        message = getattr(event, "message", None)
+        if message is None or getattr(message, "is_notice", False):
+            return
+        sender = getattr(message, "sender", None)
+        self_id = getattr(message, "self_id", None)
+        if sender is not None and self_id and str(sender.user_id) == str(self_id):
+            return
+        text = self._extract_message_text(message)
+        if not text:
+            return
+        session_id = self._session_id_from_event(event)
+        if not session_id:
+            return
+        timestamp = getattr(message, "timestamp", None) or getattr(event, "timestamp", None)
+        try:
+            self.memory_manager.record_episode_message(
+                session_id,
+                "user",
+                text,
+                sender_id=getattr(sender, "user_id", "") if sender else "",
+                sender_name=getattr(sender, "nickname", "") if sender else "",
+                timestamp=float(timestamp) if timestamp else None,
+            )
+        except Exception as e:
+            logger.debug(f"Episode record failed for {session_id}: {e}")
+
+    # ════════════════════════════════════════════════════════════════
     #  Helpers
     # ════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _extract_user_ids(event: KiraMessageBatchEvent) -> list[str]:
+    def _canonical_entity_id(event: KiraMessageBatchEvent, raw_id) -> str:
+        """Prefix a bare platform user id with the adapter name.
+
+        KiraOS stores every entity as "{adapter}:{platform_id}" (e.g.
+        "qq:123456") — the same convention the hippocampus uses when it
+        routes extracted facts and the one _parse_entity_from_session
+        documents. KiraAI events however carry the *bare* platform id on
+        sender.user_id ("123456"). Reading a profile with the bare id
+        silently misses everything the hippocampus wrote, so profile
+        lookup and recall must canonicalise first.
+        """
+        raw = "" if raw_id is None else str(raw_id)
+        if not raw or raw == "unknown":
+            return raw
+        adapter = ""
+        try:
+            adapter = event.adapter.name if event.adapter else ""
+        except AttributeError:
+            adapter = ""
+        if adapter and not raw.startswith(f"{adapter}:"):
+            return f"{adapter}:{raw}"
+        return raw
+
+    @classmethod
+    def _extract_user_ids(cls, event: KiraMessageBatchEvent) -> list[str]:
         seen = set()
         user_ids = []
         for msg in event.messages:
             if msg.sender and msg.sender.user_id:
-                uid = msg.sender.user_id
+                uid = cls._canonical_entity_id(event, msg.sender.user_id)
+                uid = identity_map.resolve_entity_id(uid, ENTITY_USER)
                 if uid not in seen and uid != "unknown":
                     seen.add(uid)
                     user_ids.append(uid)
@@ -671,11 +826,51 @@ class UserMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _get_primary_user_id(event: KiraMessageBatchEvent) -> str:
+        """Return the raw (un-prefixed) primary sender id.
+
+        Kept raw on purpose: feed_hippocampus forwards this into the chunk
+        and MemoryManager._resolve_fact_entity adds the adapter prefix
+        itself. Canonicalising here would produce "qq:qq:123".
+        """
         if event.messages:
             last_msg = event.messages[-1]
             if last_msg.sender and last_msg.sender.user_id:
                 return last_msg.sender.user_id
         return "unknown"
+
+    @staticmethod
+    def _extract_message_text(message) -> str:
+        """Concatenate the text elements of one KiraIMMessage."""
+        try:
+            from core.chat.message_elements import Text
+        except ImportError:
+            Text = None
+        parts = []
+        chain = getattr(message, "chain", None)
+        if chain is None:
+            return ""
+        for elem in chain:
+            if Text is not None and isinstance(elem, Text):
+                parts.append(elem.text)
+            elif hasattr(elem, "text"):
+                parts.append(getattr(elem, "text", ""))
+        return " ".join(part for part in parts if part).strip()
+
+    @staticmethod
+    def _session_id_from_event(event) -> str:
+        """Build adapter:type:id for a KiraMessageEvent/KiraMessageBatchEvent."""
+        try:
+            adapter = event.adapter.name if event.adapter else ""
+        except AttributeError:
+            adapter = ""
+        session = getattr(event, "session", None)
+        if session is None:
+            return ""
+        session_type = getattr(session, "session_type", "") or ""
+        session_id = getattr(session, "session_id", "") or ""
+        if not session_type or not session_id:
+            return ""
+        return f"{adapter or 'unknown'}:{session_type}:{session_id}"
 
     @staticmethod
     def _extract_latest_user_text(event: KiraMessageBatchEvent) -> str:
@@ -721,6 +916,46 @@ class UserMemoryPlugin(BasePlugin):
         uid = self._get_primary_user_id(event)
         return f"{adapter or 'unknown'}:dm:{uid}"
 
+    def _build_recall_text(self, scopes: list) -> str:
+        """Render recalled scopes within max_recall_chars.
+
+        Profiles are rendered separately and are never counted against this
+        budget. The recall budget is split evenly across the active scopes
+        (user / group / global) so a long user-memory list cannot push the
+        group and global sections out of the prompt entirely.
+        """
+        scopes = [(title, lines) for title, lines in scopes if lines]
+        if not scopes:
+            return ""
+        limit = getattr(self, "_max_recall_chars", 0)
+        if not limit or limit <= 0:
+            return "\n\n".join(
+                title + "\n" + "\n".join(lines) for title, lines in scopes
+            )
+        per_scope = max(200, limit // len(scopes))
+        rendered = []
+        truncated = False
+        for title, lines in scopes:
+            kept = []
+            total = len(title) + 1
+            for line in lines:
+                if kept and total + len(line) + 1 > per_scope:
+                    truncated = True
+                    break
+                if not kept and len(line) > per_scope:
+                    line = line[: max(0, per_scope - 8)] + "…"
+                    truncated = True
+                kept.append(line)
+                total += len(line) + 1
+            if kept:
+                rendered.append(title + "\n" + "\n".join(kept))
+        if not rendered:
+            return ""
+        body = "\n\n".join(rendered)
+        if truncated:
+            body += "\n\n…（记忆已截断）"
+        return body
+
     # ════════════════════════════════════════════════════════════════
     #  LLM Hook — inject memory context + skill manifest descriptions
     # ════════════════════════════════════════════════════════════════
@@ -731,7 +966,19 @@ class UserMemoryPlugin(BasePlugin):
         if not self.memory_manager:
             return
 
-        memory_blocks = []
+        profile_blocks = []
+        recall_scopes: list = []
+        seen_memory_keys: set = set()
+
+        # ── 0. Current session entity (group vs DM) ─────────────────
+        session_eid, session_etype = "", ""
+        session_key = self._build_session_id(event)
+        try:
+            session_eid, session_etype = MemoryManager._parse_entity_from_session(
+                session_key
+            )
+        except (ValueError, AttributeError):
+            session_eid, session_etype = "", ""
 
         # ── 1. Per-user profile prompts ─────────────────────────────
         if self._inject_profile:
@@ -741,37 +988,170 @@ class UserMemoryPlugin(BasePlugin):
                         uid, ENTITY_USER
                     )
                     if prompt and prompt.strip() and prompt.strip() != "暂无画像信息":
-                        memory_blocks.append(f"[用户 {uid} 画像]\n{prompt}")
+                        profile_blocks.append(f"[用户 {uid} 画像]\n{prompt}")
                 except Exception as e:
                     logger.warning(f"Failed to load profile for {uid}: {e}")
 
-        # ── 2. Top-K recalled memories for the latest query ─────────
+        # ── 2. Group profile (group sessions only) ──────────────────
+        if (
+            self._inject_group_memory
+            and session_etype == ENTITY_GROUP
+            and session_eid
+        ):
+            try:
+                # Check the file first: get_profile() creates a default
+                # profile.json when missing, which would litter entities/ for
+                # every group the bot merely visits.
+                if os.path.exists(
+                    get_entity_profile_path(session_eid, ENTITY_GROUP)
+                ):
+                    group_prompt = await self.memory_manager.get_profile_prompt(
+                        session_eid, ENTITY_GROUP
+                    )
+                    if (
+                        group_prompt
+                        and group_prompt.strip()
+                        and group_prompt.strip() != "暂无画像信息"
+                    ):
+                        profile_blocks.append(
+                            f"[群 {session_eid} 画像]\n{group_prompt}"
+                        )
+            except Exception as e:
+                logger.warning(f"Failed to load group profile for {session_eid}: {e}")
+
+        # ── 3. Recalled memories (user / group / global) ────────────
         if self._inject_facts or self._inject_reflections:
             query = self._extract_latest_user_text(event)
             if query:
-                primary_uid = self._get_primary_user_id(event)
-                if primary_uid and primary_uid != "unknown":
+                primary_uid = identity_map.resolve_entity_id(
+                    self._canonical_entity_id(
+                        event, self._get_primary_user_id(event)
+                    ),
+                    ENTITY_USER,
+                )
+
+                async def _recall_block(
+                    title: str,
+                    entity_id: str,
+                    entity_type: str,
+                    *,
+                    folders=None,
+                    base_dir: str = "",
+                ):
+                    """Recall one scope and return (title, formatted lines)."""
                     try:
                         memories = await self.memory_manager.recall(
                             query=query,
-                            entity_id=primary_uid,
-                            entity_type=ENTITY_USER,
+                            entity_id=entity_id,
+                            entity_type=entity_type,
                             k=self._recall_top_k,
+                            folders=folders,
+                            base_dir=base_dir,
                         )
-                        recalled_lines = []
-                        for mem in memories or []:
-                            if mem.type == "reflection" and not self._inject_reflections:
-                                continue
-                            if mem.type == "fact" and not self._inject_facts:
-                                continue
-                            tags_str = f" [{', '.join(mem.tags)}]" if mem.tags else ""
-                            recalled_lines.append(f"- [{mem.type}]{tags_str} {mem.raw_text}")
-                        if recalled_lines:
-                            memory_blocks.append("[相关记忆]\n" + "\n".join(recalled_lines))
                     except Exception as e:
-                        logger.warning(f"Recall failed: {e}")
+                        logger.warning(f"Recall failed for {title}: {e}")
+                        return None
+                    lines = []
+                    for mem in memories or []:
+                        if mem.type == "reflection" and not self._inject_reflections:
+                            continue
+                        if mem.type == "fact" and not self._inject_facts:
+                            continue
+                        key = (
+                            getattr(mem, "_entity_type", ""),
+                            getattr(mem, "_entity_id", ""),
+                            getattr(mem, "_folder", ""),
+                            mem.id,
+                        )
+                        if key in seen_memory_keys:
+                            continue
+                        seen_memory_keys.add(key)
+                        tags_str = f" [{', '.join(mem.tags)}]" if mem.tags else ""
+                        lines.append(f"- [{mem.type}]{tags_str} {mem.raw_text}")
+                    return (title, lines) if lines else None
 
-        memory_context = "\n\n".join(memory_blocks)
+                async def _collect(scope) -> None:
+                    block = await scope
+                    if block:
+                        recall_scopes.append(block)
+
+                recall_folders = ["facts", "reflections"]
+                if self._inject_episodes:
+                    recall_folders.append("episodes")
+
+                if primary_uid and primary_uid != "unknown":
+                    await _collect(
+                        _recall_block(
+                            "[相关记忆]",
+                            primary_uid,
+                            ENTITY_USER,
+                            folders=recall_folders,
+                        )
+                    )
+                if (
+                    self._inject_group_memory
+                    and session_etype == ENTITY_GROUP
+                    and session_eid
+                ):
+                    await _collect(
+                        _recall_block(
+                            "[群聊相关记忆]",
+                            session_eid,
+                            ENTITY_GROUP,
+                            folders=recall_folders,
+                        )
+                    )
+                if self._inject_global_facts:
+                    await _collect(
+                        _recall_block(
+                            "[通用知识]",
+                            "",
+                            "",
+                            folders=["facts"],
+                            base_dir="global",
+                        )
+                    )
+
+                # Cache only the current query's recalls; the [最近回忆]
+                # block below is re-surfaced from the cache, not re-cached.
+                cache_recall_text = self._build_recall_text(recall_scopes)
+
+                # QanMoCore-style thinking_back: keep the last successful
+                # recall for this session and surface it while it is fresh.
+                if self._inject_recent_recall and session_key:
+                    try:
+                        recent = self.memory_manager.recall_cache.get(session_key)
+                    except Exception:
+                        recent = None
+                    if (
+                        recent
+                        and recent.get("text")
+                        and recent.get("query") != query
+                    ):
+                        recent_lines = [
+                            line
+                            for line in str(recent["text"]).splitlines()
+                            if line.strip()
+                        ][:12]
+                        if recent_lines:
+                            recall_scopes.append(("[最近回忆]", recent_lines))
+
+        recall_text = self._build_recall_text(recall_scopes)
+        if (
+            self._inject_recent_recall
+            and session_key
+            and query
+            and cache_recall_text
+        ):
+            try:
+                self.memory_manager.recall_cache.record(
+                    session_key, query, cache_recall_text
+                )
+            except Exception as e:
+                logger.debug(f"Recall cache write failed for {session_key}: {e}")
+        memory_context = "\n\n".join(
+            profile_blocks + ([recall_text] if recall_text else [])
+        )
 
         # ── 3. Skill manifest one-liner ─────────────────────────────
         skill_line = ""
@@ -863,6 +1243,16 @@ class UserMemoryPlugin(BasePlugin):
             return
 
         session_id = self._build_session_id(event)
+        if assistant_text and self._enable_episode_memory:
+            try:
+                self.memory_manager.record_episode_message(
+                    session_id,
+                    "assistant",
+                    assistant_text,
+                    timestamp=time.time(),
+                )
+            except Exception as e:
+                logger.debug(f"Episode assistant record failed for {session_id}: {e}")
         try:
             await self.memory_manager.update_memory(session_id, chunk)
         except Exception as e:

@@ -593,6 +593,12 @@ class MemoryIndex:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def count_all(self) -> int:
+        """Total row count across every namespace (used by startup freshness check)."""
+        with self._read() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM memories").fetchone()
+        return int(row[0]) if row else 0
+
     def count_memories(
         self,
         entity_id: str = "",

@@ -313,10 +313,16 @@ async function renderDetail() {
       <h3>Reflections (${data.reflections.length})</h3>
       <div class="memory-list" id="reflections-list"></div>
     </div>
+
+    <div class="card">
+      <h3>Episodes (${(data.episodes || []).length})</h3>
+      <div class="memory-list" id="episodes-list"></div>
+    </div>
   `;
 
   renderMemoryList("facts-list", data.facts, "facts");
   renderMemoryList("reflections-list", data.reflections, "reflections");
+  renderMemoryList("episodes-list", data.episodes || [], "episodes");
 
   document.getElementById("save-profile").onclick = saveProfile;
   document.getElementById("delete-entity").onclick = deleteEntity;

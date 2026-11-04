@@ -179,7 +179,7 @@ class MemoryDecayEngine:
         entities = list_all_entities()
 
         for entity_id, entity_type in entities:
-            for folder in ("facts", "reflections"):
+            for folder in ("facts", "reflections", "episodes"):
                 try:
                     d, dg = await self.garbage_collect(entity_id, entity_type, folder)
                     total_deleted += d

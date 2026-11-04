@@ -27,6 +27,9 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
   - [架构概览](#架构概览)
   - [LLM 工具清单](#llm-工具清单)
   - [上下文自动注入](#上下文自动注入)
+  - [跨 adapter 身份关联](#跨-adapter-身份关联)
+  - [事件记忆（Episode）](#事件记忆-episode)
+  - [运行状态与最近回忆](#运行状态与最近回忆)
   - [海马体（慢系统）](#海马体慢系统)
   - [TOML 真相源](#toml-真相源)
 - [Memory WebUI](#memory-webui)
@@ -35,6 +38,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 - [数据存储](#数据存储)
 - [从 v2 迁移](#从-v2-迁移)
 - [从 Hippocampus Memory 插件迁移](#从-hippocampus-memory-插件迁移)
+- [从 MaiBot / QanMoCore 迁移记忆](#从-maibot--qanmocore-迁移记忆)
 - [故障排除](#故障排除)
 
 ---
@@ -188,9 +192,14 @@ KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时
 
 `memory_type` 取 `fact`（默认，落在 `facts/`）或 `reflection`（落在 `reflections/`）。
 
-#### `memory_search(query, entity_id?, entity_type?, k=5)`
+#### `memory_search(query, entity_id?, entity_type?, folder?, since?, until?, tags?, k=5)`
 
 在指定实体的长期记忆中搜索。`entity_id` 可以是逗号分隔的多个 ID，工具会**并行检索**并把结果拼起来。
+
+- `folder`：`all`（默认）/ `facts` / `reflections` / `episodes`
+- `since` / `until`：按记忆创建时间过滤，格式 `YYYY-MM-DD` 或 ISO 时间
+- `tags`：要求同时包含这些标签
+- 复杂问题可以换关键词/时间范围**多次调用**，由主 LLM 自己完成多步回忆（KiraOS 不额外嵌套 Agent）
 
 打分维度：
 - FTS5 匹配分（jieba 中文分词）
@@ -220,12 +229,62 @@ KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时
 
 ### 上下文自动注入
 
-每次 LLM 调用前 `@on.llm_request` 钩子会注入两类内容到 `system_prompt` 的 `memory` 段：
+每次 LLM 调用前 `@on.llm_request` 钩子会注入到 `system_prompt` 的 `memory` 段：
 
-1. **画像段** — 当前消息中所有发言者的画像（受 `inject_profile` 配置控制）
-2. **召回段** — 基于"最新一条用户消息"对主发言者做 top-K 检索（受 `recall_top_k` 控制，可分别开关 fact / reflection 注入）
+1. **画像段** — 当前消息中所有发言者的用户画像（受 `inject_profile` 控制）；群聊时还会注入当前群的群画像（受 `inject_group_memory` 控制）
+2. **召回段** — 基于“最新一条用户消息”做 top-K 检索：
+   - 主发言者的 user facts/reflections（受 `recall_top_k` 控制）
+   - 当前群的 group facts/reflections（受 `inject_group_memory` 控制）
+   - `global/facts` 的全局知识（受 `inject_global_facts` 控制，如导入的黑话）
+   - fact / reflection 可分别用 `inject_facts` / `inject_reflections` 开关；召回段总量受 `max_recall_chars` 限制，预算在 user/group/global 之间均分，避免某一类挤掉其它类
 
-末尾还会追加一段"主动记忆提示"，鼓励 LLM 看到事实就调用 `memory_add` 记录。
+末尾还会追加一段“主动记忆提示”，鼓励 LLM 看到事实就调用 `memory_add` 记录。
+
+### 跨 adapter 身份关联
+
+同一个人可能通过 QQ、WebChat、Telegram、Discord 等多个 adapter 和 bot 聊天。KiraOS 默认按 `{adapter}:{platform_id}` 隔离实体，于是每个账号会得到独立画像和记忆。`identity_aliases` 可以把这些账号映射到同一个 canonical 用户实体：
+
+```json
+{
+  "identity_aliases": [
+    "webchat:admin=qq:1000000001",
+    "telegram:123456=qq:1000000001"
+  ]
+}
+```
+
+格式是一行一个 `alias=canonical`，两边都必须是完整的 `adapter:id`。只影响 **user** 实体；群/频道不参与。
+
+启用后：
+
+- 所有读写（画像、facts、recall、工具、WebUI、海马体路由）都会先解析到 canonical 用户，新记忆不会再分裂到 alias 实体。
+- 启动时会把 `entities/user_{alias}/` 里已有的画像和 TOML 合并进 canonical：facts/traits/aliases 取并集，interaction_count 相加，last_interaction 取最大；同文本记忆去重，同文件名不同文本会加内容 hash 后缀，不覆盖。
+- 合并是幂等的：alias 目录处理后会被删除，下次启动无事可做。
+- 支持链式映射（`telegram:42=webchat:admin`，`webchat:admin=qq:...`）和循环检测；非法/循环条目会在日志里告警并跳过。
+- 只做合并、不做反向拆分：把已有数据改成 alias 映射容易，撤掉映射不会把 canonical 里的数据自动还回去。
+
+典型用途：给内置 WebChat 配 `"webchat:admin=qq:<你的QQ号>"`，这样在本体 WebChat 里聊天时，bot 会自动使用你 QQ 账号的画像和记忆，而不是空的 `webchat:admin` 画像。
+
+### 事件记忆（Episode）
+
+QanMoCore 的 `chat_history` 层是“事件记忆”：把一段群聊切成话题，总结成主题/概括/关键词/关键信息点，之后用 ReAct Agent 检索。KiraOS 的 facts/reflections 偏原子事实，会丢掉“这段时间群里发生了什么”的叙事，所以新增了 episode 层：
+
+- `on.im_message` 记录**每一条**会话消息（不只触发 bot 回复的那条），`on.step_result` 记录 bot 的回复；群聊/私聊都缓冲。
+- 缓冲达到 `episode_threshold` 条，或最旧消息超过 `episode_window_minutes` 分钟时，用提取 LLM 总结成一条事件：
+  - `theme`（主题）、`summary`（概括）、`keywords`、`participants`
+- 落盘到 `entities/{user|group}_{id}/episodes/episode_*.toml`：
+  `type = "episode"`, `importance = 6`, `tags = 关键词`, `source = 会话/时间/参与人/消息数`
+- episode 和 facts/reflections 共用 FTS 索引与 recall；`inject_episodes` 控制是否注入，`memory_search(folder="episodes")` 可直接检索。
+- `episode_require_bot=true`（默认）时，窗口里没有 bot 发言就丢弃，避免为每个群都付费总结。
+- 缓冲写入 `data/memory/.episode_buffers`，重启后继续；没有 LLM 时保留缓冲等下次。
+
+### 运行状态与最近回忆
+
+这两项对应 QanMoCore 的“工作缓存 + thinking_back 答案复用”：
+
+- `.hippocampus_pending`：尚未达到 `hippocampus_threshold`、或失败待重试的对话块，重启后恢复，避免每个会话丢最多几轮上下文。
+- `.recall_cache`：每个会话最近一次成功召回的内容，在 `recall_cache_ttl`（默认 600 秒）内作为 `[最近回忆]` 注入下一轮，避免新消息一换就“忘记刚才聊过什么”。
+- 两者都是隐藏文件，不带 `.json` 后缀，启动重建索引时不会被当成旧 JSON 记忆扫描。
 
 ### 海马体（慢系统）
 
@@ -325,6 +384,19 @@ webui_token: "your-secret-token"  # 可选；为空表示无认证
 | `inject_profile` | bool | true | 是否每轮注入用户画像 |
 | `inject_facts` | bool | true | 是否每轮注入召回的 facts |
 | `inject_reflections` | bool | true | 是否每轮注入召回的 reflections |
+| `inject_group_memory` | bool | true | 群聊时是否注入群画像与该群 top-K 记忆 |
+| `inject_global_facts` | bool | true | 是否每轮注入 global/facts 的 top-K 全局知识 |
+| `max_recall_chars` | int | 1500 | 召回段总字符预算（user/group/global 均分） |
+| `identity_aliases` | list | `[]` | 跨 adapter 用户映射，格式 `alias=canonical`，如 `webchat:admin=qq:123` |
+| `enable_episode_memory` | bool | true | 事件记忆：缓冲整段会话并总结成 episode |
+| `episode_threshold` | int | 40 | 缓冲多少条消息触发事件总结 |
+| `episode_window_minutes` | int | 30 | 缓冲最旧消息超过多少分钟也触发 |
+| `episode_require_bot` | bool | true | 只总结 bot 参与过的窗口 |
+| `inject_episodes` | bool | true | 召回/注入 episodes 目录 |
+| `persist_hippocampus_pending` | bool | true | 持久化海马体待处理队列 |
+| `inject_recent_recall` | bool | true | 注入最近一次召回（[最近回忆]） |
+| `recall_cache_ttl` | int | 600 | 最近回忆缓存时长（秒，0=关闭） |
+| `force_rebuild_index` | bool | false | 每次启动强制全量重建索引（平时只在索引与 TOML 数量不一致时重建） |
 | `enable_decay` | bool | true | 启用记忆衰减（手动调用，未来加调度） |
 | `auto_migrate_legacy_db` | bool | true | 启动时自动迁移 v2 kiraos.db |
 | `skills_dir` | string | `data/skills/` | 技能目录 |
@@ -343,15 +415,21 @@ data/memory/
 ├── memory_index.db                      # SQLite 索引（可重建）
 ├── chat_memory.json                     # 短期对话历史
 ├── .migrated_v3                         # 迁移标记（v2 → v3 一次性迁移）
+├── .qanmocore_migrated                  # QanMoCore 导入 manifest（隐藏，无 .json）
+├── .hippocampus_pending                 # 未处理/失败重试的海马体 chunk（隐藏）
+├── .episode_buffers                     # 事件记忆的会话缓冲（隐藏）
+├── .recall_cache                        # 最近召回缓存（隐藏）
 ├── entities/
 │   ├── user_{quoted_id}/                # 例: user_telegram%3A12345 (URL-encoded)
 │   │   ├── profile.json                 # 用户画像
 │   │   ├── facts/{id}.toml              # 细粒度事实
-│   │   └── reflections/{id}.toml        # 高阶洞察
+│   │   ├── reflections/{id}.toml        # 高阶洞察
+│   │   └── episodes/{id}.toml           # 事件记忆（type=episode）
 │   ├── group_{quoted_id}/               # 群 ID 同样 URL-encoded
 │   │   ├── profile.json
 │   │   ├── facts/
-│   │   └── reflections/
+│   │   ├── reflections/
+│   │   └── episodes/
 │   └── channel_{quoted_id}/...
 ├── global/
 │   ├── facts/
@@ -456,6 +534,7 @@ cat data/memory/.hippocampus_migrated
 
 ---
 
+
 ## 故障排除
 
 ### 启动报 `No module named 'tomli_w'` / `No module named 'jieba'` 等
@@ -475,7 +554,7 @@ WebUI 装的插件会自动跑，本地直接 clone 的需要手动跑一次。`
 检查端口是否被占用；token 是否匹配；浏览器控制台 fetch 报错的具体 HTTP 状态码。
 
 ### 想完整重建索引
-删掉 `data/memory/memory_index.db`，重启插件即可。TOML 文件是真相源，索引会从零重建。
+平时启动**不会**全量重建：只有索引行数与 TOML 文件数不一致（或索引缺失/损坏）才重建，所以 2 万条记忆也不会拖慢每次启动。手动改过 TOML 文本后，可以临时把 `force_rebuild_index` 设为 `true` 启动一次，再关掉；或删掉 `data/memory/memory_index.db` 重启。TOML 文件是真相源。
 
 ### 想完整重置记忆
 关闭插件，删整个 `data/memory/`，重启。所有数据丢失（包括 v2 备份），慎用。

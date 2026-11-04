@@ -11,24 +11,29 @@ import asyncio
 import hashlib
 import json
 import os
-import time
+from pathlib import Path
 from typing import Dict, Optional, List
 from threading import Lock
 from asyncio import Lock as AsyncLock
 
 from core.logging_manager import get_logger
 
+from .episode_manager import EpisodeManager, EPISODE_BUFFER_FILE_NAME
+from .identity import resolve_entity_id
 from .session import Session
 from .memory_index import MemoryIndex
 from .toml_tree_store import TomlTreeStore, Memory
 from .entity_profile import EntityProfileStore, EntityProfile
 from .memory_extractor import MemoryExtractor, _MERGE_MAX_CHARS
 from .memory_router import MemoryRouter
+from .pending_store import PendingStore, PENDING_FILE_NAME
+from .recall_cache import RecallCache, RECALL_CACHE_FILE_NAME
 from .memory_paths import (
     ensure_directory_structure,
     list_all_entities,
     get_chat_memory_path,
     get_entity_profile_path,
+    get_memory_root,
     ENTITY_USER,
     ENTITY_GROUP,
 )
@@ -75,6 +80,13 @@ class MemoryManager:
         llm_chat_timeout: float = 30.0,
         profile_compact_threshold: int = _PROFILE_COMPACT_THRESHOLD,
         profile_compact_max_chars: int = _PROFILE_COMPACT_MAX_CHARS,
+        enable_episode_memory: bool = True,
+        episode_threshold: int = 40,
+        episode_window_minutes: int = 30,
+        episode_require_bot: bool = True,
+        persist_hippocampus_pending: bool = True,
+        recall_cache_ttl: float = 600.0,
+        force_rebuild_index: bool = False,
     ):
         self.max_memory_length = int(max_memory_length)
         # Same clamps as the schema minimums (main.py clamps too).
@@ -111,8 +123,40 @@ class MemoryManager:
         )
         self.router = MemoryRouter()
 
+        # === 事件记忆（episodes）===
+        self.enable_episode_memory = bool(enable_episode_memory)
+        self.recall_folders = (
+            ("facts", "reflections", "episodes")
+            if self.enable_episode_memory
+            else ("facts", "reflections")
+        )
+        self.episode_manager: Optional[EpisodeManager] = None
+        if self.enable_episode_memory:
+            self.episode_manager = EpisodeManager(
+                self.tree_store,
+                buffer_path=Path(get_memory_root()) / EPISODE_BUFFER_FILE_NAME,
+                threshold=episode_threshold,
+                window_minutes=episode_window_minutes,
+                require_bot=episode_require_bot,
+                llm_timeout=max(5.0, float(llm_chat_timeout)),
+            )
+            self.episode_manager.set_llm_client(llm_client)
+
+        # === 最近回忆缓存 ===
+        self.recall_cache = RecallCache(
+            Path(get_memory_root()) / RECALL_CACHE_FILE_NAME,
+            ttl=recall_cache_ttl,
+        )
+
+        # === 索引启动校验 ===
+        self._force_rebuild_index = bool(force_rebuild_index)
+
         # === 后台任务管理 ===
-        self._pending_conversations: Dict[str, list] = {}
+        self._persist_pending = bool(persist_hippocampus_pending)
+        self._pending_store = PendingStore(Path(get_memory_root()) / PENDING_FILE_NAME)
+        self._pending_conversations: Dict[str, list] = (
+            self._pending_store.load() if self._persist_pending else {}
+        )
         self._hippocampus_threshold = int(hippocampus_threshold)
         self._hippocampus_lock = Lock()
         self._background_tasks: set = set()
@@ -135,8 +179,31 @@ class MemoryManager:
         TOML 文件是真相源（用户可直接编辑），SQLite 是运行时索引。
         每次启动全量 rebuild，保证两者一致。
         """
-        await self.tree_store.rebuild_index()
-        logger.info("Memory index rebuilt from TOML files (startup sync)")
+        if self._force_rebuild_index:
+            await self.tree_store.rebuild_index()
+            logger.info("Memory index rebuilt from TOML files (forced startup rebuild)")
+        else:
+            try:
+                result = await self.tree_store.ensure_index_fresh()
+                if result.get("rebuilt"):
+                    logger.info(
+                        "Memory index rebuilt from TOML files (reason=%s)",
+                        result.get("reason"),
+                    )
+                else:
+                    logger.info(
+                        "Memory index already fresh (%d entries); startup rebuild skipped",
+                        result.get("index", 0),
+                    )
+            except Exception as exc:
+                # A freshness check must never prevent the plugin from starting.
+                logger.warning(
+                    "Index freshness check failed (%s); falling back to full rebuild",
+                    exc,
+                )
+                await self.tree_store.rebuild_index()
+        if self.episode_manager is not None:
+            self.episode_manager.start()
 
     def close(self) -> None:
         """释放持有的资源（目前是 SQLite 句柄）。
@@ -146,6 +213,12 @@ class MemoryManager:
         连接同时开着；Windows 上还会让打开的 db 文件阻止数据目录被删除。
         在 drain 掉后台海马体任务之后调用（那些任务还要写 TOML + 索引）。
         """
+        if self.episode_manager is not None:
+            try:
+                self.episode_manager.stop()
+            except Exception as e:
+                logger.warning(f"Episode manager close failed: {e}")
+        self._persist_pending_queue()
         try:
             self.tree_store.close()
         except Exception as e:
@@ -170,6 +243,8 @@ class MemoryManager:
         self._reflection_client = reflection_client
         self.extractor.set_extraction_client(extraction_client)
         self.extractor.set_reflection_client(reflection_client)
+        if self.episode_manager is not None:
+            self.episode_manager.set_llm_client(extraction_client)
 
         # 主动 drain pending：扫一遍所有 session，已达阈值的立刻调度。
         # 在 hippocampus_lock 内取出 + 清空 pending，跟 _buffer_for_hippocampus
@@ -184,6 +259,8 @@ class MemoryManager:
                 if len(chunks) >= self._hippocampus_threshold:
                     to_dispatch.append((session, list(chunks)))
                     self._pending_conversations[session] = []
+        if to_dispatch:
+            self._persist_pending_queue()
         for session, chunks in to_dispatch:
             task = loop.create_task(self._hippocampus_process(session, chunks))
             with self._background_tasks_lock:
@@ -343,10 +420,19 @@ class MemoryManager:
         entity_id: str = "",
         entity_type: str = "user",
         k: int = 5,
+        folders: list = None,
+        base_dir: str = "",
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        tags: Optional[list] = None,
+        memory_type: str = "",
     ) -> List[Memory]:
         """检索相关长期记忆（对话前调用）
 
-        跨 facts + reflections 联合检索，按综合分数排序。
+        默认跨某实体的 facts + reflections/episodes 联合检索。传
+        base_dir="global" 时检索全局命名空间（例如 global/facts 里的
+        黑话/常识），此时 entity_id / entity_type 应为空。since/until/tags
+        是可选过滤条件，供 memory_search 做“深度回忆”式多步查询。
         遵循宪章 §7：不在检索时 +1 access_count。
         """
         try:
@@ -354,16 +440,23 @@ class MemoryManager:
         except (TypeError, ValueError):
             k = 5
 
-        if not entity_id:
+        if not entity_id and not base_dir:
             return []
+        if folders is None:
+            folders = list(self.recall_folders)
 
         try:
             return await self.tree_store.search_across_folders(
                 query=query,
                 entity_id=entity_id,
                 entity_type=entity_type,
-                folders=["facts", "reflections"],
+                folders=folders,
                 k=k,
+                base_dir=base_dir,
+                since=since,
+                until=until,
+                tags=tags,
+                memory_type=memory_type,
             )
         except Exception as e:
             logger.error(f"Recall error: {e}")
@@ -378,6 +471,7 @@ class MemoryManager:
         type_labels = {
             "fact": "事实",
             "reflection": "洞察",
+            "episode": "事件",
             "episodic": "事件",
             "skill": "技能",
             "summary": "摘要",
@@ -472,6 +566,40 @@ class MemoryManager:
     # 海马体（慢系统 — 后台处理）
     # ==========================================
 
+    def _persist_pending_queue(self) -> None:
+        """Persist the current pre-hippocampus queue (runtime state)."""
+        if not self._persist_pending:
+            return
+        try:
+            self._pending_store.save(self._pending_conversations)
+        except Exception as e:
+            logger.warning(f"Failed to persist hippocampus pending queue: {e}")
+
+    def record_episode_message(
+        self,
+        session: str,
+        role: str,
+        content: str,
+        *,
+        sender_id: str = "",
+        sender_name: str = "",
+        timestamp: float = None,
+    ) -> None:
+        """Feed one message into the episode window (user OR assistant)."""
+        if self.episode_manager is None:
+            return
+        try:
+            self.episode_manager.record_message(
+                session,
+                role,
+                content,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                timestamp=timestamp,
+            )
+        except Exception as e:
+            logger.warning(f"Episode buffer record failed for {session}: {e}")
+
     def _buffer_for_hippocampus(self, session: str, new_chunk):
         """将新对话缓冲到待处理队列"""
         # 非会话类 session（系统消息等）不该进海马体：它没有对应的用户/群实体。
@@ -495,6 +623,8 @@ class MemoryManager:
                 chunks_to_process = self._pending_conversations[session][:]
                 self._pending_conversations[session] = []
 
+        self._persist_pending_queue()
+
         if chunks_to_process is not None:
             try:
                 loop = asyncio.get_running_loop()
@@ -512,6 +642,7 @@ class MemoryManager:
                         )
                     else:
                         self._pending_conversations[session] = chunks_to_process
+                self._persist_pending_queue()
                 logger.debug("No running event loop, skipping hippocampus processing")
 
     def _on_background_task_done(self, task: asyncio.Task):
@@ -585,12 +716,16 @@ class MemoryManager:
 
         # 1. LLM 输出了 speaker_id，且在 chunk 元数据中能找到
         if speaker_id and speaker_id in sender_map:
-            return f"{adapter}:{sender_map[speaker_id]}", ENTITY_USER
+            return resolve_entity_id(
+                f"{adapter}:{sender_map[speaker_id]}", ENTITY_USER
+            ), ENTITY_USER
 
         # 2. LLM 输出的 subject 匹配 chunk 中某个用户昵称
         if subject and subject.lower() in sender_map:
             matched_id = sender_map[subject.lower()]
-            return f"{adapter}:{matched_id}", ENTITY_USER
+            return resolve_entity_id(
+                f"{adapter}:{matched_id}", ENTITY_USER
+            ), ENTITY_USER
 
         # 3. 明确的群组级信息
         if subject.lower() == "group":
@@ -598,9 +733,15 @@ class MemoryManager:
 
         # 4. 如果整个对话只有一个 sender，所有个人事实都归这个人
         if len(unique_senders) == 1:
-            return f"{adapter}:{unique_senders[0]}", ENTITY_USER
+            return resolve_entity_id(
+                f"{adapter}:{unique_senders[0]}", ENTITY_USER
+            ), ENTITY_USER
 
         # 5. 兜底：多人对话且无法匹配，存到 session entity
+        if session_entity_type == ENTITY_USER:
+            return resolve_entity_id(
+                session_entity_id, ENTITY_USER
+            ), ENTITY_USER
         return session_entity_id, session_entity_type
 
     async def _hippocampus_process(self, session: str, chunks: list):
@@ -620,6 +761,7 @@ class MemoryManager:
                 pending = self._pending_conversations.setdefault(session, [])
                 # 把这次的 chunks 放到队首，保持原始时间顺序。
                 self._pending_conversations[session] = list(chunks) + pending
+            self._persist_pending_queue()
             return
 
         try:
@@ -726,6 +868,7 @@ class MemoryManager:
             with self._hippocampus_lock:
                 pending = self._pending_conversations.setdefault(session, [])
                 self._pending_conversations[session] = list(chunks) + pending
+            self._persist_pending_queue()
             logger.error(
                 f"Hippocampus processing error: {e}; "
                 f"re-buffered {len(chunks)} chunks for retry",
@@ -919,7 +1062,7 @@ class MemoryManager:
 
         parts = []
         for sid in unique_senders:
-            entity_id = f"{adapter}:{sid}"
+            entity_id = resolve_entity_id(f"{adapter}:{sid}", ENTITY_USER)
             try:
                 profile = await self.profile_store.get_profile(entity_id, ENTITY_USER)
                 # 用昵称/名字标识，避免暴露系统 entity_id
@@ -989,7 +1132,9 @@ class MemoryManager:
         if session_type == "gm":
             return f"{adapter}:{session_id}", ENTITY_GROUP
         if session_type == "dm":
-            return f"{adapter}:{session_id}", ENTITY_USER
+            return resolve_entity_id(
+                f"{adapter}:{session_id}", ENTITY_USER
+            ), ENTITY_USER
         raise ValueError(
             f"Non-conversational session type {session_type!r}: {session}"
         )
