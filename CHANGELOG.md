@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **QanMoCore / MaiBot memory importer** (`memory/migration_qanmocore.py` +
+  `scripts/import_qanmocore.py`). Read-only, idempotent one-shot import of
+  `person_info` profiles and memory points, `chat_history` summaries,
+  `memory_chest`, `jargon`, `thinking_back`, `memory_conflicts` and the legacy
+  `memory` table into KiraOS TOML + `profile.json`. No LLM/network calls;
+  a hidden `.qanmocore_migrated` manifest records per-item state so reruns do
+  not duplicate memories, deleted/edited imports are never resurrected, and
+  user-owned memories with colliding ids are never overwritten. Supports
+  `--dry-run`, category filters, date/per-chat caps, and a JSON report under
+  `data/migration_reports/`. See the README section "从 MaiBot / QanMoCore
+  迁移记忆".
 - **Group and global memory injection**. `inject_context` now also injects the
   current group profile and top-K group facts/reflections, plus top-K
   `global/facts` entries (imported jargon/knowledge), gated by the new
@@ -75,7 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
-- `tests/test_entity_ids.py` and `tests/test_injection_scopes.py` cover id canonicalisation and group/global injection.
+- `tests/test_entity_ids.py`, `tests/test_injection_scopes.py` and
+  `tests/test_qanmocore_migration.py` cover id canonicalisation, group/global
+  injection, and the importer's mapping/idempotency/read-only guarantees.
 
 ## [4.0.1] - 2026-10-19
 
