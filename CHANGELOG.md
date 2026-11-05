@@ -5,6 +5,78 @@ All notable changes to KiraOS Plugin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Group and global memory injection**. `inject_context` now also injects the
+  current group profile and top-K group facts/reflections, plus top-K
+  `global/facts` entries (imported jargon/knowledge), gated by the new
+  `inject_group_memory` and `inject_global_facts` switches (both default on).
+  `memory_search` accepts `entity_type=global`.
+- `max_recall_chars` is now actually enforced (block-aware truncation); it was
+  read into config but never applied.
+- **Cross-adapter identity aliases** (`identity_aliases`). Map
+  `{adapter}:{id}` user entities to one canonical user so QQ / WebChat /
+  Telegram/Discord accounts share a single profile and fact set. Storage,
+  tools, WebUI and hippocampus routing resolve aliases before touching data;
+  a startup reconcile merges pre-existing `entities/user_{alias}/` profiles
+  and TOMLs into the canonical entity (union/dedupe, no overwrite, idempotent).
+  Example: `webchat:admin=qq:1000000001`. Only user entities are affected.
+- **Episode (event) memory**, ported from MaiBot's `chat_history` layer.
+  Every conversational message (not just bot-triggered turns) is buffered per
+  session; every `episode_threshold` messages or `episode_window_minutes`
+  minutes the extraction LLM summarizes the window into theme/summary/
+  keywords/participants and stores it under `entities/{user|group}/episodes/`
+  as `type="episode"`. Episodes share the FTS index and recall path, can be
+  injected (`inject_episodes`) and searched with
+  `memory_search(folder="episodes")`; `episode_require_bot` keeps
+  summary costs to chats the bot actually joined. Buffers persist in
+  `.episode_buffers`.
+- **Persistent hippocampus queue** (`.hippocampus_pending`). Pre-threshold and
+  failed-retry chunks survive a restart instead of being lost from the
+  in-memory dict. Controlled by `persist_hippocampus_pending`.
+- **Recent-recall cache** (`.recall_cache`). The last successful recall block
+  per session is kept for `recall_cache_ttl` (default 600s) and injected as
+  `[最近回忆]` on a later query, mirroring MaiBot `thinking_back` answer
+  reuse. Controlled by `inject_recent_recall`.
+- **Deep-recall filters for `memory_search`**: `folder`
+  (all/facts/reflections/episodes), `since`, `until` and `tags`. The main LLM
+  can now perform multi-step retrieval itself instead of KiraOS nesting a
+  second ReAct agent.
+
+### Fixed
+
+- **Fast startup / config-save hang.** KiraOS no longer rebuilds the whole
+  20k+ TOML index on every plugin load. TomlTreeStore.ensure_index_fresh()
+  only rebuilds when the SQLite row count differs from the TOML file count
+  (or the index is missing/unreadable); a new force_rebuild_index switch
+  restores the old always-rebuild behavior for manual TOML edits. On a 23k
+  memory store this cuts startup from roughly 60-90s to about 0.2s.
+- **Lifecycle serialization.** initialize() and terminate() now share an
+  asyncio.Lock. KiraAI re-initializes a plugin after each WebUI config save;
+  without the lock a terminate could run while initialize was still using
+  self.memory_manager, producing "NoneType has no attribute tree_store" and a
+  half-initialized plugin. Config saves now wait for a short, serialized
+  reinit instead of racing a long rebuild.
+- **Entity-id canonicalisation.** Profile lookup, recall and the memory tools
+  now use the documented `{adapter}:{platform_id}` entity id (e.g.
+  `qq:123456`). KiraAI events expose the bare platform id on
+  `sender.user_id`, so the old code read a different namespace than the
+  hippocampus writes and never saw its profiles/facts. The raw id is still
+  what `feed_hippocampus` puts into a chunk, avoiding a double prefix.
+- Group and global memories are no longer write-only: they can reach the
+  system prompt and are searchable through `memory_search`.
+- Explicit cross-adapter entity ids are preserved by the memory tools: a
+  WebChat session can query imported `qq:` profiles/memories with
+  `memory_search(entity_id="qq:...", entity_type="user")` or `profile_view`
+  instead of having the current adapter prefix prepended. Bare ids still
+  resolve to the current adapter.
+
+### Tests
+
+- `tests/test_entity_ids.py` and `tests/test_injection_scopes.py` cover id canonicalisation and group/global injection.
+
 ## [4.0.1] - 2026-10-19
 
 ### Fixed

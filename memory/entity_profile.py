@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, fields, asdict
 from typing import Optional
 
 from core.logging_manager import get_logger
+from .identity import resolve_entity_id
 from .memory_paths import (
     get_entity_profile_path,
     ensure_entity_dirs,
@@ -120,7 +121,9 @@ class EntityProfileStore:
         self, entity_id: str, entity_type: str
     ) -> asyncio.Lock:
         """Return the per-entity lock, creating it on first use."""
-        key = (entity_id, entity_type)
+        # Aliases and their canonical id must share one lock: the read-modify-
+        # write sequences below always save to the canonical entity.
+        key = (resolve_entity_id(entity_id, entity_type), entity_type)
         lock = self._entity_locks.get(key)
         if lock is not None:
             return lock
@@ -140,6 +143,7 @@ class EntityProfileStore:
         瞬时 I/O 故障…），返回一个内存级默认画像但**不**回写覆盖磁盘——否则就
         会把用户原本的数据静默清空。文件不存在的情况才会触发自动创建。
         """
+        entity_id = resolve_entity_id(entity_id, entity_type)
         fpath = get_entity_profile_path(entity_id, entity_type)
 
         if os.path.exists(fpath):
@@ -161,6 +165,7 @@ class EntityProfileStore:
 
     async def save_profile(self, profile: EntityProfile) -> bool:
         """保存画像到文件"""
+        profile.entity_id = resolve_entity_id(profile.entity_id, profile.entity_type)
         ensure_entity_dirs(profile.entity_id, profile.entity_type)
         fpath = get_entity_profile_path(profile.entity_id, profile.entity_type)
 
@@ -263,6 +268,7 @@ class EntityProfileStore:
         缺失（并发删除或原位替换），放弃本次压实并返回 ``None``，避免旧摘要
         复活过期事实，也绝不覆盖一份读不出来的画像。
         """
+        entity_id = resolve_entity_id(entity_id, entity_type)
         fpath = get_entity_profile_path(entity_id, entity_type)
         async with await self._get_entity_lock(entity_id, entity_type):
             if not os.path.exists(fpath):
@@ -426,6 +432,7 @@ class EntityProfileStore:
         self, entity_id: str, entity_type: str = ENTITY_USER
     ) -> bool:
         """删除画像文件"""
+        entity_id = resolve_entity_id(entity_id, entity_type)
         fpath = get_entity_profile_path(entity_id, entity_type)
         try:
             if os.path.exists(fpath):

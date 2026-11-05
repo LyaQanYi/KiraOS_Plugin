@@ -238,6 +238,18 @@ _install_host_stubs()
 import pytest  # noqa: E402  (must follow stub installation)
 
 
+@pytest.fixture(autouse=True)
+def _reset_identity_aliases():
+    """Keep the process-global cross-adapter alias map isolated per test."""
+    from plugins.KiraOS_Plugin.memory import identity
+
+    identity.clear_aliases()
+    try:
+        yield
+    finally:
+        identity.clear_aliases()
+
+
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     """A throwaway data root, with the stubbed `get_data_path()` pointed at it.

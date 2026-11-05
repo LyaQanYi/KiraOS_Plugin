@@ -42,7 +42,7 @@ ENTITY_CHANNEL = "channel"
 VALID_ENTITY_TYPES = {ENTITY_USER, ENTITY_GROUP, ENTITY_CHANNEL}
 
 # ========== 记忆子目录 ==========
-MEMORY_FOLDERS = ("facts", "reflections", "skills")
+MEMORY_FOLDERS = ("facts", "reflections", "episodes", "skills")
 
 # ========== ID 安全校验 ==========
 _SAFE_ID_RE = re.compile(r"^[\w\-.:]+$")
@@ -196,9 +196,9 @@ def ensure_entity_dirs(entity_id: str, entity_type: str):
 
     # 不同实体类型有不同的子目录集合
     if entity_type == ENTITY_USER:
-        folders = ("facts", "reflections")
+        folders = ("facts", "reflections", "episodes")
     elif entity_type == ENTITY_GROUP:
-        folders = ("facts", "reflections")
+        folders = ("facts", "reflections", "episodes")
     elif entity_type == ENTITY_CHANNEL:
         folders = ("facts",)
     else:
