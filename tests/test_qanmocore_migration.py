@@ -1,8 +1,8 @@
-"""QanMoCore -> KiraOS importer tests.
+"""MaiBot -> KiraOS importer tests.
 
 A tiny synthetic MaiBot database exercises every source mapping, the
 ownership/idempotency rules, and the read-only guarantee. The fixtures mirror
-the real schema columns selected by migration_qanmocore.QanMoCoreSource.
+the real schema columns the importer reads from the source database.
 """
 
 from __future__ import annotations

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CLI wrapper for the QanMoCore -> KiraOS memory importer.
+"""CLI wrapper for the MaiBot -> KiraOS memory importer.
 
 Run it with the KiraAI virtualenv:
 
     python KiraOS_Plugin/scripts/import_qanmocore.py \
-        --source ../QanMoCore/data \
+        --source ../MaiBot/data \
         --data-dir ../KiraAI/data \
         --dry-run
 
@@ -35,9 +35,9 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 def _find_source() -> Optional[Path]:
     candidates = [
-        PLUGIN_ROOT.parent / "QanMoCore" / "data",
-        Path.cwd() / "QanMoCore" / "data",
-        Path.cwd().parent / "QanMoCore" / "data",
+        PLUGIN_ROOT.parent / "MaiBot" / "data",
+        Path.cwd() / "MaiBot" / "data",
+        Path.cwd().parent / "MaiBot" / "data",
     ]
     for candidate in candidates:
         if candidate.is_dir():
@@ -200,7 +200,7 @@ class _ImportLock:
                         pass
                     continue
                 raise RuntimeError(
-                    f"another QanMoCore import appears to be running (lock: {self.path})"
+                    f"another MaiBot import appears to be running (lock: {self.path})"
                 ) from exc
             break
         if self.fd is None:
@@ -260,7 +260,7 @@ def _write_report(data_dir: Path, stats, options, manifest_path) -> Path:
 
 def _print_summary(stats, source_dir: Path, report_path: Optional[Path]) -> None:
     print("=" * 64)
-    print("QanMoCore -> KiraAI / KiraOS memory import")
+    print("MaiBot -> KiraAI / KiraOS memory import")
     print(f"  source: {source_dir}")
     print(f"  target: {stats.output_root}")
     print(f"  dry-run: {stats.dry_run}")
@@ -292,10 +292,10 @@ def _print_summary(stats, source_dir: Path, report_path: Optional[Path]) -> None
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Import MaiBot / QanMoCore long-term memory into KiraOS TOML storage."
+        description="Import MaiBot long-term memory into KiraOS TOML storage."
     )
     parser.add_argument("--source", type=Path, default=None,
-                        help="QanMoCore data directory (contains MaiBot.db)")
+                        help="MaiBot data directory (contains MaiBot.db)")
     parser.add_argument("--data-dir", type=Path, default=None,
                         help="KiraAI data directory (defaults to the installed plugin layout)")
     parser.add_argument("--kira-root", type=Path, default=None,
@@ -358,7 +358,7 @@ def main(argv: Optional[list] = None) -> int:
     source_dir = (args.source or _find_source())
     if source_dir is None or not (source_dir / "MaiBot.db").is_file():
         print(
-            "ERROR: cannot locate QanMoCore/data/MaiBot.db. Pass --source /path/to/QanMoCore/data.",
+            "ERROR: cannot locate MaiBot/data/MaiBot.db. Pass --source /path/to/MaiBot/data.",
             file=sys.stderr,
         )
         return 2

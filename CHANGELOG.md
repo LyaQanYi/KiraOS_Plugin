@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **QanMoCore / MaiBot memory importer** (`memory/migration_qanmocore.py` +
+- **MaiBot memory importer** (`memory/migration_qanmocore.py` +
   `scripts/import_qanmocore.py`). Read-only, idempotent one-shot import of
   `person_info` profiles and memory points, `chat_history` summaries,
   `memory_chest`, `jargon`, `thinking_back`, `memory_conflicts` and the legacy
@@ -18,8 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not duplicate memories, deleted/edited imports are never resurrected, and
   user-owned memories with colliding ids are never overwritten. Supports
   `--dry-run`, category filters, date/per-chat caps, and a JSON report under
-  `data/migration_reports/`. See the README section "从 MaiBot / QanMoCore
-  迁移记忆".
+  `data/migration_reports/`. See the README section "从 MaiBot 迁移记忆".
 - **Group and global memory injection**. `inject_context` now also injects the
   current group profile and top-K group facts/reflections, plus top-K
   `global/facts` entries (imported jargon/knowledge), gated by the new

@@ -38,6 +38,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 - [数据存储](#数据存储)
 - [从 v2 迁移](#从-v2-迁移)
 - [从 Hippocampus Memory 插件迁移](#从-hippocampus-memory-插件迁移)
+- [从 MaiBot 迁移记忆](#从-maibot-迁移记忆)
 - [故障排除](#故障排除)
 
 ---
@@ -533,9 +534,9 @@ cat data/memory/.hippocampus_migrated
 
 ---
 
-## 从 MaiBot / QanMoCore 迁移记忆
+## 从 MaiBot 迁移记忆
 
-> 这是面向 **MaiBot / QanMoCore（旧 QQ bot）** 数据的一次性导入工具，与上面的 Hippocampus 插件迁移互不相干。迁移只读旧库、不调用 LLM、不联网，直接把长期记忆写成 KiraOS 的 TOML 真相源；KiraAI 下次启动时自动重建 SQLite 索引。
+> 这是面向 **MaiBot（旧 QQ bot）** 数据的一次性导入工具，与上面的 Hippocampus 插件迁移互不相干。迁移只读旧库、不调用 LLM、不联网，直接把长期记忆写成 KiraOS 的 TOML 真相源；KiraAI 下次启动时自动重建 SQLite 索引。
 
 ### 迁移什么
 
@@ -560,13 +561,13 @@ cat data/memory/.hippocampus_migrated
 ```bash
 # 1) 先看会导多少条，不写任何目标文件
 python data/plugins/KiraOS_Plugin/scripts/import_qanmocore.py \
-    --source /path/to/QanMoCore/data \
+    --source /path/to/MaiBot/data \
     --data-dir data \
     --dry-run
 
 # 2) 确认 adapter 名称后正式导入
 python data/plugins/KiraOS_Plugin/scripts/import_qanmocore.py \
-    --source /path/to/QanMoCore/data \
+    --source /path/to/MaiBot/data \
     --data-dir data \
     --adapter qq
 ```
@@ -596,7 +597,7 @@ Windows 用 `data\plugins\KiraOS_Plugin\scripts\import_qanmocore.py`，并把 `-
 - 你在 KiraOS 里删除/归档的导入记忆不会被重新复活；`--force` 可重新导入已标记删除的条目。
 - 目标里已有同 id 但**没有** `qanmocore-import` 标签的记忆视为你自己的数据，绝不覆盖。
 - 你在 KiraOS 里手改过的导入记忆，后续源数据变更不会覆盖它。
-- 旧库以只读 `immutable` 打开，不会在 QanMoCore 目录里留下 `-wal`/`-shm` 文件。
+- 旧库以只读 `immutable` 打开，不会在 MaiBot 目录里留下 `-wal`/`-shm` 文件。
 - 逐条状态记录在 `data/memory/.qanmocore_migrated`（隐藏文件，故意不带 .json 后缀，避免被当成旧 JSON 记忆扫描）；导入统计另存到 `data/migration_reports/`。
 
 ### 迁移后
@@ -611,7 +612,7 @@ Windows 用 `data\plugins\KiraOS_Plugin\scripts\import_qanmocore.py`，并把 `-
      - `profile_view(entity_id="qq:1000000002")`
    - 如果希望 WebChat 会话自动使用某个 QQ 用户/群的记忆，需要额外的别名配置（当前未内置，可按需扩展）。
 3. 迁移保留旧 bot 名字（如“浅陌”）在记忆文本里；如果 KiraAI 人设换名，可在 persona 配置里使用同名，或后续用 `--since` 重新挑选。
-4. 确认无误后，旧 `QanMoCore/data` 可作为 rollback 保留，不必删除。
+4. 确认无误后，旧 `MaiBot/data` 可作为 rollback 保留，不必删除。
 
 > 迁移只覆盖长期记忆。旧 bot 的短期上下文、聊天原文、表达方式学习结果不会进入 KiraAI。
 

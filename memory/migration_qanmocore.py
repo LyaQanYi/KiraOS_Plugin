@@ -1,7 +1,6 @@
-"""Import MaiBot / QanMoCore memory into KiraOS.
+"""Import MaiBot memory into KiraOS.
 
-This module is a one-shot, read-only importer for MaiBot (MaiCore/QanMoCore)
-data. It is deliberately independent from the hippocampus pipeline: no LLM
+This module is a one-shot, read-only importer for MaiBot data. It is deliberately independent from the hippocampus pipeline: no LLM
 calls, no network access, and no source modification. It writes the KiraOS
 TOML truth-source layout directly; the plugin rebuilds its SQLite index from
 TOML on the next start.
@@ -274,7 +273,7 @@ class ImportStats:
         if len(self.errors) >= 100:
             return
         self.errors.append(f"{item}: {type(exc).__name__}: {exc}")
-        logger.warning("QanMoCore import failed for %s: %s", item, exc)
+        logger.warning("MaiBot import failed for %s: %s", item, exc)
 
     @property
     def total_imported(self) -> int:
@@ -319,7 +318,7 @@ def load_manifest(path: Path) -> Dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise RuntimeError(f"cannot read QanMoCore import manifest {path}: {exc}") from exc
+        raise RuntimeError(f"cannot read MaiBot import manifest {path}: {exc}") from exc
     if not raw:
         return _fresh_manifest()
     try:
@@ -331,18 +330,18 @@ def load_manifest(path: Path) -> Dict[str, Any]:
         except OSError:
             pass
         logger.warning(
-            "corrupt QanMoCore import manifest %s (%s); backed up to %s and starting fresh",
+            "corrupt MaiBot import manifest %s (%s); backed up to %s and starting fresh",
             path,
             exc,
             backup,
         )
         return _fresh_manifest()
     if not isinstance(data, dict):
-        raise RuntimeError(f"unrecognised QanMoCore import manifest {path}")
+        raise RuntimeError(f"unrecognised MaiBot import manifest {path}")
     version = data.get("version")
     if version != MANIFEST_VERSION:
         logger.warning(
-            "unsupported QanMoCore import manifest version %r in %s; starting fresh",
+            "unsupported MaiBot import manifest version %r in %s; starting fresh",
             version,
             path,
         )
@@ -387,7 +386,7 @@ def write_manifest(path: Path, manifest: Dict[str, Any]) -> None:
 
 
 class QanMoCoreSource:
-    """Read-only view of a MaiBot / QanMoCore data directory."""
+    """Read-only view of a MaiBot data directory."""
 
     def __init__(self, source_dir: Path, *, adapter: str = "qq", allow_live: bool = False):
         self.source_dir = Path(source_dir)
@@ -414,7 +413,7 @@ class QanMoCoreSource:
 
     def open(self) -> None:
         if not self.source_dir.is_dir():
-            raise FileNotFoundError(f"QanMoCore data directory not found: {self.source_dir}")
+            raise FileNotFoundError(f"MaiBot data directory not found: {self.source_dir}")
         if not self.db_path.is_file():
             raise FileNotFoundError(f"MaiBot.db not found under {self.source_dir}")
 
@@ -460,7 +459,7 @@ class QanMoCoreSource:
         self.history_counts = self._count_by_chat("chat_history")
         self.qa_counts = self._count_by_chat("thinking_back")
         logger.info(
-            "QanMoCore source opened: db=%s tables=%d streams=%d (live_wal=%s)",
+            "MaiBot source opened: db=%s tables=%d streams=%d (live_wal=%s)",
             self.db_path,
             len(self.tables),
             len(self.streams),
@@ -497,7 +496,7 @@ class QanMoCoreSource:
         try:
             return [dict(row) for row in self.conn.execute(sql)]
         except sqlite3.Error as exc:
-            logger.warning("QanMoCore table %s unreadable: %s", table, exc)
+            logger.warning("MaiBot table %s unreadable: %s", table, exc)
             return []
 
     def _count_by_chat(self, table: str) -> Dict[str, int]:
@@ -1763,7 +1762,7 @@ async def import_qanmocore(
     options: Optional[ImportOptions] = None,
     allow_live_source: bool = False,
 ) -> ImportStats:
-    """Import MaiBot/QanMoCore memory into the current KiraOS data root.
+    """Import MaiBot memory into the current KiraOS data root.
 
     "tree_store" and "profile_store" are only required when "options.dry_run"
     is false. The caller is responsible for calling set_data_root() before
@@ -1805,7 +1804,7 @@ async def import_qanmocore(
         ) as source:
             stats.source = source.fingerprint()
             logger.info(
-                "QanMoCore import starting: source=%s adapter=%s include=%s dry_run=%s",
+                "MaiBot import starting: source=%s adapter=%s include=%s dry_run=%s",
                 source_dir,
                 options.adapter,
                 ",".join(sorted(options.include)),
@@ -1860,7 +1859,7 @@ async def import_qanmocore(
         stats.elapsed = time.time() - started
 
     logger.info(
-        "QanMoCore import finished: imported=%s updated=%s profiles=%d skipped=%s errors=%d elapsed=%.1fs",
+        "MaiBot import finished: imported=%s updated=%s profiles=%d skipped=%s errors=%d elapsed=%.1fs",
         stats.imported,
         stats.updated,
         stats.profiles_written,
