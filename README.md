@@ -38,7 +38,6 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 - [数据存储](#数据存储)
 - [从 v2 迁移](#从-v2-迁移)
 - [从 Hippocampus Memory 插件迁移](#从-hippocampus-memory-插件迁移)
-- [从 MaiBot / QanMoCore 迁移记忆](#从-maibot--qanmocore-迁移记忆)
 - [故障排除](#故障排除)
 
 ---
@@ -267,7 +266,7 @@ KiraOS **启用时会自动把 Simple Memory 禁用**（避免两套记忆同时
 
 ### 事件记忆（Episode）
 
-QanMoCore 的 `chat_history` 层是“事件记忆”：把一段群聊切成话题，总结成主题/概括/关键词/关键信息点，之后用 ReAct Agent 检索。KiraOS 的 facts/reflections 偏原子事实，会丢掉“这段时间群里发生了什么”的叙事，所以新增了 episode 层：
+MaiBot 的 `chat_history` 层是“事件记忆”：把一段群聊切成话题，总结成主题/概括/关键词/关键信息点，之后用 ReAct Agent 检索。KiraOS 的 facts/reflections 偏原子事实，会丢掉“这段时间群里发生了什么”的叙事，所以新增了 episode 层：
 
 - `on.im_message` 记录**每一条**会话消息（不只触发 bot 回复的那条），`on.step_result` 记录 bot 的回复；群聊/私聊都缓冲。
 - 缓冲达到 `episode_threshold` 条，或最旧消息超过 `episode_window_minutes` 分钟时，用提取 LLM 总结成一条事件：
@@ -280,7 +279,7 @@ QanMoCore 的 `chat_history` 层是“事件记忆”：把一段群聊切成话
 
 ### 运行状态与最近回忆
 
-这两项对应 QanMoCore 的“工作缓存 + thinking_back 答案复用”：
+这两项对应 MaiBot 的“工作缓存 + thinking_back 答案复用”：
 
 - `.hippocampus_pending`：尚未达到 `hippocampus_threshold`、或失败待重试的对话块，重启后恢复，避免每个会话丢最多几轮上下文。
 - `.recall_cache`：每个会话最近一次成功召回的内容，在 `recall_cache_ttl`（默认 600 秒）内作为 `[最近回忆]` 注入下一轮，避免新消息一换就“忘记刚才聊过什么”。
@@ -415,7 +414,7 @@ data/memory/
 ├── memory_index.db                      # SQLite 索引（可重建）
 ├── chat_memory.json                     # 短期对话历史
 ├── .migrated_v3                         # 迁移标记（v2 → v3 一次性迁移）
-├── .qanmocore_migrated                  # QanMoCore 导入 manifest（隐藏，无 .json）
+├── .qanmocore_migrated                  # MaiBot 导入 manifest（隐藏，无 .json）
 ├── .hippocampus_pending                 # 未处理/失败重试的海马体 chunk（隐藏）
 ├── .episode_buffers                     # 事件记忆的会话缓冲（隐藏）
 ├── .recall_cache                        # 最近召回缓存（隐藏）

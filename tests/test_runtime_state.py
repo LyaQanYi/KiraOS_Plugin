@@ -1,10 +1,10 @@
 """Runtime state: persistent hippocampus queue and recent-recall cache.
 
-These port two QanMoCore behaviours that KiraOS lacked:
-- QanMoCore persisted its unfinished topic/batch cache to disk; MemoryManager
+These port two MaiBot behaviours that KiraOS lacked:
+- MaiBot persisted its unfinished topic/batch cache to disk; MemoryManager
   now persists _pending_conversations so a restart does not drop pre-hippocampus
   turns.
-- QanMoCore's thinking_back answered "what did I just remember" for ten
+- MaiBot's thinking_back answered "what did I just remember" for ten
   minutes; RecallCache keeps one recent recall block per session and
   inject_context surfaces it as a [最近回忆] scope.
 """

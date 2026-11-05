@@ -1,6 +1,6 @@
 """Per-session cache of the most recent successful recall block.
 
-QanMoCore's thinking_back table reused answers found in the last ten minutes so
+MaiBot's thinking_back table reused answers found in the last ten minutes so
 the next reply could still refer to a fact the model had just "remembered".
 KiraOS recomputes recall from scratch every turn; when the newest message no
 longer matches the earlier query, that context disappears. This cache keeps one
