@@ -2,7 +2,7 @@
 
 KiraOS keeps pre-hippocampus chunks in MemoryManager._pending_conversations.
 Losing that state on restart drops up to hippocampus_threshold turns per
-session. QanMoCore persisted its topic/batch cache for exactly this reason, so
+session. MaiBot persisted its topic/batch cache for exactly this reason, so
 this store mirrors the idea: a small hidden file under the memory root that is
 loaded on startup and rewritten whenever the queue changes.
 

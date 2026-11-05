@@ -156,11 +156,11 @@
         "name": "Enable episode memory",
         "type": "switch",
         "default": true,
-        "hint": "Buffer every conversational message per session and periodically summarize the window into one episode memory (theme/summary/keywords) under entities/{user|group}/episodes. This is the QanMoCore chat_history-style event layer; it costs one extraction LLM call per flushed window.",
+        "hint": "Buffer every conversational message per session and periodically summarize the window into one episode memory (theme/summary/keywords) under entities/{user|group}/episodes. This is the MaiBot chat_history-style event layer; it costs one extraction LLM call per flushed window.",
         "locales": {
             "zh": {
                 "name": "启用事件记忆",
-                "hint": "按会话缓冲所有聊天消息，定期用提取 LLM 总结成一条事件记忆（主题/概括/关键词），写入 entities/{user|group}/episodes。对应 QanMoCore chat_history 的事件层，每个窗口会多一次 LLM 调用。"
+                "hint": "按会话缓冲所有聊天消息，定期用提取 LLM 总结成一条事件记忆（主题/概括/关键词），写入 entities/{user|group}/episodes。对应 MaiBot chat_history 的事件层，每个窗口会多一次 LLM 调用。"
             }
         }
     },
@@ -196,11 +196,11 @@
         "name": "Only summarize chats the bot joined",
         "type": "switch",
         "default": true,
-        "hint": "Skip an episode window when the bot never spoke in it. Mirrors QanMoCore's bot-participation gate and avoids paying for summaries of every group.",
+        "hint": "Skip an episode window when the bot never spoke in it. Mirrors MaiBot's bot-participation gate and avoids paying for summaries of every group.",
         "locales": {
             "zh": {
                 "name": "只总结 bot 参与的对话",
-                "hint": "窗口内没有 bot 发言时丢弃，不生成事件记忆。对应 QanMoCore 的 bot 参与门控，避免为每个群都付费总结。"
+                "hint": "窗口内没有 bot 发言时丢弃，不生成事件记忆。对应 MaiBot 的 bot 参与门控，避免为每个群都付费总结。"
             }
         }
     },
@@ -232,11 +232,11 @@
         "name": "Inject recent recall",
         "type": "switch",
         "default": true,
-        "hint": "Keep the last successful recall block per session for recall_cache_ttl seconds and inject it as [最近回忆] on later turns, mirroring QanMoCore thinking_back answer reuse.",
+        "hint": "Keep the last successful recall block per session for recall_cache_ttl seconds and inject it as [最近回忆] on later turns, mirroring MaiBot thinking_back answer reuse.",
         "locales": {
             "zh": {
                 "name": "注入最近回忆",
-                "hint": "按会话缓存最近一次成功召回的内容，在 TTL 内作为 [最近回忆] 注入后续轮次，对应 QanMoCore thinking_back 的答案复用。"
+                "hint": "按会话缓存最近一次成功召回的内容，在 TTL 内作为 [最近回忆] 注入后续轮次，对应 MaiBot thinking_back 的答案复用。"
             }
         }
     },

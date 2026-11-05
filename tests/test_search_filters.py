@@ -1,6 +1,6 @@
 """Rich memory_search filters: folder / since / until / tags.
 
-The QanMoCore retrieval agent could search chat history by participant and time
+The MaiBot retrieval agent could search chat history by participant and time
 range. KiraOS's fast recall was query-only. These filters let the main LLM do
 multi-step "deep recall" itself: search facts, reflections and episodes with
 different keywords/time windows instead of a nested agent.

@@ -1,6 +1,6 @@
 """Episode (event) memory tests.
 
-QanMoCore's chat_history layer summarized whole conversation windows into
+MaiBot's chat_history layer summarized whole conversation windows into
 theme/summary/keywords/key_points. EpisodeManager ports that idea into KiraOS:
 it buffers every message in a session (not only bot-triggered turns), asks the
 extraction LLM for one compact event summary, and stores it as a normal TOML

@@ -1,6 +1,6 @@
 """Episode (event) memory.
 
-QanMoCore's most distinctive memory layer was chat_history: it segmented a long
+MaiBot's most distinctive memory layer was chat_history: it segmented a long
 conversation into topics, summarized each topic into theme/summary/keywords/
 key_points, and later let a ReAct agent search those event summaries. KiraOS's
 hippocampus extracts atomic facts and reflections, but loses the narrative of

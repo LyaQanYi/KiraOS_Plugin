@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a startup reconcile merges pre-existing `entities/user_{alias}/` profiles
   and TOMLs into the canonical entity (union/dedupe, no overwrite, idempotent).
   Example: `webchat:admin=qq:1000000001`. Only user entities are affected.
-- **Episode (event) memory**, ported from QanMoCore's `chat_history` layer.
+- **Episode (event) memory**, ported from MaiBot's `chat_history` layer.
   Every conversational message (not just bot-triggered turns) is buffered per
   session; every `episode_threshold` messages or `episode_window_minutes`
   minutes the extraction LLM summarizes the window into theme/summary/
@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-memory dict. Controlled by `persist_hippocampus_pending`.
 - **Recent-recall cache** (`.recall_cache`). The last successful recall block
   per session is kept for `recall_cache_ttl` (default 600s) and injected as
-  `[最近回忆]` on a later query, mirroring QanMoCore `thinking_back` answer
+  `[最近回忆]` on a later query, mirroring MaiBot `thinking_back` answer
   reuse. Controlled by `inject_recent_recall`.
 - **Deep-recall filters for `memory_search`**: `folder`
   (all/facts/reflections/episodes), `since`, `until` and `tags`. The main LLM

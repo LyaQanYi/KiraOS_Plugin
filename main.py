@@ -1116,7 +1116,7 @@ class UserMemoryPlugin(BasePlugin):
                 # block below is re-surfaced from the cache, not re-cached.
                 cache_recall_text = self._build_recall_text(recall_scopes)
 
-                # QanMoCore-style thinking_back: keep the last successful
+                # MaiBot-style thinking_back: keep the last successful
                 # recall for this session and surface it while it is fresh.
                 if self._inject_recent_recall and session_key:
                     try:
