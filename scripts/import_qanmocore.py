@@ -383,6 +383,9 @@ def main(argv: Optional[list] = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 3
 
+    if not args.dry_run:
+        data_dir.mkdir(parents=True, exist_ok=True)
+
     try:
         init_paths, migration, paths, index_mod, store_mod, profile_mod = _load_importer(
             kira_root.resolve(), data_dir
