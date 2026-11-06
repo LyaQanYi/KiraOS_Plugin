@@ -234,11 +234,22 @@ def _backup_memory_root(memory_root: Path, data_dir: Path) -> Optional[Path]:
     return destination
 
 
-def _write_report(data_dir: Path, stats, options, manifest_path) -> Path:
-    report_dir = data_dir / "migration_reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = report_dir / f"qanmocore-{stamp}.json"
+def _check_target_idle(memory_root: Path) -> None:
+    target_wal = memory_root / "memory_index.db-wal"
+    if target_wal.exists() and target_wal.stat().st_size > 0:
+        raise RuntimeError(
+            "data/memory/memory_index.db-wal is non-empty; KiraAI may be "
+            "running. Stop it first (or pass --allow-running)."
+        )
+
+
+def _write_report(
+    data_dir: Path, stats, options, manifest_path, path: Optional[Path] = None,
+) -> Path:
+    if path is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = data_dir / "migration_reports" / f"qanmocore-{stamp}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "manifest": str(manifest_path),
@@ -345,7 +356,6 @@ def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
     data_dir = (args.data_dir or _default_data_dir()).resolve()
-    data_dir.mkdir(parents=True, exist_ok=True)
 
     kira_root = (args.kira_root or _find_kira_root(data_dir))
     if kira_root is None:
@@ -364,6 +374,15 @@ def main(argv: Optional[list] = None) -> int:
         return 2
     source_dir = source_dir.resolve()
 
+    memory_root = data_dir / "memory"
+    if not args.dry_run and not args.allow_running:
+        try:
+            # Bootstrap creates a log file, so guard the target before loading it.
+            _check_target_idle(memory_root)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 3
+
     try:
         init_paths, migration, paths, index_mod, store_mod, profile_mod = _load_importer(
             kira_root.resolve(), data_dir
@@ -374,16 +393,15 @@ def main(argv: Optional[list] = None) -> int:
         return 2
 
     init_paths(data_dir=str(data_dir))
-    memory_root = data_dir / "memory"
     paths.set_data_root(memory_root)
 
     adapter = args.adapter or _detect_adapter_name(data_dir) or "qq"
 
     include = set(migration.DEFAULT_INCLUDE)
-    if args.include:
-        include = {part.strip() for part in args.include.split(",") if part.strip()}
+    if args.include is not None:
+        include = migration._normalize_categories([args.include])
     if args.exclude:
-        include -= {part.strip() for part in args.exclude.split(",") if part.strip()}
+        include -= migration._normalize_categories([args.exclude])
     if args.include_hippo_topics:
         include.add(migration.CATEGORY_HIPPO)
 
@@ -404,31 +422,30 @@ def main(argv: Optional[list] = None) -> int:
     import asyncio
 
     if args.dry_run:
-        stats = asyncio.run(
-            migration.import_qanmocore(
-                source_dir,
-                options=options,
-                allow_live_source=args.allow_live_source,
+        try:
+            stats = asyncio.run(
+                migration.import_qanmocore(
+                    source_dir,
+                    options=options,
+                    allow_live_source=args.allow_live_source,
+                )
             )
-        )
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 3
         _print_summary(stats, source_dir, None)
         if args.fail_on_error and stats.errors:
             return 4
         return 0
 
-    memory_root.mkdir(parents=True, exist_ok=True)
     index = None
     store = None
     backup_path = None
     try:
         with _ImportLock(memory_root / ".qanmocore_import.lock"):
-            target_wal = memory_root / "memory_index.db-wal"
-            if target_wal.exists() and target_wal.stat().st_size > 0 and not args.allow_running:
-                print(
-                    "WARNING: data/memory/memory_index.db-wal is non-empty; KiraAI may be "
-                    "running. Stop it first (or pass --allow-running).",
-                    file=sys.stderr,
-                )
+            if not args.allow_running:
+                _check_target_idle(memory_root)
+            migration.load_manifest(options.manifest_path)
             if not args.no_backup:
                 backup_path = _backup_memory_root(memory_root, data_dir)
                 if backup_path is not None:
@@ -461,9 +478,11 @@ def main(argv: Optional[list] = None) -> int:
             except Exception:
                 pass
 
-    report_path = args.report
+    report_path = None
     try:
-        report_path = _write_report(data_dir, stats, options, memory_root / migration.MANIFEST_NAME)
+        report_path = _write_report(
+            data_dir, stats, options, memory_root / migration.MANIFEST_NAME, args.report
+        )
     except Exception as exc:
         print(f"WARNING: could not write report: {exc}", file=sys.stderr)
 

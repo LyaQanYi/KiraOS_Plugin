@@ -42,7 +42,7 @@ from .memory_paths import (
     get_entity_profile_path,
     get_memory_root,
 )
-from .toml_tree_store import TomlTreeStore
+from .toml_tree_store import Memory, TomlTreeStore
 
 logger = get_logger("kiraos_qanmocore_migration", "cyan")
 
@@ -218,7 +218,7 @@ class ImportOptions:
     """Knobs shared by the CLI and the tests."""
 
     adapter: str = "qq"
-    include: set = field(default_factory=lambda: set(DEFAULT_INCLUDE))
+    include: Optional[set] = None
     profile_facts_limit: int = 12
     profile_facts_max_chars: int = 1200
     profile_fact_clip: int = 200
@@ -233,7 +233,9 @@ class ImportOptions:
     now: Optional[float] = None
 
     def __post_init__(self) -> None:
-        self.include = _normalize_categories(self.include or DEFAULT_INCLUDE)
+        self.include = _normalize_categories(
+            DEFAULT_INCLUDE if self.include is None else self.include
+        )
         unknown = self.include - set(ALL_CATEGORIES)
         if unknown:
             logger.warning(
@@ -317,42 +319,27 @@ def load_manifest(path: Path) -> Dict[str, Any]:
         return _fresh_manifest()
     try:
         raw = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise RuntimeError(f"cannot read MaiBot import manifest {path}: {exc}") from exc
-    if not raw:
-        return _fresh_manifest()
     try:
         data = json.loads(raw)
     except ValueError as exc:
-        backup = path.with_name(path.name + f".corrupt_{int(time.time())}")
-        try:
-            path.replace(backup)
-        except OSError:
-            pass
-        logger.warning(
-            "corrupt MaiBot import manifest %s (%s); backed up to %s and starting fresh",
-            path,
-            exc,
-            backup,
-        )
-        return _fresh_manifest()
+        raise RuntimeError(f"corrupt MaiBot import manifest {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError(f"unrecognised MaiBot import manifest {path}")
     version = data.get("version")
     if version != MANIFEST_VERSION:
-        logger.warning(
-            "unsupported MaiBot import manifest version %r in %s; starting fresh",
-            version,
-            path,
+        raise RuntimeError(
+            f"unsupported MaiBot import manifest version {version!r} in {path}"
         )
-        return _fresh_manifest()
     manifest = _fresh_manifest()
     for key in ("items", "profiles"):
         value = data.get(key)
-        if isinstance(value, dict):
-            manifest[key] = {
-                str(k): v for k, v in value.items() if isinstance(v, dict)
-            }
+        if not isinstance(value, dict) or any(
+            not isinstance(v, dict) for v in value.values()
+        ):
+            raise RuntimeError(f"invalid {key} in MaiBot import manifest {path}")
+        manifest[key] = value
     source = data.get("source")
     if isinstance(source, dict):
         manifest["source"] = source
@@ -715,7 +702,64 @@ class _MemoryWriter:
         # change source_hash on every run and rewrite those memories forever;
         # the epoch is persisted in the manifest on the first real run.
         self.source_epoch = source_epoch
-        self._seen: set = set()
+        self._seen: Dict[str, str] = {}
+        self._dedupe_records = {
+            record["dedupe_key"]: key
+            for key, record in manifest["items"].items()
+            if record.get("dedupe_key") and not record.get("duplicate_of")
+        }
+        self._prepared: Dict[str, str] = {}
+
+    def prepare_stream_rows(
+        self, source: QanMoCoreSource, rows: List[dict], category: str,
+        folder: str, text_for_row: Callable[[dict], str],
+    ) -> None:
+        """Choose shared owners before limits or iteration order hide a row.
+
+        This also recovers scope for older manifests that only saved a text
+        hash. A deleted memory's source row still identifies its entity.
+        """
+        groups: Dict[str, List[str]] = {}
+        current_keys: Dict[str, str] = {}
+        items = self.manifest["items"]
+        for row in rows:
+            mapped = source.entity_for_stream(_clean_text(row.get("chat_id")))
+            if mapped is None:
+                continue
+            entity_id, entity_type, _ = mapped
+            item_key = f"{category}:{row.get('id')}"
+            record = items.get(item_key) or {}
+            if record.get("text_hash") and not record.get("duplicate_of"):
+                old_key = _payload_hash([
+                    entity_type, entity_id, "", folder, record["text_hash"],
+                ])
+                self._dedupe_records.setdefault(old_key, item_key)
+            text = _clean_text(text_for_row(row))
+            if text:
+                key = _payload_hash([entity_type, entity_id, "", folder, _text_hash(text)])
+                groups.setdefault(key, []).append(item_key)
+                current_keys[item_key] = key
+        for key, candidates in groups.items():
+            owner = next((
+                candidate for candidate in candidates
+                if items.get(candidate, {}).get("memory_ids")
+                and not items[candidate].get("duplicate_of")
+            ), None)
+            previous_owner = self._dedupe_records.get(key)
+            if previous_owner in current_keys and current_keys[previous_owner] != key:
+                previous_owner = None
+            self._prepared[key] = owner or previous_owner or candidates[0]
+
+    @staticmethod
+    def _content_hash(memory: Memory) -> str:
+        # Runtime access counters change during recall and are not user edits.
+        return _payload_hash({
+            "text": memory.text,
+            "type": memory.type,
+            "importance": memory.importance,
+            "tags": memory.tags,
+            "source": memory.source,
+        })
 
     async def safe_store(self, **kwargs) -> str:
         """store() wrapper that records a per-item error and keeps going."""
@@ -752,18 +796,65 @@ class _MemoryWriter:
         tags = _merge_tags([IMPORT_TAG], tags or [])
         source_data = _toml_safe(source or {}) or {}
         if "time" not in source_data:
-            source_data["time"] = _iso(timestamp or self.now)
+            source_data["time"] = _iso(timestamp or self.source_epoch)
         try:
             importance = max(1, min(10, int(importance)))
         except (TypeError, ValueError):
             importance = 5
         ts = _safe_float(timestamp, self.source_epoch) or self.source_epoch
         text_hash = _text_hash(text)
-        dedupe_key = (entity_type, entity_id, base_dir, folder, text_hash)
+        dedupe_key = _payload_hash([entity_type, entity_id, base_dir, folder, text_hash])
+        items = self.manifest["items"]
+        record = items.get(item_key) or {}
+        canonical_key = (
+            self._prepared.get(dedupe_key)
+            or self._seen.get(dedupe_key)
+            or self._dedupe_records.get(dedupe_key)
+            or item_key
+        )
+        if canonical_key != item_key:
+            # Keep every source row linked to the same ownership/deletion record,
+            # even when a later run changes iteration order or applies a limit.
+            items[item_key] = {"duplicate_of": canonical_key}
+            item_key = canonical_key
+            record = items.get(item_key) or {}
+        elif record.get("duplicate_of"):
+            # Former duplicates can become different facts in the source.
+            # Give a diverging row its own memory instead of changing its peer.
+            previous = items.get(record["duplicate_of"], {})
+            previous_state = previous.get("state")
+            if previous_state in ("edited", "conflict") or (
+                previous_state == "deleted" and not self.options.force
+            ):
+                self.stats.skip(previous_state)
+                return previous_state
+            if self.tree_store is not None and not self.options.dry_run:
+                previous_ids = previous.get("memory_ids") or []
+                if previous_ids:
+                    previous_memory = await self.tree_store.get_memory(
+                        previous_ids[0], entity_id=entity_id, entity_type=entity_type,
+                        folder=folder, base_dir=base_dir,
+                    )
+                    if previous_memory is None and not self.options.force:
+                        previous.update(state="deleted", deleted_at=self.now)
+                        self.stats.skip("deleted")
+                        return "deleted"
+                    if previous_memory is not None and (
+                        IMPORT_TAG not in previous_memory.tags
+                        or _text_hash(previous_memory.text) != previous.get("text_hash")
+                        or (previous.get("content_hash") and self._content_hash(previous_memory)
+                            != previous["content_hash"])
+                    ):
+                        previous.update(state="edited", edited_at=self.now)
+                        self.stats.skip("edited")
+                        return "edited"
+            record = {}
+            items.pop(item_key, None)
         if dedupe_key in self._seen:
             self.stats.skip("duplicate")
             return "duplicate"
-        self._seen.add(dedupe_key)
+        self._seen[dedupe_key] = item_key
+        self._dedupe_records[dedupe_key] = item_key
         source_hash = _payload_hash(
             {
                 "text": text,
@@ -774,7 +865,7 @@ class _MemoryWriter:
             }
         )
 
-        record = self.manifest["items"].get(item_key) or {}
+        record["dedupe_key"] = dedupe_key
         state = record.get("state") or ""
         if state == "deleted" and not self.options.force:
             self.stats.skip("deleted")
@@ -812,7 +903,7 @@ class _MemoryWriter:
         )
 
         if mem is None:
-            if state in ("imported", "updated", "edited", "conflict"):
+            if state in ("imported", "updated", "edited", "conflict") and not self.options.force:
                 record.update({"state": "deleted", "deleted_at": self.now})
                 self.manifest["items"][item_key] = record
                 self.stats.skip("deleted")
@@ -823,7 +914,7 @@ class _MemoryWriter:
                 importance=importance,
                 tags=tags,
                 source=source_data,
-                semantic_id=semantic_id,
+                semantic_id=memory_id,
                 entity_id=entity_id,
                 entity_type=entity_type,
                 folder=folder,
@@ -838,6 +929,8 @@ class _MemoryWriter:
                 "state": "imported",
                 "source_hash": source_hash,
                 "text_hash": text_hash,
+                "content_hash": self._content_hash(mem),
+                "dedupe_key": dedupe_key,
                 "memory_ids": [mem.id],
                 "updated_at": self.now,
             }
@@ -850,6 +943,7 @@ class _MemoryWriter:
                 "state": "conflict",
                 "source_hash": source_hash,
                 "text_hash": text_hash,
+                "dedupe_key": dedupe_key,
                 "memory_ids": [mem.id],
                 "updated_at": self.now,
             }
@@ -865,6 +959,31 @@ class _MemoryWriter:
             return "edited"
 
         if state in ("imported", "updated"):
+            content_hash = self._content_hash(mem)
+            saved_hash = record.get("content_hash")
+            if saved_hash is None:
+                # Version 1 manifests used only source/text hashes. Check the
+                # old payload before adopting a full snapshot on an upgrade.
+                current_payload = _payload_hash({
+                    "text": mem.text,
+                    "type": mem.type,
+                    "importance": mem.importance,
+                    "tags": mem.tags,
+                    "timestamp": mem.timestamp,
+                })
+                matches_import = (
+                    current_payload == record.get("source_hash")
+                    and {k: v for k, v in mem.source.items() if k != "time"}
+                    == {k: v for k, v in source_data.items() if k != "time"}
+                )
+            else:
+                matches_import = content_hash == saved_hash
+            if not matches_import or current_hash != record.get("text_hash"):
+                record.update({"state": "edited", "edited_at": self.now})
+                self.manifest["items"][item_key] = record
+                self.stats.skip("edited")
+                return "edited"
+            record["content_hash"] = content_hash
             if (
                 record.get("source_hash") == source_hash
                 and record.get("text_hash") == text_hash
@@ -872,11 +991,6 @@ class _MemoryWriter:
             ):
                 self.stats.skip("unchanged")
                 return "unchanged"
-            if current_hash != record.get("text_hash"):
-                record.update({"state": "edited", "edited_at": self.now})
-                self.manifest["items"][item_key] = record
-                self.stats.skip("edited")
-                return "edited"
         else:
             # No record yet (bird's-eye adoption after a crash, or a previous
             # importer run whose manifest was lost).
@@ -885,6 +999,8 @@ class _MemoryWriter:
                     "state": "imported",
                     "source_hash": source_hash,
                     "text_hash": text_hash,
+                    "content_hash": self._content_hash(mem),
+                    "dedupe_key": dedupe_key,
                     "memory_ids": [mem.id],
                     "updated_at": self.now,
                 }
@@ -894,6 +1010,7 @@ class _MemoryWriter:
                 "state": "conflict",
                 "source_hash": source_hash,
                 "text_hash": text_hash,
+                "dedupe_key": dedupe_key,
                 "memory_ids": [mem.id],
                 "updated_at": self.now,
             }
@@ -912,6 +1029,8 @@ class _MemoryWriter:
             "state": "updated",
             "source_hash": source_hash,
             "text_hash": text_hash,
+            "content_hash": self._content_hash(mem),
+            "dedupe_key": dedupe_key,
             "memory_ids": [mem.id],
             "updated_at": self.now,
         }
@@ -1399,14 +1518,24 @@ def _tags_with_keywords(base: List[str], keywords: list, limit: int = 10) -> Lis
     return tags
 
 
+def _history_text(row: dict) -> str:
+    summary = _clean_text(row.get("summary"))
+    theme = _clean_text(row.get("theme"))
+    if not summary:
+        return ""
+    return f"{theme}\n{summary}" if theme and theme != summary else summary
+
+
 async def _import_history(
     source: QanMoCoreSource,
     writer: _MemoryWriter,
     options: ImportOptions,
     stats: ImportStats,
 ) -> None:
+    rows = list(source.iter_chat_history(newest_first=bool(options.max_per_chat)))
+    writer.prepare_stream_rows(source, rows, "history", "reflections", _history_text)
     per_chat: Dict[str, int] = {}
-    for row in source.iter_chat_history(newest_first=bool(options.max_per_chat)):
+    for row in rows:
         end_time = _safe_float(row.get("end_time"), 0.0)
         if not _time_in_range(end_time, options):
             stats.skip("time_filter")
@@ -1417,17 +1546,14 @@ async def _import_history(
             if used >= options.max_per_chat:
                 stats.skip("max_per_chat")
                 continue
-            per_chat[chat_id] = used + 1
         mapped = source.entity_for_stream(chat_id)
         if mapped is None:
             stats.skip("missing_stream")
             continue
-        summary = _clean_text(row.get("summary"))
-        if not summary:
+        text = _history_text(row)
+        if not text:
             stats.skip("empty")
             continue
-        theme = _clean_text(row.get("theme"))
-        text = f"{theme}\n{summary}" if theme and theme != summary else summary
         entity_id, entity_type, session = mapped
         keywords = _json_list(row.get("keywords"))
         key_points = _json_list(row.get("key_point"))
@@ -1444,7 +1570,7 @@ async def _import_history(
             "count": _safe_int(row.get("count"), 0),
             "forget_times": _safe_int(row.get("forget_times"), 0),
         }
-        await writer.safe_store(
+        result = await writer.safe_store(
             category="history",
             item_key=f"history:{row.get('id')}",
             entity_id=entity_id,
@@ -1458,6 +1584,8 @@ async def _import_history(
             timestamp=end_time,
             semantic_id=f"mai_history_{row.get('id')}",
         )
+        if result in ("added", "updated", "unchanged"):
+            per_chat[chat_id] = per_chat.get(chat_id, 0) + 1
 
 
 async def _import_chest(
@@ -1537,30 +1665,48 @@ async def _import_jargon(
             continue
         text = f"「{content}」：{meaning}"
         stream_ids = _parse_jargon_streams(row.get("chat_id"))
-        await writer.safe_store(
-            category="jargon",
-            item_key=f"jargon:{row.get('id')}",
-            entity_id="",
-            entity_type="",
-            folder="facts",
-            base_dir="global",
-            text=text,
-            memory_type="fact",
-            importance=6,
-            tags=[IMPORT_TAG, "jargon", "黑话"],
-            source={
+        is_global = _safe_int(row.get("is_global"), 0) == 1
+        if is_global:
+            targets = [("", "", "")]
+        else:
+            targets = sorted({
+                mapped for stream_id in stream_ids
+                if (mapped := source.entity_for_stream(stream_id)) is not None
+            })
+            if not targets:
+                stats.skip("missing_stream")
+                continue
+        for entity_id, entity_type, session in targets:
+            item_key = f"jargon:{row.get('id')}"
+            if not is_global:
+                item_key += f":{entity_type}:{entity_id}"
+            source_dict = {
                 "origin": "qanmocore",
                 "table": "jargon",
                 "id": row.get("id"),
                 "content": content,
-                "is_global": _safe_int(row.get("is_global"), 0),
+                "is_global": int(is_global),
                 "count": _safe_int(row.get("count"), 0),
                 "is_complete": _safe_int(row.get("is_complete"), 0),
                 "stream_ids": stream_ids,
-            },
-            timestamp=None,
-            semantic_id=f"mai_jargon_{row.get('id')}",
-        )
+            }
+            if session:
+                source_dict["session"] = session
+            await writer.safe_store(
+                category="jargon",
+                item_key=item_key,
+                entity_id=entity_id,
+                entity_type=entity_type,
+                folder="facts",
+                base_dir="global" if is_global else "",
+                text=text,
+                memory_type="fact",
+                importance=6,
+                tags=[IMPORT_TAG, "jargon", "黑话"],
+                source=source_dict,
+                timestamp=None,
+                semantic_id=f"mai_jargon_{row.get('id')}",
+            )
 
 
 def _is_negative_answer(answer: str) -> bool:
@@ -1574,8 +1720,13 @@ async def _import_qa(
     options: ImportOptions,
     stats: ImportStats,
 ) -> None:
+    rows = list(source.iter_qa(newest_first=bool(options.max_per_chat)))
+    writer.prepare_stream_rows(
+        source, rows, "qa", "facts",
+        lambda row: f"Q：{_clean_text(row.get('question'))}\nA：{_clean_text(row.get('answer'))}",
+    )
     per_chat: Dict[str, int] = {}
-    for row in source.iter_qa(newest_first=bool(options.max_per_chat)):
+    for row in rows:
         created = _safe_float(row.get("create_time"), 0.0)
         if not _time_in_range(created, options):
             stats.skip("time_filter")
@@ -1586,7 +1737,6 @@ async def _import_qa(
             if used >= options.max_per_chat:
                 stats.skip("max_per_chat")
                 continue
-            per_chat[chat_id] = used + 1
         answer = _clean_text(row.get("answer"))
         question = _clean_text(row.get("question"))
         if not answer or not question or _safe_int(row.get("found_answer"), 0) != 1:
@@ -1600,7 +1750,7 @@ async def _import_qa(
             stats.skip("missing_stream")
             continue
         entity_id, entity_type, session = mapped
-        await writer.safe_store(
+        result = await writer.safe_store(
             category="qa",
             item_key=f"qa:{row.get('id')}",
             entity_id=entity_id,
@@ -1621,6 +1771,8 @@ async def _import_qa(
             timestamp=created,
             semantic_id=f"mai_qa_{row.get('id')}",
         )
+        if result in ("added", "updated", "unchanged"):
+            per_chat[chat_id] = per_chat.get(chat_id, 0) + 1
 
 
 async def _import_conflicts(
@@ -1780,12 +1932,12 @@ async def import_qanmocore(
     )
     stats.manifest_path = str(manifest_path)
 
+    manifest = load_manifest(manifest_path)
     if not options.dry_run:
         if tree_store is None or profile_store is None:
             raise ValueError("tree_store and profile_store are required for a real import")
         ensure_directory_structure()
 
-    manifest = load_manifest(manifest_path)
     # A stable epoch for timestamp-less source rows. Persisted on the first
     # real run so reruns compute the same source_hash and stay no-ops.
     source_epoch = _safe_float(manifest.get("imported_at"), 0.0)
