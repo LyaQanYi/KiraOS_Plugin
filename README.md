@@ -38,6 +38,7 @@ KiraOS 是 Kira 的 OS 级插件，整合了两大核心能力：
 - [数据存储](#数据存储)
 - [从 v2 迁移](#从-v2-迁移)
 - [从 Hippocampus Memory 插件迁移](#从-hippocampus-memory-插件迁移)
+- [从 MaiBot 迁移记忆](#从-maibot-迁移记忆)
 - [故障排除](#故障排除)
 
 ---
@@ -533,6 +534,92 @@ cat data/memory/.hippocampus_migrated
 
 ---
 
+## 从 MaiBot 迁移记忆
+
+> 这是面向 **MaiBot（旧 QQ bot）** 数据的一次性导入工具，与上面的 Hippocampus 插件迁移互不相干。迁移只读旧库、不调用 LLM、不联网，直接把长期记忆写成 KiraOS 的 TOML 真相源；KiraAI 下次启动时自动重建 SQLite 索引。
+
+### 迁移什么
+
+| 旧数据 | 目标 | 说明 |
+|------|------|------|
+| `person_info` | `entities/user_{adapter}:{qq}/` | 昵称、群昵称、画像 facts（top-N） |
+| `person_info.memory_points` | 同用户 `facts/` | 逐条细粒度事实 |
+| `chat_streams` 群 | `entities/group_{adapter}:{group}/` | 群名字/别名/最近活跃 |
+| `chat_history` | 群 `reflections/` | 主题 + 摘要 + 关键词，原文不导 |
+| `memory_chest` | 群或用户 `facts/` | 记忆宝盒知识三联 |
+| `jargon`（有释义） | 全局条目到 `global/facts/`，其余到来源群或用户 `facts/` | 黑话/群文化知识；无法确定来源的非全局条目跳过 |
+| `thinking_back`（有可用答案） | 群或用户 `facts/` | “X 是什么/谁”的问答缓存 |
+| `memory_conflicts`（有答案） | 群或用户 `facts/` | 冲突澄清结论 |
+| `memory` 表（非空时） | 群或用户 `facts/` | 旧版残留表 |
+
+不迁移：`expression`（表达方式）、`messages`（原始消息）、emoji/图片、`hippo_memorizer` 话题缓存（可用 `--include-hippo-topics` 额外导入）。所有导入记忆带 `qanmocore-import` 标签。
+
+### 使用
+
+先停掉旧 MaiBot 和 KiraAI，然后在 KiraAI 仓库根目录执行（Linux/macOS）：
+
+```bash
+# 1) 先看会导多少条，不写任何目标文件
+python data/plugins/KiraOS_Plugin/scripts/import_qanmocore.py \
+    --source /path/to/MaiBot/data \
+    --data-dir data \
+    --dry-run
+
+# 2) 确认 adapter 名称后正式导入
+python data/plugins/KiraOS_Plugin/scripts/import_qanmocore.py \
+    --source /path/to/MaiBot/data \
+    --data-dir data \
+    --adapter qq
+```
+
+Windows 用 `data\plugins\KiraOS_Plugin\scripts\import_qanmocore.py`，并把 `--data-dir` 写成 `data`。
+
+**实体 ID 前缀必须与 KiraAI 里 QQ adapter 的实例名一致**。脚本会读 `data/config/system_config.json`，如果只有一个 platform=qq 的 adapter 就自动用它；否则默认 `qq`，请用 `--adapter` 指定。前缀不对会导致画像/记忆写进另一个命名空间、对话里读不到。
+
+### 常用参数
+
+| 参数 | 作用 |
+|------|------|
+| `--dry-run` | 只统计，不写目标 |
+| `--include` / `--exclude` | 选择类别：`profiles,history,chest,jargon,qa,conflicts,memory,hippo-topics` |
+| `--profile-facts N` | 每个画像最多复制多少条 facts（默认 12） |
+| `--since YYYY-MM-DD` / `--until` | 按源时间过滤 chat_history / QA / conflicts |
+| `--max-per-chat N` | 每个群最多导多少条摘要/问答（按时间倒序取最近） |
+| `--keep-unanswered` | 保留“未找到/无法确认”类问答 |
+| `--no-backup` | 目标已有记忆时不先备份 `data/memory` |
+| `--rebuild-index` | 导入后立即重建索引（默认留给 KiraAI 启动时做） |
+| `--allow-live-source` | 旧库 `-wal` 非空时仍只读导入 |
+| `--allow-running` | 目标索引 `-wal` 非空时仍继续（默认中止，请先停止 KiraAI） |
+| `--report PATH` | 将统计 JSON 写入指定路径，自动创建父目录 |
+| `--fail-on-error` | 有单条失败时以非 0 退出 |
+
+### 幂等与安全
+
+- 重复运行不会产生重复记忆：源数据没变的条目直接跳过；源数据更新时原位更新。
+- 你在 KiraOS 里删除/归档的导入记忆不会被重新复活；`--force` 可重新导入已标记删除的条目。
+- 目标里已有同 id 但**没有** `qanmocore-import` 标签的记忆视为你自己的数据，绝不覆盖。
+- 你在 KiraOS 里手改过的导入记忆，后续源数据变更不会覆盖它。
+- 旧库以只读 `immutable` 打开，不会在 MaiBot 目录里留下 `-wal`/`-shm` 文件。
+- 逐条状态记录在 `data/memory/.qanmocore_migrated`（隐藏文件，故意不带 .json 后缀，避免被当成旧 JSON 记忆扫描）；导入统计另存到 `data/migration_reports/`。
+- 状态文件损坏或版本不受支持时会中止导入，并保留原文件；请先从备份恢复状态，避免丢失删除记录。
+
+### 迁移后
+
+1. 启动 KiraAI。KiraOS 启动时会检查索引与 TOML 数量：一致就直接复用现有索引（2.3 万条实测约 0.2 秒），不一致才重建。正常启动不需要等一分钟。
+2. 打开 Memory WebUI（如配置了 `webui_port`）或直接问 bot “你记得 XX 吗”，确认画像/群摘要/黑话能召回。
+   - KiraAI 自带 WebChat，不配 QQ adapter 也能在 WebUI 本体里聊天（会话实体固定为 `webchat:admin`）。
+   - 导入的 QQ 记忆按 `qq:...` 隔离：WebChat 会自动注入 global 知识（如标记为全局的黑话）。要在 WebChat 里验证指定 QQ 实体的记忆，可以让 bot 显式调用工具：
+     - `memory_search(entity_id="qq:1000000002", entity_type="user")`
+     - `memory_search(entity_id="qq:1000000003", entity_type="group")`
+     - `memory_search(entity_type="global")`
+     - `profile_view(entity_id="qq:1000000002")`
+   - 如果希望 WebChat 自动使用某个 QQ 用户的画像和记忆，在 KiraOS 插件配置中设置 `"identity_aliases": ["webchat:admin=qq:1000000001"]`，QQ 前缀须与导入时的 `--adapter` 一致。详见[跨 adapter 身份关联](#跨-adapter-身份关联)。该配置只支持用户映射，群/频道不参与；群记忆仍需显式查询。
+3. 迁移保留旧 bot 名字（如“浅陌”）在记忆文本里；如果 KiraAI 人设换名，可在 persona 配置里使用同名，或后续用 `--since` 重新挑选。
+4. 确认无误后，旧 `MaiBot/data` 可作为 rollback 保留，不必删除。
+
+> 迁移只覆盖长期记忆。旧 bot 的短期上下文、聊天原文、表达方式学习结果不会进入 KiraAI。
+
+---
 
 ## 故障排除
 
